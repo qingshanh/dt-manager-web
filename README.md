@@ -195,6 +195,7 @@ docker compose up -d
 - `ENCRYPTION_KEY`：账号密码和 token 入库加密密钥，生产环境必须改
 - `NODE_OPTIONS`：限制 Node.js 最大堆内存，小内存 VPS 可设为 `--max-old-space-size=192`
 - `DOCKER_NODE_IMAGE`、`DOCKER_NGINX_IMAGE`、`DOCKER_PYTHON_IMAGE`：Docker 基础镜像地址，Docker Hub 拉取慢时可换成可访问的镜像源
+- `NPM_REGISTRY`、`PIP_INDEX_URL`：Docker 构建时安装 npm / pip 依赖使用的镜像源
 - `DATABASE_URL`：本地开发数据库地址；Docker Compose 默认覆盖为 `file:/app/data/dingtone.db`
 - `CORS_ORIGIN`：前端访问源，多个用英文逗号分隔
 - `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`、`TELEGRAM_API_BASE_URL`：Telegram 通知和 bot

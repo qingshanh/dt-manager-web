@@ -5,7 +5,8 @@ FROM ${NODE_IMAGE} AS build
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+RUN npm config set registry ${NPM_REGISTRY} && npm ci
 
 COPY prisma ./prisma
 COPY src ./src
