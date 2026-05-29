@@ -158,6 +158,32 @@ DT_HELPER_REMOTE_HOST=172.17.0.1:27042
 
 小内存 VPS 建议保持 `.env` 中 `NODE_OPTIONS=--max-old-space-size=192`，并优先使用 `direct` 模式，不启动 helper profile。后端 Docker 镜像已只保留生产依赖，能减少镜像体积和运行时文件扫描开销。
 
+### Docker 拉取卡住
+
+项目默认通过 `docker.hanxi.cc` 拉取官方基础镜像，以减少 VPS 直连 Docker Hub 卡住的概率。如果构建仍然长时间停在基础镜像拉取阶段，可以先单独测试：
+
+```bash
+docker pull docker.hanxi.cc/library/node:22-alpine
+docker pull docker.hanxi.cc/library/nginx:1.27-alpine
+```
+
+我这里用 registry manifest 检查过：`docker.hanxi.cc` 对 `library/node`、`library/nginx`、`library/python` 会返回 Docker Registry 鉴权挑战，Docker 客户端应可继续拉取；`ghcr.nju.edu.cn` 对这些 Docker Hub 官方基础镜像返回 `404`，不适合作为本项目默认基础镜像源。
+
+如果 `docker.hanxi.cc` 在你的 VPS 上也不可用，请在 `.env` 里把基础镜像改成你的 VPS 可访问的镜像源，例如：
+
+```env
+DOCKER_NODE_IMAGE=你的镜像源/library/node:22-alpine
+DOCKER_NGINX_IMAGE=你的镜像源/library/nginx:1.27-alpine
+DOCKER_PYTHON_IMAGE=你的镜像源/library/python:3.11-slim
+```
+
+然后重新构建：
+
+```bash
+docker compose build --pull --progress=plain
+docker compose up -d
+```
+
 ## 环境变量
 
 项目只使用根目录 `.env` 作为本地开发和 Docker Compose 的配置入口。模板文件 `.env.example` 已按用途分组，每一项上方都有说明；实际部署时复制一份 `.env` 后填写真实值即可。
@@ -168,6 +194,7 @@ DT_HELPER_REMOTE_HOST=172.17.0.1:27042
 - `JWT_SECRET`：后台登录 JWT 密钥，生产环境必须改
 - `ENCRYPTION_KEY`：账号密码和 token 入库加密密钥，生产环境必须改
 - `NODE_OPTIONS`：限制 Node.js 最大堆内存，小内存 VPS 可设为 `--max-old-space-size=192`
+- `DOCKER_NODE_IMAGE`、`DOCKER_NGINX_IMAGE`、`DOCKER_PYTHON_IMAGE`：Docker 基础镜像地址，Docker Hub 拉取慢时可换成可访问的镜像源
 - `DATABASE_URL`：本地开发数据库地址；Docker Compose 默认覆盖为 `file:/app/data/dingtone.db`
 - `CORS_ORIGIN`：前端访问源，多个用英文逗号分隔
 - `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`、`TELEGRAM_API_BASE_URL`：Telegram 通知和 bot

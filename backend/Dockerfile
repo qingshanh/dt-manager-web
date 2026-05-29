@@ -1,4 +1,6 @@
-FROM node:22-alpine AS build
+ARG NODE_IMAGE=docker.hanxi.cc/library/node:22-alpine
+
+FROM ${NODE_IMAGE} AS build
 
 WORKDIR /app
 
@@ -12,7 +14,7 @@ COPY tsconfig.json ./
 RUN npx prisma generate && npm run build
 RUN npm prune --omit=dev
 
-FROM node:22-alpine AS runtime
+FROM ${NODE_IMAGE} AS runtime
 
 WORKDIR /app
 ENV NODE_ENV=production

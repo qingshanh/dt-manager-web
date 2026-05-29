@@ -4,6 +4,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        NODE_IMAGE: ${DOCKER_NODE_IMAGE:-docker.hanxi.cc/library/node:22-alpine}
     env_file:
       - ./.env
     environment:
@@ -28,6 +30,8 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
+        NODE_IMAGE: ${DOCKER_NODE_IMAGE:-docker.hanxi.cc/library/node:22-alpine}
+        NGINX_IMAGE: ${DOCKER_NGINX_IMAGE:-docker.hanxi.cc/library/nginx:1.27-alpine}
         APP_VERSION: ${APP_VERSION:-0.1.0}
         VITE_APP_VERSION: ${VITE_APP_VERSION:-0.1.0}
     depends_on:
@@ -49,6 +53,8 @@ services:
     build:
       context: ./backend/helper
       dockerfile: Dockerfile
+      args:
+        PYTHON_IMAGE: ${DOCKER_PYTHON_IMAGE:-docker.hanxi.cc/library/python:3.11-slim}
     environment:
       DT_HELPER_BIND_HOST: 0.0.0.0
       DT_HELPER_PORT: ${HELPER_PORT:-19091}

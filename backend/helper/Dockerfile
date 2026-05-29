@@ -1,4 +1,6 @@
-FROM python:3.11-slim
+ARG PYTHON_IMAGE=docker.hanxi.cc/library/python:3.11-slim
+
+FROM ${PYTHON_IMAGE}
 
 WORKDIR /app
 
