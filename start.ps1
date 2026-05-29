@@ -178,7 +178,8 @@ function Stop-ProcessTree {
 
   try {
     Stop-Process -Id $ProcessId -Force -ErrorAction Stop
-    return $true
+    Wait-Process -Id $ProcessId -Timeout 5 -ErrorAction SilentlyContinue
+    return -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
   } catch {
     return $false
   }
@@ -191,12 +192,19 @@ function Stop-ProjectProcesses {
     "Set-Location -LiteralPath '.*\\backend'",
     "Set-Location -LiteralPath '.*\\frontend'",
     "Set-Location -LiteralPath '.*\\backend\\helper'",
+    "dt-manager-web[\\/]+backend",
+    "dt-manager-web[\\/]+frontend",
+    "dt-manager-web[\\/]+backend[\\/]+helper",
     "dt-manager-web\\backend\\node_modules",
     "dt-manager-web\\frontend\\node_modules",
     "dt-manager-web\\backend\\helper\\server\.py",
+    "backend[\\/]+node_modules[\\/]+tsx",
+    "frontend[\\/]+node_modules[\\/]+vite",
     "npm-cli\.js.*--prefix .*dt-manager-web",
     "tsx\\dist\\cli\.mjs.*backend",
+    "tsx[\\/]+dist[\\/]+cli\.mjs.*backend",
     "vite\\bin\\vite\.js.*frontend",
+    "vite[\\/]+bin[\\/]+vite\.js.*frontend",
     "python server\.py"
   )
   $allowedNames = @("node.exe", "python.exe", "powershell.exe", "pwsh.exe")
@@ -283,6 +291,31 @@ function Invoke-WithRetry {
   }
 }
 
+function Test-PrismaClientReady {
+  $clientDir = Join-Path $backendDir "node_modules\.prisma\client"
+  return (Test-Path -LiteralPath (Join-Path $clientDir "index.js")) -and
+    (Test-Path -LiteralPath (Join-Path $clientDir "query_engine-windows.dll.node"))
+}
+
+function Invoke-PrismaGenerate {
+  Push-Location $backendDir
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    $output = & npx prisma generate 2>&1
+    $exitCode = $LASTEXITCODE
+    foreach ($line in $output) {
+      Write-Host $line
+    }
+    if ($exitCode -ne 0) {
+      throw ($output -join [Environment]::NewLine)
+    }
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+    Pop-Location
+  }
+}
+
 Import-DotEnvFile -Path $envFile
 
 $BackendPort = Resolve-EnvInt -Value $BackendPort -Names @("PORT", "BACKEND_PORT") -Default 3000
@@ -315,8 +348,18 @@ if (-not $SkipInstall) {
 }
 
 Write-Host "[backend] generating Prisma client..."
-Invoke-WithRetry -Name "prisma generate" -Action {
-  Invoke-WorkingDirectoryCommand $backendDir { npx prisma generate }
+try {
+  Invoke-WithRetry -Name "prisma generate" -Retries 5 -DelaySeconds 3 -Action {
+    Invoke-PrismaGenerate
+  }
+} catch {
+  $message = $_.Exception.Message
+  if ($message -match 'EPERM|access is denied|access denied|rename' -and (Test-PrismaClientReady)) {
+    Write-Host "[backend] Prisma client engine is locked by another local process; using existing generated client."
+    Write-Host "[backend] To force regeneration, close other tools using this project and run: cd backend; npx prisma generate"
+  } else {
+    throw
+  }
 }
 
 Write-Host "[backend] applying Prisma migrations..."

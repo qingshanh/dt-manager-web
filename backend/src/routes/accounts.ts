@@ -1733,19 +1733,31 @@ async function captureAndImportSession(
   }
 }
 
-async function persistCapturedSession(accountId: number, account: { dtDeviceId: string }, session: DingtoneSessionExport) {
+async function persistCapturedSession(accountId: number, account: { dtDeviceId: string; email?: string | null; phone?: string | null }, session: DingtoneSessionExport) {
   const persistedAccountId = await persistAuthenticatedSession(accountId, {
     dtUserId: session.dtUserId,
     token: session.token,
     deviceId: normalizeOptionalString(session.deviceId) ?? account.dtDeviceId
   });
+  const activatedEmail = normalizeOptionalString(session.activatedEmail);
+  const mainPhone = normalizeOptionalString(session.mainPhone);
+  if ((activatedEmail && !account.email) || (mainPhone && !account.phone)) {
+    await prisma.dtAccount.update({
+      where: { id: persistedAccountId },
+      data: {
+        ...(activatedEmail && !account.email ? { email: activatedEmail } : {}),
+        ...(mainPhone && !account.phone ? { phone: mainPhone } : {})
+      }
+    });
+  }
   if (session.snapshot) {
+    const previousSnapshot = await prisma.accountSnapshot.findUnique({ where: { accountId: persistedAccountId } });
     await prisma.accountSnapshot.upsert({
       where: { accountId: persistedAccountId },
-      update: mapSnapshot(session.snapshot),
+      update: mapSnapshot(session.snapshot, previousSnapshot),
       create: {
         accountId: persistedAccountId,
-        ...mapSnapshot(session.snapshot)
+        ...mapSnapshot(session.snapshot, previousSnapshot)
       }
     });
   }
@@ -1953,7 +1965,6 @@ async function assertCapturedSessionIsNotOwnedByAnotherAccount(
     where: {
       adminId: account.adminId,
       dtUserId,
-      appVariant: account.appVariant,
       NOT: { id: account.id }
     },
     select: {
@@ -2198,7 +2209,6 @@ async function mergeDuplicateAccounts(accountId: number) {
     where: {
       adminId: target.adminId,
       dtUserId,
-      appVariant: target.appVariant,
       NOT: { id: accountId }
     }
   });
@@ -3957,31 +3967,62 @@ function safeJsonStringify(value: unknown) {
   }
 }
 
-function mapSnapshot(snapshot: DingtoneSnapshot) {
+function mapSnapshot(snapshot: DingtoneSnapshot, previousSnapshot?: {
+  dtDingtoneId: string | null;
+  fullName: string | null;
+  avatarUrl: string | null;
+  gender: number | null;
+  birthday: string | null;
+  email: string | null;
+  phone: string | null;
+  aboutMe: string | null;
+  feeling: string | null;
+  company: string | null;
+  school: string | null;
+  country: string | null;
+  state: string | null;
+  city: string | null;
+  primaryBalance: number | null;
+  userGrade: number | null;
+  validPoint: number | null;
+  progressPoint: number | null;
+  membershipType: string | null;
+  membershipExpireAt: Date | null;
+  profileVerCode: string | null;
+  rawJson: string | null;
+} | null) {
   return {
-    dtDingtoneId: snapshot.dtDingtoneId ?? null,
-    fullName: snapshot.fullName ?? null,
-    avatarUrl: snapshot.avatarUrl ?? null,
-    gender: snapshot.gender ?? null,
-    birthday: snapshot.birthday ?? null,
-    email: snapshot.email ?? null,
-    phone: snapshot.phone ?? null,
-    aboutMe: snapshot.aboutMe ?? null,
-    feeling: snapshot.feeling ?? null,
-    company: snapshot.company ?? null,
-    school: snapshot.school ?? null,
-    country: snapshot.country ?? null,
-    state: snapshot.state ?? null,
-    city: snapshot.city ?? null,
-    primaryBalance: snapshot.primaryBalance ?? null,
-    userGrade: snapshot.userGrade ?? null,
-    validPoint: snapshot.validPoint ?? null,
-    progressPoint: snapshot.progressPoint ?? null,
-    membershipType: snapshot.membershipType ?? null,
-    membershipExpireAt: snapshot.membershipExpireAt ?? null,
-    profileVerCode: snapshot.profileVerCode ?? null,
-    rawJson: snapshot.rawJson ?? JSON.stringify(snapshot)
+    dtDingtoneId: pickNextValue(snapshot.dtDingtoneId, previousSnapshot?.dtDingtoneId),
+    fullName: pickNextValue(snapshot.fullName, previousSnapshot?.fullName),
+    avatarUrl: pickNextValue(snapshot.avatarUrl, previousSnapshot?.avatarUrl),
+    gender: pickNextNumber(snapshot.gender, previousSnapshot?.gender),
+    birthday: pickNextValue(snapshot.birthday, previousSnapshot?.birthday),
+    email: pickNextValue(snapshot.email, previousSnapshot?.email),
+    phone: pickNextValue(snapshot.phone, previousSnapshot?.phone),
+    aboutMe: pickNextValue(snapshot.aboutMe, previousSnapshot?.aboutMe),
+    feeling: pickNextValue(snapshot.feeling, previousSnapshot?.feeling),
+    company: pickNextValue(snapshot.company, previousSnapshot?.company),
+    school: pickNextValue(snapshot.school, previousSnapshot?.school),
+    country: pickNextValue(snapshot.country, previousSnapshot?.country),
+    state: pickNextValue(snapshot.state, previousSnapshot?.state),
+    city: pickNextValue(snapshot.city, previousSnapshot?.city),
+    primaryBalance: pickNextNumber(snapshot.primaryBalance, previousSnapshot?.primaryBalance),
+    userGrade: pickNextNumber(snapshot.userGrade, previousSnapshot?.userGrade),
+    validPoint: pickNextNumber(snapshot.validPoint, previousSnapshot?.validPoint),
+    progressPoint: pickNextNumber(snapshot.progressPoint, previousSnapshot?.progressPoint),
+    membershipType: pickNextValue(snapshot.membershipType ?? snapshot.membershipLevelLabel, previousSnapshot?.membershipType),
+    membershipExpireAt: snapshot.membershipExpireAt ?? previousSnapshot?.membershipExpireAt ?? null,
+    profileVerCode: pickNextValue(snapshot.profileVerCode, previousSnapshot?.profileVerCode),
+    rawJson: snapshot.rawJson ?? previousSnapshot?.rawJson ?? JSON.stringify(snapshot)
   };
+}
+
+function pickNextValue(next: string | null | undefined, previous: string | null | undefined) {
+  return normalizeOptionalString(next) ?? normalizeOptionalString(previous) ?? null;
+}
+
+function pickNextNumber(next: number | null | undefined, previous: number | null | undefined) {
+  return Number.isFinite(next) ? next : Number.isFinite(previous) ? previous : null;
 }
 
 function mapPhoneNumberBase(item: Partial<DingtonePhoneNumber>) {

@@ -12,6 +12,7 @@ const schema = z.object({
   JWT_SECRET: z.string().min(16),
   JWT_EXPIRES_IN: z.string().default("24h"),
   ENCRYPTION_KEY: z.string().min(16),
+  LEGACY_ENCRYPTION_KEYS: z.string().optional().default(""),
   ADMIN_USERNAME: z.string().default("admin"),
   ADMIN_PASSWORD: z.string().min(8).default("change-me"),
   CORS_ORIGIN: z.string().default("http://localhost:5173"),

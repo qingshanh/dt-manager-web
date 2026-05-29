@@ -2,6 +2,10 @@ import crypto from "node:crypto";
 import { config } from "../config.js";
 
 const key = crypto.createHash("sha256").update(config.ENCRYPTION_KEY).digest();
+const legacyKeys = config.LEGACY_ENCRYPTION_KEYS.split(",")
+  .map((value) => value.trim())
+  .filter((value) => value && value !== config.ENCRYPTION_KEY)
+  .map((value) => crypto.createHash("sha256").update(value).digest());
 
 export function hashPassword(password: string) {
   return crypto.createHash("sha256").update(password).digest("hex");
@@ -19,11 +23,22 @@ export function decryptText(value: string | null | undefined) {
   if (!value) {
     return null;
   }
+  for (const candidateKey of [key, ...legacyKeys]) {
+    try {
+      return decryptTextWithKey(value, candidateKey);
+    } catch {
+      // Try the next configured key. This keeps old database rows usable after .env migration.
+    }
+  }
+  return decryptTextWithKey(value, key);
+}
+
+function decryptTextWithKey(value: string, candidateKey: Buffer) {
   const payload = Buffer.from(value, "base64");
   const iv = payload.subarray(0, 12);
   const tag = payload.subarray(12, 28);
   const encrypted = payload.subarray(28);
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", candidateKey, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
 }

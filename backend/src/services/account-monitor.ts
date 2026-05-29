@@ -80,6 +80,11 @@ export class AccountMonitorService {
     if (!account.dtUserId || !account.dtToken) {
       throw new AppError("Account has not completed login yet", 400, 400);
     }
+    try {
+      requireDecryptedToken(account.dtToken);
+    } catch {
+      throw new AppError("Account token cannot be decrypted. Re-import this account session or set LEGACY_ENCRYPTION_KEYS to the old ENCRYPTION_KEY.", 400, 400);
+    }
 
     await this.stopDuplicateDtUserIdMonitors(accountId, account.adminId, account.dtUserId);
     await this.stop(accountId, { preserveMonitorEnabled: true, targetStatus: AccountStatus.offline, emitStatus: false });
@@ -345,6 +350,9 @@ export class AccountMonitorService {
       await this.runCycle(runner, false);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (runner.stopped) {
+        return;
+      }
       logger.error("Account monitor tick crashed, stopping runner", {
         accountId,
         error: message

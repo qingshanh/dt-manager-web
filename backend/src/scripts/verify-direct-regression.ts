@@ -140,6 +140,9 @@ async function main() {
   checks.push(checkLoginBootstrapPatchesAppIdentity());
   checks.push(checkSessionImportVariantGuards());
   checks.push(checkDtUserIdMonitorUniqueness());
+  checks.push(checkLegacyEncryptionKeyFallback());
+  checks.push(checkMonitorStartTokenPreflight());
+  checks.push(checkDuplicateSessionMergeAcrossVariants());
   checks.push(checkDirectMonitorHostDiagnostics());
   checks.push(checkPreviewAreaCodeBackfill());
   checks.push(checkPhoneTelegramNotifications());
@@ -956,6 +959,34 @@ function readSourceFile(path: string) {
   return fs.readFileSync(path, "utf8");
 }
 
+function extractFunctionBlock(source: string, functionName: string) {
+  let start = source.indexOf(`function ${functionName}`);
+  if (start < 0) {
+    start = source.indexOf(`async function ${functionName}`);
+  }
+  if (start < 0) {
+    return "";
+  }
+  const signatureMatch = source.slice(start).match(/\)\s*\{/);
+  if (!signatureMatch || signatureMatch.index === undefined) {
+    return "";
+  }
+  const braceStart = start + signatureMatch.index + signatureMatch[0].lastIndexOf("{");
+  let depth = 0;
+  for (let index = braceStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(start, index + 1);
+      }
+    }
+  }
+  return source.slice(start);
+}
+
 function checkDirectTemplateValidation() {
   const valid = "01070000001681020000000000000000000000000000";
   const truncated = "01070000002081020000000000000000000000000000";
@@ -1342,6 +1373,67 @@ function checkDtUserIdMonitorUniqueness() {
       directKeyUsesUserIdOnly,
       stopsDuplicateMonitors,
       restoreDedupes
+    }
+  };
+}
+
+function checkLegacyEncryptionKeyFallback() {
+  const configText = readSourceFile("src/config.ts");
+  const cryptoText = readSourceFile("src/utils/crypto.ts");
+  const envText = fs.readFileSync("../.env.example", "utf8");
+  const configHasLegacyKeys = configText.includes("LEGACY_ENCRYPTION_KEYS");
+  const cryptoTriesLegacyKeys =
+    cryptoText.includes("legacyKeys") &&
+    cryptoText.includes("for (const candidateKey of [key, ...legacyKeys])") &&
+    cryptoText.includes("decryptTextWithKey");
+  const envDocumentsLegacyKeys = envText.includes("LEGACY_ENCRYPTION_KEYS=") && envText.includes("旧入库加密密钥");
+  return {
+    name: "legacy_encryption_key_fallback",
+    ok: configHasLegacyKeys && cryptoTriesLegacyKeys && envDocumentsLegacyKeys,
+    detail: {
+      configHasLegacyKeys,
+      cryptoTriesLegacyKeys,
+      envDocumentsLegacyKeys
+    }
+  };
+}
+
+function checkMonitorStartTokenPreflight() {
+  const monitorText = readSourceFile("src/services/account-monitor.ts");
+  const preflightsToken =
+    monitorText.includes("requireDecryptedToken(account.dtToken)") &&
+    monitorText.includes("Account token cannot be decrypted");
+  const preservesFatalError =
+    monitorText.includes("if (runner.stopped)") &&
+    monitorText.includes("return;") &&
+    monitorText.includes("Account monitor tick crashed");
+  return {
+    name: "monitor_start_token_preflight",
+    ok: preflightsToken && preservesFatalError,
+    detail: {
+      preflightsToken,
+      preservesFatalError
+    }
+  };
+}
+
+function checkDuplicateSessionMergeAcrossVariants() {
+  const routeText = readSourceFile("src/routes/accounts.ts");
+  const mergeDuplicateBlock = extractFunctionBlock(routeText, "mergeDuplicateAccounts");
+  const ownerGuardBlock = extractFunctionBlock(routeText, "assertCapturedSessionIsNotOwnedByAnotherAccount");
+  const hasDtUserIdAndNotGuard = (block: string) => /dtUserId\s*,\s*NOT\s*:/m.test(block);
+  const mergesByDtUserIdAcrossVariants =
+    hasDtUserIdAndNotGuard(mergeDuplicateBlock) &&
+    !/dtUserId\s*,\s*appVariant:\s*target\.appVariant/m.test(mergeDuplicateBlock);
+  const ownerGuardChecksByDtUserIdAcrossVariants =
+    hasDtUserIdAndNotGuard(ownerGuardBlock) &&
+    !/dtUserId\s*,\s*appVariant:\s*account\.appVariant/m.test(ownerGuardBlock);
+  return {
+    name: "duplicate_session_merge_across_variants",
+    ok: mergesByDtUserIdAcrossVariants && ownerGuardChecksByDtUserIdAcrossVariants,
+    detail: {
+      mergesByDtUserIdAcrossVariants,
+      ownerGuardChecksByDtUserIdAcrossVariants
     }
   };
 }

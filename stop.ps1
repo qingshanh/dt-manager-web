@@ -16,7 +16,8 @@ function Stop-ProcessTree {
 
   try {
     Stop-Process -Id $ProcessId -Force -ErrorAction Stop
-    return $true
+    Wait-Process -Id $ProcessId -Timeout 5 -ErrorAction SilentlyContinue
+    return -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
   } catch {
     return $false
   }
@@ -27,8 +28,15 @@ function Stop-ProjectProcesses {
     "dt-manager-web\\backend",
     "dt-manager-web\\frontend",
     "dt-manager-web\\backend\\helper",
+    "dt-manager-web[\\/]+backend",
+    "dt-manager-web[\\/]+frontend",
+    "dt-manager-web[\\/]+backend[\\/]+helper",
     "tsx\\dist\\cli\.mjs.*backend",
+    "tsx[\\/]+dist[\\/]+cli\.mjs.*backend",
     "vite\\bin\\vite\.js.*frontend",
+    "vite[\\/]+bin[\\/]+vite\.js.*frontend",
+    "backend[\\/]+node_modules[\\/]+tsx",
+    "frontend[\\/]+node_modules[\\/]+vite",
     "python .*server\.py"
   )
   $allowedNames = @("node.exe", "python.exe", "powershell.exe", "pwsh.exe")
