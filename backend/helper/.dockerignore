@@ -1,0 +1,8 @@
+node_modules
+__pycache__
+*.pyc
+*.pyo
+*.log
+*notes*.md
+*capture*.py
+*capture*.js

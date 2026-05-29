@@ -1,0 +1,12 @@
+node_modules
+dist
+data
+dev.stdout.log
+dev.stderr.log
+.env
+.env.*
+*.db
+*.db-*
+*.log
+__pycache__/
+*.pyc

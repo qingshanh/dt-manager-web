@@ -1,0 +1,209 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum LoginType {
+  email_code
+  phone_code
+  email_password
+  phone_password
+  manual_session
+}
+
+enum AppVariant {
+  dingtone
+  dingdong
+}
+
+enum AccountStatus {
+  pending
+  offline
+  online
+  error
+  expired
+}
+
+enum PhoneStatus {
+  active
+  paused
+  expired
+  cancelled
+  pending
+}
+
+enum MessageDirection {
+  incoming
+  outgoing
+}
+
+enum MessageType {
+  sms
+  verification
+  mms
+  system
+}
+
+enum MonitorStatus {
+  running
+  stopped
+  error
+}
+
+model AdminUser {
+  id           Int         @id @default(autoincrement())
+  username     String      @unique
+  passwordHash String      @map("password_hash")
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt @map("updated_at")
+  accounts     DtAccount[]
+
+  @@map("admin_users")
+}
+
+model DtAccount {
+  id              Int             @id @default(autoincrement())
+  adminId         Int             @map("admin_id")
+  nickname        String?
+  appVariant      AppVariant      @default(dingtone) @map("app_variant")
+  loginType       LoginType       @map("login_type")
+  email           String?
+  phone           String?
+  password        String?
+  dtUserId        String?         @map("dt_user_id")
+  dtToken         String?         @map("dt_token")
+  dtDeviceId      String          @map("dt_device_id")
+  dtTrackCode     String          @map("dt_track_code")
+  status          AccountStatus   @default(offline)
+  monitorEnabled  Boolean         @default(false) @map("monitor_enabled")
+  telegramNotify  Boolean         @default(false) @map("telegram_notify")
+  proxyEnabled    Boolean         @default(false) @map("proxy_enabled")
+  lastLoginAt     DateTime?       @map("last_login_at")
+  lastError       String?         @map("last_error")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  admin           AdminUser       @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  snapshot        AccountSnapshot?
+  phoneNumbers    PhoneNumber[]
+  messages        Message[]
+  monitorSessions MonitorSession[]
+
+  @@index([adminId])
+  @@index([status])
+  @@unique([adminId, appVariant, email])
+  @@unique([adminId, appVariant, phone])
+  @@map("dt_accounts")
+}
+
+model AccountSnapshot {
+  id                 Int       @id @default(autoincrement())
+  accountId          Int       @unique @map("account_id")
+  dtDingtoneId       String?   @map("dt_dingtone_id")
+  fullName           String?   @map("full_name")
+  avatarUrl          String?   @map("avatar_url")
+  gender             Int?
+  birthday           String?
+  email              String?
+  phone              String?
+  aboutMe            String?   @map("about_me")
+  feeling            String?
+  company            String?
+  school             String?
+  country            String?
+  state              String?
+  city               String?
+  primaryBalance     Float?    @map("primary_balance")
+  userGrade          Int?      @map("user_grade")
+  validPoint         Float?    @map("valid_point")
+  progressPoint      Float?    @map("progress_point")
+  membershipType     String?   @map("membership_type")
+  membershipExpireAt DateTime? @map("membership_expire_at")
+  profileVerCode     String?   @map("profile_ver_code")
+  rawJson            String?   @map("raw_json")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+  account            DtAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@map("account_snapshots")
+}
+
+model PhoneNumber {
+  id              Int         @id @default(autoincrement())
+  accountId       Int         @map("account_id")
+  phoneNumber     String      @map("phone_number")
+  countryCode     Int?        @map("country_code")
+  providerId      Int?        @map("provider_id")
+  displayName     String?     @map("display_name")
+  status          PhoneStatus @default(pending)
+  purchaseType    Int?        @map("purchase_type")
+  payType         Int?        @map("pay_type")
+  validPeriodDays Int?        @map("valid_period_days")
+  gainTime        String?     @map("gain_time")
+  expiredTime     String?     @map("expired_time")
+  autoRenew       Boolean     @default(false) @map("auto_renew")
+  isPrimary       Boolean     @default(false) @map("is_primary")
+  isGoodNumber    Boolean     @default(false) @map("is_good_number")
+  portoutInfo     String?     @map("portout_info")
+  rawJson         String?     @map("raw_json")
+  createdAt       DateTime    @default(now()) @map("created_at")
+  updatedAt       DateTime    @updatedAt @map("updated_at")
+  account         DtAccount   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, phoneNumber])
+  @@index([accountId, status])
+  @@map("phone_numbers")
+}
+
+model Message {
+  id            Int              @id @default(autoincrement())
+  accountId     Int              @map("account_id")
+  direction     MessageDirection
+  msgType       MessageType      @map("msg_type")
+  fromNumber    String?          @map("from_number")
+  toNumber      String?          @map("to_number")
+  content       String
+  rawInfo       String?          @map("raw_info")
+  rawK3         String?          @map("raw_k3")
+  k5Flag        Int?             @map("k5_flag")
+  isRead        Boolean          @default(false) @map("is_read")
+  telegramSent  Boolean          @default(false) @map("telegram_sent")
+  telegramMsgId String?          @map("telegram_msg_id")
+  receivedAt    DateTime         @map("received_at")
+  createdAt     DateTime         @default(now()) @map("created_at")
+  account       DtAccount        @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, receivedAt(sort: Desc)])
+  @@index([accountId, isRead])
+  @@map("messages")
+}
+
+model MonitorSession {
+  id               Int           @id @default(autoincrement())
+  accountId        Int           @map("account_id")
+  status           MonitorStatus
+  serverIp         String?       @map("server_ip")
+  serverPort       Int?          @map("server_port")
+  routeAddress     String?       @map("route_address")
+  startedAt        DateTime      @default(now()) @map("started_at")
+  stoppedAt        DateTime?     @map("stopped_at")
+  errorMessage     String?       @map("error_message")
+  heartbeatCount   Int           @default(0) @map("heartbeat_count")
+  msgReceivedCount Int           @default(0) @map("msg_received_count")
+  account          DtAccount     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, status])
+  @@map("monitor_sessions")
+}
+
+model Setting {
+  id          Int      @id @default(autoincrement())
+  key         String   @unique
+  value       String
+  description String?
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("settings")
+}

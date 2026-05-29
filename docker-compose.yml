@@ -1,0 +1,67 @@
+services:
+  backend:
+    restart: unless-stopped
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./.env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${BACKEND_INTERNAL_PORT:-3000}
+      APP_VERSION: ${APP_VERSION:-0.1.0}
+      DATABASE_URL: file:/app/data/dingtone.db
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080,http://127.0.0.1:8080}
+    volumes:
+      - backend-data:/app/data
+    ports:
+      - "${BACKEND_PORT:-3000}:${BACKEND_INTERNAL_PORT:-3000}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${BACKEND_INTERNAL_PORT:-3000}/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    restart: unless-stopped
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-0.1.0}
+        VITE_APP_VERSION: ${VITE_APP_VERSION:-0.1.0}
+    depends_on:
+      - backend
+    environment:
+      BACKEND_INTERNAL_PORT: ${BACKEND_INTERNAL_PORT:-3000}
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  helper:
+    restart: unless-stopped
+    profiles:
+      - real
+    build:
+      context: ./backend/helper
+      dockerfile: Dockerfile
+    environment:
+      DT_HELPER_BIND_HOST: 0.0.0.0
+      DT_HELPER_PORT: ${HELPER_PORT:-19091}
+      DT_HELPER_DEVICE_MODE: ${DT_HELPER_DEVICE_MODE:-remote}
+      DT_HELPER_REMOTE_HOST: ${DT_HELPER_REMOTE_HOST:-host.docker.internal:27042}
+      DT_HELPER_DEVICE_ID: ${DT_HELPER_DEVICE_ID:-}
+      DT_HELPER_TOKEN: ${DT_HELPER_TOKEN:-}
+      DT_HELPER_DINGTONE_PACKAGE: ${DT_HELPER_DINGTONE_PACKAGE:-me.talkyou.app.im}
+      DT_HELPER_DINGDONG_PACKAGE: ${DT_HELPER_DINGDONG_PACKAGE:-me.dingtone.app.im}
+      DT_HELPER_TIMEOUT_MS: ${DT_HELPER_TIMEOUT_MS:-90000}
+      DT_HELPER_SPAWN_PAUSE_MS: ${DT_HELPER_SPAWN_PAUSE_MS:-1500}
+    ports:
+      - "${HELPER_PORT:-19091}:${HELPER_PORT:-19091}"
+
+volumes:
+  backend-data:

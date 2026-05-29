@@ -1,0 +1,7 @@
+{
+  "name": "dt-manager-web-helper",
+  "private": true,
+  "dependencies": {
+    "frida-java-bridge": "7.0.8"
+  }
+}
