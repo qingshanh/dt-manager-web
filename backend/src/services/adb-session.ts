@@ -56,6 +56,9 @@ function parseCoreConfigSession(buffer: Buffer, variant: AdbAppVariant, packageN
   const token = strings.find((item) => /^[0-9a-f]{32}$/i.test(item));
   const deviceIdCandidates = strings.filter((item) => /^And\.[A-Za-z0-9._-]{8,}$/.test(item));
   const deviceId = deviceIdCandidates[0];
+  const activatedEmail = strings.find((item) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(item)) ?? null;
+  const mainPhone =
+    strings.find((item) => /^\+?\d{7,15}$/.test(item) && item !== dtUserId && item !== token) ?? null;
 
   if (!dtUserId || !token || !deviceId) {
     return null;
@@ -67,7 +70,10 @@ function parseCoreConfigSession(buffer: Buffer, variant: AdbAppVariant, packageN
     deviceId,
     deviceIdCandidates,
     appVariant: variant,
-    packageName
+    packageName,
+    activatedEmail,
+    mainPhone,
+    snapshot: activatedEmail || mainPhone ? { email: activatedEmail ?? undefined, phone: mainPhone ?? undefined } : undefined
   };
 }
 

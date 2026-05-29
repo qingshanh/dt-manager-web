@@ -589,9 +589,14 @@ accountsRouter.get("/backup/export", async (req, res, next) => {
     const [settings, accounts] = await Promise.all([
       prisma.setting.findMany({ orderBy: { key: "asc" } }),
       prisma.dtAccount.findMany({
-        where: { adminId },
         orderBy: { id: "asc" },
         include: {
+          admin: {
+            select: {
+              id: true,
+              username: true
+            }
+          },
           snapshot: true,
           phoneNumbers: { orderBy: [{ isPrimary: "desc" }, { createdAt: "desc" }] },
           messages: { orderBy: { receivedAt: "asc" } }
@@ -610,8 +615,11 @@ accountsRouter.get("/backup/export", async (req, res, next) => {
         description: item.description
       })),
       accounts: accounts.map((account) => ({
+        source_admin_id: account.adminId,
+        source_admin_username: account.admin.username,
         nickname: account.nickname,
         app_variant: account.appVariant,
+        package_name: expectedPackageNameForVariant(account.appVariant),
         login_type: account.loginType,
         email: account.email,
         phone: account.phone,
@@ -2642,26 +2650,14 @@ async function importSessionAccount(
     where: {
       adminId,
       dtUserId: item.dt_user_id
-    }
+    },
+    orderBy: { id: "asc" }
   });
-  const uniqueExistingVariants = Array.from(new Set(existingByUserIdAccounts.map((account) => account.appVariant)));
-  const inferredAppVariant = importedPackageVariant ?? item.app_variant ?? deviceVariant ?? uniqueExistingVariants[0] ?? AppVariant.dingtone;
-  if (uniqueExistingVariants.length > 1 && !importedPackageVariant && !item.app_variant && !deviceVariant) {
-    throw new AppError(
-      `Imported dt_user_id ${item.dt_user_id} already exists under multiple app types. Include package_name or app_variant in the import file to avoid mixing TalkU and Dingdong sessions.`,
-      409,
-      409
-    );
-  }
-  const conflictingExisting = existingByUserIdAccounts.find((account) => account.appVariant !== inferredAppVariant);
-  if (conflictingExisting) {
-    throw new AppError(
-      `Imported dt_user_id ${item.dt_user_id} already exists as ${describeAccountVariant(conflictingExisting.appVariant)} account #${conflictingExisting.id}; refusing to import it as ${describeAccountVariant(inferredAppVariant)}.`,
-      409,
-      409
-    );
-  }
-  const existingByUserId = existingByUserIdAccounts.find((account) => account.appVariant === inferredAppVariant) ?? null;
+  const inferredAppVariant = importedPackageVariant ?? item.app_variant ?? deviceVariant ?? existingByUserIdAccounts[0]?.appVariant ?? AppVariant.dingtone;
+  const existingByUserId =
+    existingByUserIdAccounts.find((account) => account.appVariant === inferredAppVariant) ??
+    existingByUserIdAccounts[0] ??
+    null;
   const resolvedAppVariant = inferredAppVariant;
 
   const existing =
@@ -2713,12 +2709,13 @@ async function importSessionAccount(
 
   if (item.snapshot) {
     const snapshot = normalizeImportedSnapshot(item.snapshot);
+    const previousSnapshot = await prisma.accountSnapshot.findUnique({ where: { accountId: account.id } });
     await prisma.accountSnapshot.upsert({
       where: { accountId: account.id },
-      update: mapSnapshot(snapshot),
+      update: mapSnapshot(snapshot, previousSnapshot),
       create: {
         accountId: account.id,
-        ...mapSnapshot(snapshot)
+        ...mapSnapshot(snapshot, previousSnapshot)
       }
     });
   }
@@ -2765,48 +2762,53 @@ async function importFullBackupAccount(adminId: number, item: Record<string, unk
   const importedPackageVariant = inferAppVariantFromPackageName(normalizeOptionalString(item.package_name));
   const deviceVariant = inferAppVariantFromDeviceId(deviceId);
   const explicitVariant = normalizeAppVariantValue(item.app_variant);
-  const appVariant = importedPackageVariant ?? explicitVariant ?? deviceVariant ?? AppVariant.dingtone;
   if (explicitVariant && importedPackageVariant && explicitVariant !== importedPackageVariant) {
     throw new AppError("Backup account app_variant does not match package_name.", 409, 409);
   }
-  if (deviceVariant && appVariant !== deviceVariant) {
+  const requestedAppVariant = importedPackageVariant ?? explicitVariant ?? deviceVariant;
+  if (deviceVariant && requestedAppVariant && requestedAppVariant !== deviceVariant) {
     throw new AppError("Backup account device_id does not match app_variant.", 409, 409);
   }
 
+  const incomingEmail = normalizeOptionalString(item.email);
+  const incomingPhone = normalizeOptionalString(item.phone);
+  const existingByUserIdAccounts = dtUserId
+    ? await prisma.dtAccount.findMany({ where: { adminId, dtUserId }, orderBy: { id: "asc" } })
+    : [];
+  const appVariant = requestedAppVariant ?? existingByUserIdAccounts[0]?.appVariant ?? AppVariant.dingtone;
   const existing = dtUserId
-    ? await prisma.dtAccount.findFirst({ where: { adminId, dtUserId, appVariant } })
-    : await findExistingAccount(
-        adminId,
-        appVariant,
-        normalizeOptionalString(item.email),
-        normalizeOptionalString(item.phone)
-      );
+    ? existingByUserIdAccounts.find((account) => account.appVariant === appVariant) ?? existingByUserIdAccounts[0] ?? null
+    : await findExistingAccount(adminId, appVariant, incomingEmail, incomingPhone);
   const token = normalizeOptionalString(item.token ?? item.dt_token);
   const password = normalizeOptionalString(item.password);
   const loginType = normalizeLoginTypeValue(item.login_type);
   const status = normalizeAccountStatusValue(item.status);
+  const incomingTrackCode = normalizeOptionalString(item.track_code);
+  const incomingLastLoginAt = normalizeBackupDate(item.last_login_at);
+  const incomingLastError = normalizeOptionalString(item.last_error);
   const accountData = {
     nickname:
       normalizeOptionalString(item.nickname) ??
-      normalizeOptionalString(item.email) ??
-      normalizeOptionalString(item.phone) ??
+      incomingEmail ??
+      incomingPhone ??
       dtUserId ??
+      existing?.nickname ??
       "imported-account",
     appVariant,
     loginType,
-    email: normalizeOptionalString(item.email),
-    phone: normalizeOptionalString(item.phone),
-    password: password ? encryptText(password) : null,
+    email: incomingEmail ?? existing?.email ?? null,
+    phone: incomingPhone ?? existing?.phone ?? null,
+    password: password ? encryptText(password) : existing?.password ?? null,
     dtUserId,
-    dtToken: token ? encryptText(token) : null,
+    dtToken: token ? encryptText(token) : existing?.dtToken ?? null,
     dtDeviceId: deviceId,
-    dtTrackCode: normalizeOptionalString(item.track_code) ?? createTrackCode(),
+    dtTrackCode: incomingTrackCode ?? existing?.dtTrackCode ?? createTrackCode(),
     status,
     monitorEnabled: Boolean(item.monitor_enabled),
     telegramNotify: Boolean(item.telegram_notify),
     proxyEnabled: Boolean(item.proxy_enabled),
-    lastLoginAt: normalizeBackupDate(item.last_login_at),
-    lastError: normalizeOptionalString(item.last_error)
+    lastLoginAt: incomingLastLoginAt ?? existing?.lastLoginAt ?? null,
+    lastError: incomingLastError ?? existing?.lastError ?? null
   };
 
   const account = existing
@@ -2823,12 +2825,13 @@ async function importFullBackupAccount(adminId: number, item: Record<string, unk
 
   const snapshot = normalizeBackupSnapshot(item.snapshot);
   if (snapshot) {
+    const previousSnapshot = await prisma.accountSnapshot.findUnique({ where: { accountId: account.id } });
     await prisma.accountSnapshot.upsert({
       where: { accountId: account.id },
-      update: mapSnapshot(snapshot),
+      update: mapSnapshot(snapshot, previousSnapshot),
       create: {
         accountId: account.id,
-        ...mapSnapshot(snapshot)
+        ...mapSnapshot(snapshot, previousSnapshot)
       }
     });
   }
@@ -2899,6 +2902,8 @@ async function importFullBackupAccount(adminId: number, item: Record<string, unk
       }
     );
   }
+
+  await mergeDuplicateAccounts(account.id);
 
   return {
     account_id: account.id,

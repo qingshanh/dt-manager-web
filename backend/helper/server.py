@@ -319,16 +319,25 @@ class FridaBridge:
                 project_root=str(self.config.agent_path.parent),
             )
         except Exception as error:
-            print("[helper] failed to compile frida agent, falling back to raw source", flush=True)
+            print("[helper] failed to compile frida agent", flush=True)
             traceback.print_exc()
             try:
-                compiled_source = self.config.agent_path.read_text(encoding="utf-8")
+                raw_source = self.config.agent_path.read_text(encoding="utf-8")
             except Exception as read_error:
                 raise BridgeError(
                     f"Failed to compile the Frida agent and failed to read raw source: {read_error}",
                     500,
                     500,
                 ) from read_error
+            if "frida-java-bridge" in raw_source:
+                raise BridgeError(
+                    "Failed to compile the Frida agent. Run `npm install` in backend/helper "
+                    "so frida-java-bridge is available, then restart the helper.",
+                    500,
+                    500,
+                ) from error
+            print("[helper] falling back to raw frida agent source", flush=True)
+            compiled_source = raw_source
 
         self._compiled_agent_source = compiled_source
         self._compiled_agent_mtime_ns = source_mtime_ns

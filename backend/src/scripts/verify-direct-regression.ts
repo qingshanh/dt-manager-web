@@ -1334,22 +1334,23 @@ function checkSessionImportVariantGuards() {
   const hasDeviceInference = routeText.includes("function inferAppVariantFromDeviceId") && routeText.includes('normalized.includes("dttalk")');
   const validatesPackageVsDevice = routeText.includes("deviceVariant && importedPackageVariant && deviceVariant !== importedPackageVariant");
   const validatesPackageVsDeclared = routeText.includes("importedPackageVariant && item.app_variant && importedPackageVariant !== item.app_variant");
-  const rejectsCrossVariantUserId =
+  const mergesCrossVariantUserId =
     routeText.includes("existingByUserIdAccounts") &&
-    routeText.includes("conflictingExisting") &&
-    routeText.includes("refusing to import it as");
-  const rejectsAmbiguousUserId =
-    routeText.includes("uniqueExistingVariants.length > 1") &&
-    routeText.includes("Include package_name or app_variant in the import file");
+    routeText.includes("existingByUserIdAccounts[0]?.appVariant") &&
+    routeText.includes("existingByUserIdAccounts[0]") &&
+    !routeText.includes("refusing to import it as");
+  const preservesSparseImportedSnapshot =
+    routeText.includes("previousSnapshot = await prisma.accountSnapshot.findUnique") &&
+    routeText.includes("mapSnapshot(snapshot, previousSnapshot)");
   return {
     name: "session_import_variant_guards",
-    ok: hasDeviceInference && validatesPackageVsDevice && validatesPackageVsDeclared && rejectsCrossVariantUserId && rejectsAmbiguousUserId,
+    ok: hasDeviceInference && validatesPackageVsDevice && validatesPackageVsDeclared && mergesCrossVariantUserId && preservesSparseImportedSnapshot,
     detail: {
       hasDeviceInference,
       validatesPackageVsDevice,
       validatesPackageVsDeclared,
-      rejectsCrossVariantUserId,
-      rejectsAmbiguousUserId
+      mergesCrossVariantUserId,
+      preservesSparseImportedSnapshot
     }
   };
 }

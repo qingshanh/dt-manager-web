@@ -90,6 +90,7 @@ export class RealDingtoneGateway implements DingtoneGateway {
     if (!dtUserId || !token || !deviceId) {
       throw new AppError("Real gateway helper returned an incomplete session export", 502, 502);
     }
+    const snapshot = isRecord(body.snapshot) ? normalizeSnapshot(body.snapshot) : undefined;
     return {
       dtUserId,
       token,
@@ -97,7 +98,9 @@ export class RealDingtoneGateway implements DingtoneGateway {
       dingtoneId: pickString(body, ["dingtoneId", "dingtone_id", "dtDingtoneId", "dt_dingtone_id"]),
       appVariant: normalizeAppVariant(pickString(body, ["appVariant", "app_variant", "variant"])),
       packageName: pickString(body, ["packageName", "package_name", "androidPackage", "android_package"]),
-      snapshot: isRecord(body.snapshot) ? normalizeSnapshot(body.snapshot) : undefined,
+      activatedEmail: pickString(body, ["activatedEmail", "activated_email", "email"]) ?? snapshot?.email,
+      mainPhone: pickString(body, ["mainPhone", "main_phone", "phone", "phoneNumber", "phone_number"]) ?? snapshot?.phone,
+      snapshot,
       phoneNumbers: Array.isArray(body.phoneNumbers) ? normalizePhoneNumbers(body.phoneNumbers) : undefined
     };
   }

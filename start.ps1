@@ -297,6 +297,25 @@ function Test-PrismaClientReady {
     (Test-Path -LiteralPath (Join-Path $clientDir "query_engine-windows.dll.node"))
 }
 
+function Test-PrismaEngineLocked {
+  $enginePath = Join-Path $backendDir "node_modules\.prisma\client\query_engine-windows.dll.node"
+  if (-not (Test-Path -LiteralPath $enginePath)) {
+    return $false
+  }
+
+  $stream = $null
+  try {
+    $stream = [System.IO.File]::Open($enginePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    return $false
+  } catch {
+    return $true
+  } finally {
+    if ($null -ne $stream) {
+      $stream.Close()
+    }
+  }
+}
+
 function Invoke-PrismaGenerate {
   Push-Location $backendDir
   $previousErrorActionPreference = $ErrorActionPreference
@@ -347,18 +366,23 @@ if (-not $SkipInstall) {
   }
 }
 
-Write-Host "[backend] generating Prisma client..."
-try {
-  Invoke-WithRetry -Name "prisma generate" -Retries 5 -DelaySeconds 3 -Action {
-    Invoke-PrismaGenerate
-  }
-} catch {
-  $message = $_.Exception.Message
-  if ($message -match 'EPERM|access is denied|access denied|rename' -and (Test-PrismaClientReady)) {
-    Write-Host "[backend] Prisma client engine is locked by another local process; using existing generated client."
-    Write-Host "[backend] To force regeneration, close other tools using this project and run: cd backend; npx prisma generate"
-  } else {
-    throw
+if ((Test-PrismaClientReady) -and (Test-PrismaEngineLocked)) {
+  Write-Host "[backend] Prisma client engine is locked by another local process; skipping generate and using existing client."
+  Write-Host "[backend] To force regeneration, close other tools using this project and run: cd backend; npx prisma generate"
+} else {
+  Write-Host "[backend] generating Prisma client..."
+  try {
+    Invoke-WithRetry -Name "prisma generate" -Retries 5 -DelaySeconds 3 -Action {
+      Invoke-PrismaGenerate
+    }
+  } catch {
+    $message = $_.Exception.Message
+    if ($message -match 'EPERM|access is denied|access denied|rename' -and (Test-PrismaClientReady)) {
+      Write-Host "[backend] Prisma client engine is locked by another local process; using existing generated client."
+      Write-Host "[backend] To force regeneration, close other tools using this project and run: cd backend; npx prisma generate"
+    } else {
+      throw
+    }
   }
 }
 
@@ -370,6 +394,11 @@ if ($WithHelper) {
   & python -c "import frida"
   if ($LASTEXITCODE -ne 0) {
     throw "Python package 'frida' is missing. Install it first (for example: python -m pip install frida)."
+  }
+
+  if (-not $SkipInstall -and -not (Test-Path (Join-Path $helperDir "node_modules"))) {
+    Write-Host "[helper] installing frida agent npm dependencies..."
+    Invoke-WorkingDirectoryCommand $helperDir { npm install }
   }
 }
 

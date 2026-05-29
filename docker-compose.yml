@@ -56,7 +56,9 @@ services:
       context: ./backend/helper
       dockerfile: Dockerfile
       args:
+        NODE_IMAGE: ${DOCKER_NODE_IMAGE:-docker.hanxi.cc/library/node:22-alpine}
         PYTHON_IMAGE: ${DOCKER_PYTHON_IMAGE:-docker.hanxi.cc/library/python:3.11-slim}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     environment:
       DT_HELPER_BIND_HOST: 0.0.0.0
