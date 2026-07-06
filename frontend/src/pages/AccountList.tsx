@@ -66,14 +66,20 @@ function CopyableCell({ value, copied, onCopy, fallback = '-', maxWidth = 220 }:
     </Tooltip>
   );
 }
-function downloadJson(payload: unknown, filename: string) {
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
   link.download = filename;
+  link.style.display = 'none';
+  document.body.appendChild(link);
   link.click();
-  URL.revokeObjectURL(url);
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function downloadJson(payload: unknown, filename: string) {
+  downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }), filename);
 }
 
 export default function AccountList() {
@@ -192,18 +198,21 @@ export default function AccountList() {
 
   const handleExportBackup = () => {
     modal.confirm({
-      title: '导出完整备份',
-      content: '备份会包含账户 token、密码、号码、消息和设置，请妥善保存。',
-      okText: '导出',
-      cancelText: '取消',
+      title: 'Export full backup',
+      content: 'The backup includes panel password hashes, environment variables, account tokens, phone numbers, messages, settings, and monitor state. Store it only in a trusted location.',
+      okText: 'Export',
+      cancelText: 'Cancel',
       onOk: async () => {
-        const payload = await exportFullBackup();
-        downloadJson(payload, `dt-manager-backup-${dayjs().format('YYYYMMDD-HHmmss')}.json`);
-        message.success(`已导出 ${payload.accounts.length} 个账户和 ${payload.settings.length} 项设置`);
+        const result = await exportFullBackup();
+        const payload = result.payload;
+        downloadBlob(result.blob, result.filename);
+        const envCount = typeof payload.environment === 'object' && payload.environment && Array.isArray(payload.environment.files) ? payload.environment.files.length : 0;
+        message.success(
+          'Exported ' + payload.accounts.length + ' accounts, ' + payload.settings.length + ' settings, ' + (payload.admin_users?.length ?? 0) + ' panel users, ' + envCount + ' environment files',
+        );
       },
     });
   };
-
   const handleExportSessions = async () => {
     try {
       const payload = await exportSessions();
@@ -233,14 +242,24 @@ export default function AccountList() {
 
       if (parsed.kind === 'dt-manager-full-backup') {
         const settings = Array.isArray(parsed.settings) ? parsed.settings : [];
-        const result = await importFullBackup({ accounts, settings, validate: validateImportedSessions });
-        const settingsText = result.settings_imported ? `，设置 ${result.settings_imported} 项` : '';
-        message.success(`已导入 ${result.imported} 个账户，失败 ${result.failed} 个${settingsText}`);
+        const adminUsers = Array.isArray(parsed.admin_users) ? parsed.admin_users : [];
+        const environment = parsed.environment ?? parsed.env;
+        const result = await importFullBackup({
+          accounts,
+          settings,
+          admin_users: adminUsers,
+          environment,
+          validate: validateImportedSessions,
+        });
+        const settingsText = result.settings_imported ? ', settings ' + result.settings_imported : '';
+        const adminText = result.admin_users_imported ? ', panel users ' + result.admin_users_imported : '';
+        const envText = result.env_files_written ? ', environment files ' + result.env_files_written + ' (restart backend to apply)' : '';
+        message.success('Imported ' + result.imported + ' accounts, failed ' + result.failed + settingsText + adminText + envText);
       } else {
         const directSettings = isRecord(parsed.direct_settings) ? (parsed.direct_settings as Record<string, string>) : undefined;
         const result = await importSessions({ accounts, direct_settings: directSettings, validate: validateImportedSessions });
-        const settingsText = result.settings_imported ? `，直连设置 ${result.settings_imported} 项` : '';
-        message.success(`已导入 ${result.imported} 个会话，失败 ${result.failed} 个${settingsText}`);
+        const settingsText = result.settings_imported ? ', direct settings ' + result.settings_imported : '';
+        message.success('Imported ' + result.imported + ' sessions, failed ' + result.failed + settingsText);
       }
       await fetch();
     } catch (err) {

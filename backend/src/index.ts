@@ -30,7 +30,7 @@ app.use(
     origin: config.CORS_ORIGIN.split(",").map((item) => item.trim())
   })
 );
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "100mb" }));
 app.use(
   "/api/auth/login",
   rateLimit({

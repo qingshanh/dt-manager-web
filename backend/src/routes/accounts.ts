@@ -1,3 +1,5 @@
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { AccountStatus, AppVariant, LoginType, MessageDirection, MessageType, PhoneStatus, Prisma, type PhoneNumber as StoredPhoneNumber } from "@prisma/client";
 import { Router } from "express";
 import { MonitorStatus } from "@prisma/client";
@@ -229,6 +231,8 @@ const sessionImportSchema = z.object({
 
 const fullBackupImportSchema = z.object({
   settings: z.array(z.record(z.unknown())).optional().default([]),
+  admin_users: z.array(z.record(z.unknown())).optional().default([]),
+  environment: z.unknown().optional().nullable(),
   accounts: z.array(z.record(z.unknown())).optional().default([]),
   validate: z.boolean().optional().default(false)
 });
@@ -643,63 +647,8 @@ accountsRouter.post("/sessions/import", async (req, res, next) => {
 
 accountsRouter.get("/backup/export", async (req, res, next) => {
   try {
-    const adminId = req.auth!.userId;
-    const [settings, accounts] = await Promise.all([
-      prisma.setting.findMany({ orderBy: { key: "asc" } }),
-      prisma.dtAccount.findMany({
-        orderBy: { id: "asc" },
-        include: {
-          admin: {
-            select: {
-              id: true,
-              username: true
-            }
-          },
-          snapshot: true,
-          phoneNumbers: { orderBy: [{ isPrimary: "desc" }, { createdAt: "desc" }] },
-          messages: { orderBy: { receivedAt: "asc" } }
-        }
-      })
-    ]);
-
-    ok(res, {
-      version: 1,
-      kind: "dt-manager-full-backup",
-      exported_at: new Date().toISOString(),
-      contains_secrets: true,
-      settings: settings.map((item) => ({
-        key: item.key,
-        value: item.value,
-        description: item.description
-      })),
-      accounts: accounts.map((account) => ({
-        source_admin_id: account.adminId,
-        source_admin_username: account.admin.username,
-        nickname: account.nickname,
-        app_variant: account.appVariant,
-        package_name: expectedPackageNameForVariant(account.appVariant),
-        login_type: account.loginType,
-        email: account.email,
-        phone: account.phone,
-        password: account.password ? decryptText(account.password) : null,
-        dt_user_id: account.dtUserId,
-        token: account.dtToken ? decryptText(account.dtToken) : null,
-        device_id: account.dtDeviceId,
-        track_code: account.dtTrackCode,
-        status: account.status,
-        monitor_enabled: account.monitorEnabled,
-        telegram_notify: account.telegramNotify,
-        proxy_enabled: account.proxyEnabled,
-        last_login_at: account.lastLoginAt,
-        last_error: account.lastError,
-        snapshot: account.snapshot ? mapStoredSnapshot(account.snapshot) : null,
-        phone_numbers: account.phoneNumbers.map((phone) => ({
-          phone_number: phone.phoneNumber,
-          ...mapStoredPhoneNumber(phone)
-        })),
-        messages: account.messages.map((message) => serializeMessage(message))
-      }))
-    });
+    const payload = await buildFullBackupPayload(req.auth!.userId);
+    sendJsonAttachment(res, payload, buildBackupFilename(payload.exported_at));
   } catch (error) {
     next(error);
   }
@@ -711,6 +660,8 @@ accountsRouter.post("/backup/import", async (req, res, next) => {
     const body = fullBackupImportSchema.parse(req.body ?? {});
     let settingsImported = 0;
     const results = [];
+    const envFilesWritten = await restoreBackupEnvironment(body.environment ?? (req.body as Record<string, unknown>).env ?? null);
+    const adminIdByUsername = await importBackupAdminUsers(body.admin_users, adminId);
 
     for (const setting of body.settings) {
       const key = normalizeOptionalString(setting.key);
@@ -735,7 +686,8 @@ accountsRouter.post("/backup/import", async (req, res, next) => {
 
     for (const item of body.accounts) {
       try {
-        const result = await importFullBackupAccount(adminId, item, body.validate);
+        const targetAdminId = resolveBackupAccountAdminId(item, adminId, adminIdByUsername);
+        const result = await importFullBackupAccount(targetAdminId, item, body.validate);
         results.push({ ok: true, ...result });
       } catch (error) {
         results.push({
@@ -751,6 +703,8 @@ accountsRouter.post("/backup/import", async (req, res, next) => {
       imported: results.filter((item) => item.ok).length,
       failed: results.filter((item) => !item.ok).length,
       settings_imported: settingsImported,
+      env_files_written: envFilesWritten,
+      admin_users_imported: adminIdByUsername.size,
       results
     });
   } catch (error) {
@@ -2983,6 +2937,32 @@ async function importFullBackupAccount(adminId: number, item: Record<string, unk
     messageImported += 1;
   }
 
+  let monitorSessionsImported = 0;
+  for (const rawSession of Array.isArray(item.monitor_sessions) ? item.monitor_sessions : []) {
+    const session = normalizeBackupMonitorSession(rawSession);
+    if (!session) {
+      continue;
+    }
+    const duplicate = await prisma.monitorSession.findFirst({
+      where: {
+        accountId: account.id,
+        status: session.status,
+        startedAt: session.startedAt
+      },
+      select: { id: true }
+    });
+    if (duplicate) {
+      continue;
+    }
+    await prisma.monitorSession.create({
+      data: {
+        accountId: account.id,
+        ...session
+      }
+    });
+    monitorSessionsImported += 1;
+  }
+
   if (validateSession && dtUserId && token) {
     await tryValidateCapturedSessionQuickly(
       {
@@ -3009,7 +2989,8 @@ async function importFullBackupAccount(adminId: number, item: Record<string, unk
     dt_user_id: dtUserId,
     nickname: account.nickname,
     phones_imported: phoneImported,
-    messages_imported: messageImported
+    messages_imported: messageImported,
+    monitor_sessions_imported: monitorSessionsImported
   };
 }
 
@@ -3122,6 +3103,27 @@ function normalizeBackupMessage(value: unknown): Prisma.MessageUncheckedCreateWi
   };
 }
 
+function normalizeBackupMonitorSession(value: unknown): Prisma.MonitorSessionUncheckedCreateWithoutAccountInput | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  return {
+    status: normalizeMonitorStatusValue(value.status),
+    serverIp: normalizeOptionalString(value.server_ip ?? value.serverIp),
+    serverPort: pickNumber(value, ["serverPort", "server_port"]) ?? undefined,
+    routeAddress: normalizeOptionalString(value.route_address ?? value.routeAddress),
+    startedAt: normalizeBackupDate(value.started_at ?? value.startedAt) ?? new Date(),
+    stoppedAt: normalizeBackupDate(value.stopped_at ?? value.stoppedAt),
+    errorMessage: normalizeOptionalString(value.error_message ?? value.errorMessage),
+    heartbeatCount: pickNumber(value, ["heartbeatCount", "heartbeat_count"]) ?? 0,
+    msgReceivedCount: pickNumber(value, ["msgReceivedCount", "msg_received_count"]) ?? 0
+  };
+}
+
+function normalizeMonitorStatusValue(value: unknown): MonitorStatus {
+  const allowed = new Set(Object.values(MonitorStatus));
+  return typeof value === "string" && allowed.has(value as MonitorStatus) ? (value as MonitorStatus) : MonitorStatus.stopped;
+}
 function normalizeMessageTypeValue(value: unknown): MessageType {
   const allowed = new Set(Object.values(MessageType));
   return typeof value === "string" && allowed.has(value as MessageType) ? (value as MessageType) : MessageType.sms;
@@ -3140,6 +3142,249 @@ function normalizeBackupDate(value: unknown) {
   return null;
 }
 
+type FullBackupPayload = {
+  version: 2;
+  kind: "dt-manager-full-backup";
+  exported_at: string;
+  contains_secrets: true;
+  environment: {
+    note: string;
+    files: Array<{ path: string; content: string }>;
+  };
+  admin_users: Array<Record<string, unknown>>;
+  settings: Array<Record<string, unknown>>;
+  accounts: Array<Record<string, unknown>>;
+};
+
+async function buildFullBackupPayload(_requestAdminId: number): Promise<FullBackupPayload> {
+  const exportedAt = new Date().toISOString();
+  const [settings, admins, accounts, environment] = await Promise.all([
+    prisma.setting.findMany({ orderBy: { key: "asc" } }),
+    prisma.adminUser.findMany({ orderBy: { id: "asc" } }),
+    prisma.dtAccount.findMany({
+      orderBy: { id: "asc" },
+      include: {
+        admin: { select: { id: true, username: true } },
+        snapshot: true,
+        phoneNumbers: { orderBy: [{ isPrimary: "desc" }, { createdAt: "desc" }] },
+        messages: { orderBy: { receivedAt: "asc" } },
+        monitorSessions: { orderBy: { id: "asc" } }
+      }
+    }),
+    readBackupEnvironment()
+  ]);
+
+  return {
+    version: 2,
+    kind: "dt-manager-full-backup",
+    exported_at: exportedAt,
+    contains_secrets: true,
+    environment,
+    admin_users: admins.map((admin) => ({
+      source_admin_id: admin.id,
+      username: admin.username,
+      password_hash: admin.passwordHash,
+      created_at: admin.createdAt,
+      updated_at: admin.updatedAt
+    })),
+    settings: settings.map((item) => ({
+      key: item.key,
+      value: item.value,
+      description: item.description,
+      updated_at: item.updatedAt
+    })),
+    accounts: accounts.map((account) => ({
+      source_admin_id: account.adminId,
+      source_admin_username: account.admin.username,
+      nickname: account.nickname,
+      app_variant: account.appVariant,
+      login_type: account.loginType,
+      email: account.email,
+      phone: account.phone,
+      password: account.password ? decryptText(account.password) : null,
+      dt_user_id: account.dtUserId,
+      token: account.dtToken ? decryptText(account.dtToken) : null,
+      device_id: account.dtDeviceId,
+      track_code: account.dtTrackCode,
+      status: account.status,
+      monitor_enabled: account.monitorEnabled,
+      telegram_notify: account.telegramNotify,
+      proxy_enabled: account.proxyEnabled,
+      last_login_at: account.lastLoginAt,
+      last_error: account.lastError,
+      created_at: account.createdAt,
+      updated_at: account.updatedAt,
+      snapshot: account.snapshot ? mapStoredSnapshot(account.snapshot) : null,
+      phone_numbers: account.phoneNumbers.map(serializePhoneNumber),
+      messages: account.messages.map(serializeMessage),
+      monitor_sessions: account.monitorSessions.map(mapStoredMonitorSession)
+    }))
+  };
+}
+
+function sendJsonAttachment(res: { setHeader(name: string, value: string): void; send(body: string): void }, payload: unknown, filename: string) {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  res.send(JSON.stringify(payload, null, 2));
+}
+
+function buildBackupFilename(exportedAt: string) {
+  const stamp = exportedAt.replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z").replace(/[TZ]/g, "-").replace(/-$/, "");
+  return `dt-manager-full-backup-${stamp}.json`;
+}
+
+function mapStoredMonitorSession(session: {
+  status: MonitorStatus;
+  serverIp: string | null;
+  serverPort: number | null;
+  routeAddress: string | null;
+  startedAt: Date;
+  stoppedAt: Date | null;
+  errorMessage: string | null;
+  heartbeatCount: number;
+  msgReceivedCount: number;
+}) {
+  return {
+    status: session.status,
+    server_ip: session.serverIp,
+    server_port: session.serverPort,
+    route_address: session.routeAddress,
+    started_at: session.startedAt,
+    stopped_at: session.stoppedAt,
+    error_message: session.errorMessage,
+    heartbeat_count: session.heartbeatCount,
+    msg_received_count: session.msgReceivedCount
+  };
+}
+
+function resolveProjectRoot() {
+  return path.basename(process.cwd()).toLowerCase() === "backend" ? path.resolve(process.cwd(), "..") : process.cwd();
+}
+
+function resolveEnvBackupCandidates() {
+  const projectRoot = resolveProjectRoot();
+  const candidates: Array<{ backupPath: string; absolutePath: string }> = [];
+  const configured = normalizeOptionalString(process.env.DT_ENV_FILE);
+  if (configured) {
+    candidates.push({ backupPath: ".env", absolutePath: path.resolve(configured) });
+  }
+  candidates.push({ backupPath: ".env", absolutePath: path.join(projectRoot, ".env") });
+  candidates.push({ backupPath: "backend/.env", absolutePath: path.join(projectRoot, "backend", ".env") });
+
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    const key = `${candidate.backupPath}:${path.normalize(candidate.absolutePath).toLowerCase()}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+async function readBackupEnvironment() {
+  const files: Array<{ path: string; content: string }> = [];
+  for (const candidate of resolveEnvBackupCandidates()) {
+    try {
+      const content = await readFile(candidate.absolutePath, "utf8");
+      files.push({ path: candidate.backupPath, content });
+    } catch (error) {
+      const code = isRecord(error) ? normalizeOptionalString(error.code) : null;
+      if (code !== "ENOENT") {
+        logger.warn("Failed to read environment file for backup", { path: candidate.backupPath, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }
+  return {
+    note: "Contains environment files and secrets. Keep this backup private. Import writes only .env and backend/.env under the project root.",
+    files
+  };
+}
+
+async function restoreBackupEnvironment(value: unknown) {
+  const files = normalizeBackupEnvironmentFiles(value);
+  if (files.length === 0) {
+    return 0;
+  }
+  const projectRoot = resolveProjectRoot();
+  let written = 0;
+  for (const file of files) {
+    const safePath = sanitizeBackupEnvironmentPath(file.path);
+    if (!safePath) {
+      logger.warn("Skipped unsafe environment backup path", { path: file.path });
+      continue;
+    }
+    await writeFile(path.join(projectRoot, safePath), file.content, "utf8");
+    written += 1;
+  }
+  return written;
+}
+
+function normalizeBackupEnvironmentFiles(value: unknown): Array<{ path: string; content: string }> {
+  if (typeof value === "string") {
+    return [{ path: ".env", content: value }];
+  }
+  if (!isRecord(value)) {
+    return [];
+  }
+  if (typeof value.content === "string") {
+    return [{ path: normalizeOptionalString(value.path) ?? ".env", content: value.content }];
+  }
+  if (!Array.isArray(value.files)) {
+    return [];
+  }
+  return value.files
+    .map((item) => {
+      if (!isRecord(item) || typeof item.content !== "string") {
+        return null;
+      }
+      return { path: normalizeOptionalString(item.path) ?? ".env", content: item.content };
+    })
+    .filter((item): item is { path: string; content: string } => Boolean(item));
+}
+
+function sanitizeBackupEnvironmentPath(value: string) {
+  const normalized = value.replace(/\\/g, "/").replace(/^\.\//, "").trim();
+  if (normalized === ".env") {
+    return ".env";
+  }
+  if (normalized === "backend/.env") {
+    return path.join("backend", ".env");
+  }
+  return null;
+}
+
+async function importBackupAdminUsers(items: Array<Record<string, unknown>>, fallbackAdminId: number) {
+  const map = new Map<string, number>();
+  for (const item of items) {
+    const username = normalizeOptionalString(item.username);
+    const passwordHash = normalizeOptionalString(item.password_hash ?? item.passwordHash);
+    if (!username || !passwordHash) {
+      continue;
+    }
+    const admin = await prisma.adminUser.upsert({
+      where: { username },
+      update: { passwordHash },
+      create: { username, passwordHash }
+    });
+    map.set(username, admin.id);
+  }
+  if (map.size === 0) {
+    const current = await prisma.adminUser.findUnique({ where: { id: fallbackAdminId }, select: { username: true } });
+    if (current) {
+      map.set(current.username, fallbackAdminId);
+    }
+  }
+  return map;
+}
+
+function resolveBackupAccountAdminId(item: Record<string, unknown>, fallbackAdminId: number, adminIdByUsername: Map<string, number>) {
+  const username = normalizeOptionalString(item.source_admin_username ?? item.admin_username);
+  if (username) {
+    return adminIdByUsername.get(username) ?? fallbackAdminId;
+  }
+  return fallbackAdminId;
+}
 async function exportSessionSettings() {
   const rows = await prisma.setting.findMany({
     where: {

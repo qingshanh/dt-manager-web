@@ -258,26 +258,61 @@ export async function importSessions(data: { accounts: unknown[]; direct_setting
   return res.data.data;
 }
 
-export async function exportFullBackup() {
-  const res = await api.get<
-    ApiResponse<{
-      version: number;
-      kind: 'dt-manager-full-backup';
-      exported_at: string;
-      contains_secrets?: boolean;
-      settings: unknown[];
-      accounts: unknown[];
-    }>
-  >('/accounts/backup/export');
-  return res.data.data;
+type FullBackupPayload = {
+  version: number;
+  kind: 'dt-manager-full-backup';
+  exported_at: string;
+  contains_secrets?: boolean;
+  environment?: { files?: unknown[] } | string | null;
+  admin_users?: unknown[];
+  settings: unknown[];
+  accounts: unknown[];
+};
+
+function filenameFromContentDisposition(value: unknown) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1].trim().replace(/^"|"$/g, ''));
+  }
+  const asciiMatch = value.match(/filename="?([^";]+)"?/i);
+  return asciiMatch?.[1]?.trim() || null;
 }
 
-export async function importFullBackup(data: { settings?: unknown[]; accounts?: unknown[]; validate?: boolean }) {
+export async function exportFullBackup() {
+  const res = await api.get<Blob>('/accounts/backup/export', {
+    responseType: 'blob',
+    timeout: 180_000,
+  });
+  const text = await res.data.text();
+  const payload = JSON.parse(text) as FullBackupPayload;
+  const filename =
+    filenameFromContentDisposition(res.headers['content-disposition']) ||
+    `dt-manager-full-backup-${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z').replace(/[TZ]/g, '-')}.json`;
+  return {
+    payload,
+    filename,
+    blob: new Blob([text], { type: 'application/json;charset=utf-8' }),
+  };
+}
+
+export async function importFullBackup(data: {
+  settings?: unknown[];
+  admin_users?: unknown[];
+  environment?: unknown;
+  env?: unknown;
+  accounts?: unknown[];
+  validate?: boolean;
+}) {
   const res = await api.post<
     ApiResponse<{
       imported: number;
       failed: number;
       settings_imported?: number;
+      env_files_written?: number;
+      admin_users_imported?: number;
       results: Array<{ ok: boolean; account_id?: number; dt_user_id?: string; nickname?: string; error?: string }>;
     }>
   >('/accounts/backup/import', data, { timeout: 180_000 });

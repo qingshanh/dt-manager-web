@@ -18,6 +18,9 @@ api.interceptors.request.use((config) => {
 // 响应拦截器 — 统一错误处理
 api.interceptors.response.use(
   (response) => {
+    if (response.data instanceof Blob) {
+      return response;
+    }
     const body = response.data as ApiResponse;
     if (body.code !== 0) {
       return Promise.reject(new Error(body.message || 'Request failed'));
