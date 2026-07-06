@@ -51,6 +51,21 @@ export async function getCachedPrivateNumberEvent() {
   return payload.data?.payload;
 }
 
+export async function assertHelperAvailable(timeoutMs = 2_000) {
+  const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
+  const helperBaseUrl = normalizeOptionalString(settings.dt_real_bridge_base_url) || config.DT_REAL_BRIDGE_BASE_URL || "http://127.0.0.1:19091";
+  const response = await fetch(`${helperBaseUrl.replace(/\/+$/, "")}/health`, {
+    signal: AbortSignal.timeout(timeoutMs)
+  }).catch((error) => {
+    throw new AppError(`Helper is not reachable: ${error instanceof Error ? error.message : String(error)}`, 502, 502);
+  });
+  const payload = (await response.json().catch(() => null)) as { ok?: boolean; data?: unknown; message?: string } | null;
+  if (!response.ok || !payload?.ok) {
+    throw new AppError(payload?.message || `Helper health check failed with HTTP ${response.status}`, 502, 502);
+  }
+  return payload.data;
+}
+
 async function postHelperExecute(action: string, input: Record<string, unknown>, timeoutMs: number) {
   const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
   const helperBaseUrl = normalizeOptionalString(settings.dt_real_bridge_base_url) || config.DT_REAL_BRIDGE_BASE_URL || "http://127.0.0.1:19091";

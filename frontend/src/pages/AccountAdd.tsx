@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Alert, App, Button, Card, Form, Input, Select, Space, Steps, Tag, Typography } from 'antd';
 import { LockOutlined, MailOutlined, NumberOutlined, PhoneOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import { createAccount, getSettings, sendVerificationCode, verifyCode } from '../services/endpoints';
+import { createAccount, getAccount, getSettings, sendVerificationCode, verifyCode } from '../services/endpoints';
 import type { AppVariant, CreateAccountRequest, LoginType, SettingItem } from '../types';
 
 type CreateFormValues = {
@@ -10,6 +10,7 @@ type CreateFormValues = {
   email?: string;
   phone?: string;
   password?: string;
+  deviceId?: string;
 };
 
 function toMap(items: SettingItem[]) {
@@ -32,7 +33,7 @@ export default function AccountAdd() {
         const map = toMap(items);
         setSettings(map);
         if (map.DT_GATEWAY_MODE === 'direct') {
-          setLoginType('manual_session');
+          setLoginType('email_code');
         }
       })
       .catch(() => undefined);
@@ -45,6 +46,20 @@ export default function AccountAdd() {
   const verificationTargetLabel = loginType === 'phone_code' ? '手机号' : '邮箱';
   const verificationDeliveryLabel = loginType === 'phone_code' ? '短信' : '邮件';
 
+  const watchPendingVerificationSend = async (id: number) => {
+    for (let i = 0; i < 18; i += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 5_000));
+      try {
+        const detail = await getAccount(id);
+        if (detail.last_error) {
+          message.error('验证码发送失败：' + detail.last_error, 10);
+          return;
+        }
+      } catch {
+        return;
+      }
+    }
+  };
   const handleCreate = async (values: CreateFormValues) => {
     setLoading(true);
     try {
@@ -52,6 +67,7 @@ export default function AccountAdd() {
         nickname: values.nickname?.trim() || undefined,
         app_variant: appVariant,
         login_type: loginType,
+        device_id: values.deviceId?.trim() || undefined,
       };
 
       if (loginType === 'email_code' || loginType === 'email_password' || loginType === 'manual_session') {
@@ -67,10 +83,16 @@ export default function AccountAdd() {
       const result = await createAccount(params);
 
       if (isVerificationLogin) {
-        setAccountId(result.id);
+        const targetAccountId = result.account_id ?? result.id;
+        setAccountId(targetAccountId);
         setStep(1);
+        if (result.send_pending) {
+          message.warning(result.message || '验证码请求已提交；如果你已经收到验证码，可以直接输入继续登录。');
+          void watchPendingVerificationSend(targetAccountId);
+          return;
+        }
         if (result.mock && result.verification_code) {
-          message.info(`当前是 mock 模式，请直接输入固定验证码 ${result.verification_code}`);
+          message.info(`当前是 mock 模式，请直接输入固定验证码：${result.verification_code}`);
         } else {
           message.success(result.message || `验证码已发送，请查收${verificationDeliveryLabel}`);
         }
@@ -96,8 +118,12 @@ export default function AccountAdd() {
     if (!accountId) return;
     setLoading(true);
     try {
-      await verifyCode(accountId, values.code);
-      message.success('验证成功，账户已登录');
+      const result = await verifyCode(accountId, values.code);
+      if (result.refresh_error) {
+        message.warning(`验证成功，但资料刷新未完成：${result.refresh_error}`);
+      } else {
+        message.success('验证成功，账户已登录并刷新资料');
+      }
       navigate(`/accounts/${accountId}`);
     } catch (err) {
       message.error(err instanceof Error ? err.message : '验证失败');
@@ -110,11 +136,20 @@ export default function AccountAdd() {
     if (!accountId) return;
     try {
       const result = await sendVerificationCode(accountId);
-      if (result.mock && result.verification_code) {
-          message.info(`mock 模式固定验证码：${result.verification_code}`);
-        } else {
-          message.success(result.message || `验证码已重新发送，请查收${verificationDeliveryLabel}`);
+      const targetAccountId = result.account_id ?? accountId;
+      if (result.account_id) {
+        setAccountId(result.account_id);
+      }
+      if (result.send_pending) {
+          message.warning(result.message || '验证码请求已提交；如果你已经收到验证码，可以直接输入继续登录。');
+          void watchPendingVerificationSend(targetAccountId);
+          return;
         }
+      if (result.mock && result.verification_code) {
+        message.info(`mock 模式固定验证码：${result.verification_code}`);
+      } else {
+        message.success(result.message || `验证码已重新发送，请查收${verificationDeliveryLabel}`);
+      }
     } catch (err) {
       message.error(err instanceof Error ? err.message : '发送失败');
     }
@@ -143,7 +178,7 @@ export default function AccountAdd() {
           type="info"
           showIcon
           message="当前后端运行在 direct 直连模式"
-          description="这个模式不依赖原生 app。首次接入建议使用“手动导入直连会话”，创建后到详情页填写 dtUserId、token、deviceId，或直接从 helper 抓取已登录会话。"
+          description="邮箱验证码登录会直接调用说道/叮咚接口，不依赖模拟器或 helper。"
         />
       )}
 
@@ -163,7 +198,7 @@ export default function AccountAdd() {
             <Form.Item label="应用类型" required>
               <Select
                 value={appVariant}
-                onChange={(value) => setAppVariant(value)}
+                onChange={(value: AppVariant) => setAppVariant(value)}
                 options={[
                   { value: 'dingtone', label: '说道 Dingtone / TalkU' },
                   { value: 'dingdong', label: '叮咚 Dingdong' },
@@ -174,7 +209,7 @@ export default function AccountAdd() {
             <Form.Item label="接入方式" required>
               <Select
                 value={loginType}
-                onChange={(value) => setLoginType(value)}
+                onChange={(value: LoginType) => setLoginType(value)}
                 options={[
                   { value: 'manual_session', label: '手动导入直连会话' },
                   { value: 'email_code', label: '邮箱 + 验证码' },
@@ -193,13 +228,21 @@ export default function AccountAdd() {
               <Input maxLength={100} showCount placeholder="如：我的主号（可选）" />
             </Form.Item>
 
+            <Form.Item
+              label="设备 ID (deviceId)"
+              name="deviceId"
+              extra="可选。如果您希望使用特定的已在官方注册的设备，请在此处填写其设备 ID（如 And.xxxxx.dttalk）。不填时系统将自动生成。"
+            >
+              <Input placeholder="可选：例如 And.0123456789abcdef0123456789abcdef.dttalk" />
+            </Form.Item>
+
             {loginType === 'manual_session' && (
               <Alert
                 style={{ marginBottom: 16 }}
                 type="info"
                 showIcon
                 message="先创建占位账户，再导入真实会话"
-                description="这个入口不会触发登录，也不会依赖 app。创建完成后，请到详情页点击“导入直连会话”，填入 dtUserId、token、deviceId；如果你仍保留 helper，也可以点击“抓取 helper 会话”。"
+                description="这个入口不会触发登录。创建完成后，请到详情页导入 dtUserId、token、deviceId。"
               />
             )}
 
@@ -252,11 +295,11 @@ export default function AccountAdd() {
               ? `当前是 mock 模式，不会收到真实${verificationDeliveryLabel}，请直接输入固定验证码 123456。`
               : loginType === 'phone_code'
                 ? '验证码已发送至手机号，请输入收到的验证码。'
-                : '验证码已发送至您的邮箱，请输入收到的验证码。'}
+                : '验证码已发送至邮箱，请输入收到的验证码。'}
           </Typography.Paragraph>
           <Form layout="vertical" onFinish={handleVerify}>
             <Form.Item label="验证码" name="code" rules={[{ required: true, message: '请输入验证码' }]}>
-              <Input prefix={<NumberOutlined />} placeholder="6位验证码" />
+              <Input prefix={<NumberOutlined />} placeholder="验证码" />
             </Form.Item>
             <Form.Item>
               <Button type="primary" htmlType="submit" loading={loading} block>

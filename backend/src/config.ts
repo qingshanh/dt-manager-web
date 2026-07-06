@@ -18,6 +18,7 @@ const schema = z.object({
   CORS_ORIGIN: z.string().default("http://localhost:5173"),
   DT_GATEWAY_MODE: z.enum(["mock", "real", "bridge", "direct"]).default("mock"),
   DT_APP_VERSION: z.string().default("6.3.1"),
+  DT_DINGDONG_APP_VERSION: z.string().default("6.5.0"),
   DT_SERVER_IP: z.string().default("139.224.25.197"),
   DT_SERVER_PORT: z.coerce.number().int().positive().default(443),
   DT_BACKUP_IP: z.string().default("47.103.133.227"),

@@ -16,6 +16,8 @@ import { ensureDefaultAdmin } from "./services/admin.service.js";
 import { accountMonitorService } from "./services/account-monitor.js";
 import { ensureDefaultSettings, getGatewayMode } from "./services/settings.service.js";
 import { telegramBotService } from "./services/telegram-bot.js";
+import { accountAutoRefreshService } from "./services/account-auto-refresh.js";
+import { phoneExpiryReminderService } from "./services/phone-expiry-reminder.js";
 import { logger } from "./utils/logger.js";
 
 logger.setLevel(config.LOG_LEVEL);
@@ -40,7 +42,7 @@ app.use(
   "/api",
   rateLimit({
     windowMs: 60_000,
-    max: 60
+    max: 300
   })
 );
 
@@ -72,6 +74,8 @@ async function bootstrap() {
       logger.error("Failed to restore account monitors after startup", error);
     });
     telegramBotService.start();
+    accountAutoRefreshService.start();
+    phoneExpiryReminderService.start();
   });
 }
 

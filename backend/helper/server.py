@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import tempfile
 import threading
 import time
 import traceback
@@ -172,6 +174,7 @@ class FridaBridge:
         self._attached_package: str | None = None
         self._compiled_agent_source: str | None = None
         self._compiled_agent_mtime_ns: int = 0
+        self._compiler_project_root: Path | None = None
         self._pending: dict[str, PendingRequest] = {}
         self._latest_events: dict[str, dict[str, Any]] = {}
         self._recent_debug: list[dict[str, Any]] = []
@@ -208,7 +211,12 @@ class FridaBridge:
                 if cached and (time.time() - float(cached.get("at", 0))) <= 120:
                     print(f"[helper] use cached request_private_number after {action} failure", flush=True)
                     return cached["payload"]
-            should_retry = error.status_code in {503, 504} and action not in {"request_phone_number", "request_phone_number_via_activity"}
+            should_retry = error.status_code in {503, 504} and action not in {
+                "login",
+                "send_verification_code",
+                "request_phone_number",
+                "request_phone_number_via_activity",
+            }
             if not should_retry:
                 raise
             with self._lock:
@@ -225,7 +233,7 @@ class FridaBridge:
 
     def _execute_once(self, action: str, payload: dict[str, Any], meta: dict[str, Any]) -> Any:
         package_name = self.config.resolve_package(payload)
-        keep_session_alive = False
+        keep_session_alive = action == "send_verification_code"
         with self._operation_lock:
             try:
                 print(f"[helper] start action={action} package={package_name}", flush=True)
@@ -321,6 +329,11 @@ class FridaBridge:
         except Exception as error:
             print("[helper] failed to compile frida agent", flush=True)
             traceback.print_exc()
+            compiled_source = self._try_compile_agent_from_ascii_mirror(error)
+            if compiled_source is not None:
+                self._compiled_agent_source = compiled_source
+                self._compiled_agent_mtime_ns = source_mtime_ns
+                return compiled_source
             try:
                 raw_source = self.config.agent_path.read_text(encoding="utf-8")
             except Exception as read_error:
@@ -342,6 +355,49 @@ class FridaBridge:
         self._compiled_agent_source = compiled_source
         self._compiled_agent_mtime_ns = source_mtime_ns
         return compiled_source
+
+    def _try_compile_agent_from_ascii_mirror(self, original_error: Exception) -> str | None:
+        mirror_root = self._ensure_ascii_compiler_project_root()
+        if mirror_root is None:
+            return None
+        try:
+            print(f"[helper] retry compile frida agent from ascii mirror {mirror_root}", flush=True)
+            shutil.copy2(self.config.agent_path, mirror_root / self.config.agent_path.name)
+            compiler = frida.Compiler()
+            return compiler.build(self.config.agent_path.name, project_root=str(mirror_root))
+        except Exception:
+            print("[helper] failed to compile frida agent from ascii mirror", flush=True)
+            traceback.print_exc()
+            print(f"[helper] original compile error: {original_error}", flush=True)
+            return None
+
+    def _ensure_ascii_compiler_project_root(self) -> Path | None:
+        if self._compiler_project_root is not None:
+            return self._compiler_project_root
+
+        preferred = Path(os.getenv("DT_HELPER_COMPILE_ROOT", "")).expanduser() if os.getenv("DT_HELPER_COMPILE_ROOT") else None
+        candidates = [preferred] if preferred else []
+        if os.name == "nt":
+            candidates.extend([Path("C:/tmp/dt-helper-ascii"), Path("C:/tmp/dt-helper-ascii-compile")])
+        else:
+            candidates.append(Path(tempfile.gettempdir()) / "dt-manager-helper-frida-compile")
+
+        for base_dir in [candidate for candidate in candidates if candidate is not None]:
+            try:
+                base_dir.mkdir(parents=True, exist_ok=True)
+                source_modules = self.config.agent_path.parent / "node_modules"
+                target_modules = base_dir / "node_modules"
+                if source_modules.exists() and not target_modules.exists():
+                    shutil.copytree(source_modules, target_modules)
+                if not target_modules.exists():
+                    print(f"[helper] ascii compiler project root lacks node_modules: {base_dir}", flush=True)
+                    continue
+                self._compiler_project_root = base_dir
+                return base_dir
+            except Exception:
+                print(f"[helper] failed to prepare ascii compiler project root {base_dir}", flush=True)
+                traceback.print_exc()
+        return None
 
     def _reset_session(self) -> None:
         self._attached_package = None

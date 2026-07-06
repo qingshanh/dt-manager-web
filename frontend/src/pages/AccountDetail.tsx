@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
   App,
@@ -1025,9 +1025,11 @@ export default function AccountDetail() {
   const [account, setAccount] = useState<DtAccountDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [teamMessages, setTeamMessages] = useState<Message[]>([]);
   const [msgTotal, setMsgTotal] = useState(0);
   const [msgPage, setMsgPage] = useState(1);
   const [msgLoading, setMsgLoading] = useState(false);
+  const [teamMsgLoading, setTeamMsgLoading] = useState(false);
   const [activeTab, setActiveTab] = useState('info');
   const [syncingLatestMessages, setSyncingLatestMessages] = useState(false);
   const [syncingAppMessages, setSyncingAppMessages] = useState(false);
@@ -1088,7 +1090,7 @@ export default function AccountDetail() {
         setMsgLoading(true);
       }
       try {
-        const data = await getAccountMessages(accountId, { page, pageSize: 10 });
+        const data = await getAccountMessages(accountId, { page, pageSize: 10, exclude_system: true });
         setMessages(data.list);
         setMsgTotal(data.total);
       } catch (err) {
@@ -1104,6 +1106,21 @@ export default function AccountDetail() {
     [accountId, message],
   );
 
+  const fetchTeamMessages = useCallback(
+    async (options?: { silent?: boolean }) => {
+      if (!options?.silent) setTeamMsgLoading(true);
+      try {
+        const data = await getAccountMessages(accountId, { page: 1, pageSize: 100, msg_type: 'system' });
+        setTeamMessages(data.list);
+      } catch (err) {
+        if (!options?.silent) message.error(err instanceof Error ? err.message : '获取团队消息失败');
+      } finally {
+        if (!options?.silent) setTeamMsgLoading(false);
+      }
+    },
+    [accountId, message],
+  );
+
   useEffect(() => {
     const handleNewMessage = (event: Event) => {
       const detail = (event as CustomEvent<{ accountId?: number }>).detail;
@@ -1111,12 +1128,12 @@ export default function AccountDetail() {
         return;
       }
       setMsgPage(1);
-      void Promise.all([fetchMessages(1, { silent: true }), fetchAccount()]);
+      void Promise.all([fetchMessages(1, { silent: true }), fetchTeamMessages({ silent: true }), fetchAccount()]);
     };
 
     window.addEventListener('dt:new-message', handleNewMessage);
     return () => window.removeEventListener('dt:new-message', handleNewMessage);
-  }, [accountId, fetchAccount, fetchMessages]);
+  }, [accountId, fetchAccount, fetchMessages, fetchTeamMessages]);
 
   useEffect(() => {
     if (activeTab !== 'messages') {
@@ -1131,6 +1148,7 @@ export default function AccountDetail() {
       inFlight = true;
       try {
         await fetchMessages(msgPage, { silent: true, suppressError: true });
+        await fetchTeamMessages({ silent: true });
       } finally {
         inFlight = false;
       }
@@ -1143,7 +1161,7 @@ export default function AccountDetail() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [activeTab, fetchMessages, msgPage]);
+  }, [activeTab, fetchMessages, fetchTeamMessages, msgPage]);
 
   const syncLatestMessages = useCallback(async () => {
     setSyncingLatestMessages(true);
@@ -1151,7 +1169,7 @@ export default function AccountDetail() {
       const result = await refreshAccountMessages(accountId, 50, false);
       setLastRefreshDiagnostics(result.diagnostics ?? null);
       setMsgPage(1);
-      await Promise.all([fetchMessages(1), fetchAccount()]);
+      await Promise.all([fetchMessages(1), fetchTeamMessages(), fetchAccount()]);
       if (result.imported > 0) {
         message.success(`已导入 ${result.imported} 条新消息`);
         return;
@@ -1180,7 +1198,7 @@ export default function AccountDetail() {
         },
       ]);
       setMsgPage(1);
-      await Promise.all([fetchMessages(1), fetchAccount()]);
+      await Promise.all([fetchMessages(1), fetchTeamMessages(), fetchAccount()]);
       message.success(result.imported > 0 ? `已从 app 同步 ${result.imported} 条消息` : 'app 消息同步完成，暂无新增');
     } catch (err) {
       message.error(err instanceof Error ? err.message : 'app 消息同步失败');
@@ -1192,11 +1210,11 @@ export default function AccountDetail() {
   const refreshLocalMessages = useCallback(async () => {
     setRefreshingLocalMessages(true);
     try {
-      await fetchMessages(msgPage);
+      await Promise.all([fetchMessages(msgPage), fetchTeamMessages()]);
     } finally {
       setRefreshingLocalMessages(false);
     }
-  }, [fetchMessages, msgPage]);
+  }, [fetchMessages, fetchTeamMessages, msgPage]);
 
   const fetchPhones = useCallback(async () => {
     setPhoneLoading(true);
@@ -1223,7 +1241,7 @@ export default function AccountDetail() {
     setPhoneLoading(true);
     try {
       const data = await syncPhoneNumbers(accountId);
-      setPhones(data);
+      setPhones(data.phone_numbers);
       await fetchAccount();
       message.success('已刷新已购手机号');
     } catch (err) {
@@ -1246,6 +1264,7 @@ export default function AccountDetail() {
     setActiveTab(key);
     if (key === 'messages') {
       fetchMessages(msgPage);
+      fetchTeamMessages();
     }
     if (key === 'phone-numbers') {
       fetchPhones();
@@ -2167,6 +2186,16 @@ export default function AccountDetail() {
                     <div style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 12 }}>
                       {buildRefreshDiagnosticsSummary(lastRefreshDiagnostics)}
                     </div>
+                  </Card>
+                ) : null}
+                {teamMessages.length > 0 ? (
+                  <Card size="small" style={{ marginBottom: 12 }} loading={teamMsgLoading}>
+                    <Space>
+                      <Tag color="default">系统</Tag>
+                      <strong>团队消息</strong>
+                      <span style={{ color: '#666' }}>共 {teamMessages.length} 条</span>
+                    </Space>
+                    <div style={{ marginTop: 8, color: '#666' }}>{teamMessages[0]?.content}</div>
                   </Card>
                 ) : null}
                 <Table

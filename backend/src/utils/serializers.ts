@@ -1,5 +1,7 @@
 import type { AccountSnapshot, Message, PhoneNumber, Setting } from "@prisma/client";
 
+const DEFAULT_CREDIT_EXCHANGE_RATIO = 0.02;
+
 export function serializeSnapshot(snapshot: AccountSnapshot | null) {
   if (!snapshot) {
     return null;
@@ -21,10 +23,10 @@ export function serializeSnapshot(snapshot: AccountSnapshot | null) {
     country: repairUtf8Mojibake(snapshot.country),
     state: repairUtf8Mojibake(snapshot.state),
     city: repairUtf8Mojibake(snapshot.city),
-    primary_balance: snapshot.primaryBalance,
+    primary_balance: normalizeSnapshotPrimaryBalance(snapshot.primaryBalance, snapshot.rawJson),
     user_grade: snapshot.userGrade,
-    valid_point: snapshot.validPoint,
-    progress_point: snapshot.progressPoint,
+    valid_point: normalizeSnapshotMemberPoint(snapshot.validPoint) ?? normalizeSnapshotMemberPoint(snapshot.progressPoint),
+    progress_point: normalizeSnapshotMemberPoint(snapshot.progressPoint),
     membership_type: repairUtf8Mojibake(snapshot.membershipType),
     membership_expire_at: snapshot.membershipExpireAt,
     profile_ver_code: repairUtf8Mojibake(snapshot.profileVerCode),
@@ -33,13 +35,61 @@ export function serializeSnapshot(snapshot: AccountSnapshot | null) {
   };
 }
 
+function normalizeSnapshotPrimaryBalance(value: number | null, rawJson: string | null) {
+  const raw = parseJsonRecord(rawJson);
+  const publicPoint = isRecord(raw?.publicPoint) ? raw.publicPoint : null;
+  const rawBalance = isRecord(raw?.balance) ? raw.balance : null;
+  const publicDisplay = pickNumber(publicPoint, ["balanceDisplay", "balance_display"]);
+  const rawPrimary = pickNumber(rawBalance, [
+    "primaryBalance",
+    "primary_balance",
+    "balance",
+    "balanceAmount",
+    "balance_amount",
+    "availableBalance",
+    "available_balance",
+    "walletBalance",
+    "wallet_balance",
+    "coinBalance",
+    "coin_balance",
+    "creditBalance",
+    "credit_balance"
+  ]);
+  const ratio = pickNumber(rawBalance, ["creditExchangeRatio"]) ?? DEFAULT_CREDIT_EXCHANGE_RATIO;
+  if (publicDisplay !== null && publicDisplay > 0) {
+    return normalizeCreditBalance(publicDisplay, ratio);
+  }
+
+  if (rawPrimary !== null && rawPrimary > 0) {
+    return normalizeCreditBalance(rawPrimary, ratio);
+  }
+
+  if (value !== null && value > 0 && value < 1000) {
+    return roundTo(value / DEFAULT_CREDIT_EXCHANGE_RATIO, 2);
+  }
+  return value !== null && value > 0 ? value : null;
+}
+
+function normalizeCreditBalance(value: number, ratio: number) {
+  if (value > 0 && value < 1000 && ratio > 0) {
+    return roundTo(value / ratio, 2);
+  }
+  return value;
+}
+
+function normalizeSnapshotMemberPoint(value: number | null) {
+  return value !== null && value > 0 && value <= 10_000 ? value : null;
+}
+
 export function serializePhoneNumber(phone: PhoneNumber) {
   const validPeriodDays = derivePhoneValidPeriodDays(phone.gainTime, phone.expiredTime, phone.validPeriodDays);
+  const raw = parseJsonRecord(phone.rawJson);
   return {
     id: phone.id,
     account_id: phone.accountId,
     phone_number: repairUtf8Mojibake(phone.phoneNumber),
     country_code: phone.countryCode,
+    area_code: pickNumber(raw, ["areaCode", "area_code"]),
     provider_id: phone.providerId,
     display_name: repairUtf8Mojibake(phone.displayName),
     status: phone.status,
@@ -76,6 +126,46 @@ function parseEpoch(value: string | null) {
     return null;
   }
   return parsed > 1_000_000_000_000 ? parsed : parsed * 1000;
+}
+
+function parseJsonRecord(value: string | null) {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function pickNumber(record: Record<string, unknown> | null, keys: string[]) {
+  if (!record) {
+    return null;
+  }
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function roundTo(value: number, digits: number) {
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
 }
 
 export function serializeMessage(message: Message) {
@@ -118,26 +208,38 @@ export function repairUtf8Mojibake(value: string | null) {
     return value;
   }
 
-  const known = repairKnownReplacementText(decodeNumericHtmlEntities(value));
-  if (known !== value) {
-    return known;
-  }
-  if (/[\u4e00-\u9fff]/.test(value)) {
-    return value;
-  }
-  if (!/[\u00c0-\u00ff]/.test(value)) {
-    return value;
+  let best = repairKnownReplacementText(decodeNumericHtmlEntities(value));
+  let bestScore = mojibakeScore(best);
+  if (best !== value && containsHanText(best)) {
+    return best;
   }
 
-  try {
-    const repaired = Buffer.from(value, "latin1").toString("utf8");
-    if (!repaired || repaired === value || repaired.includes("\uFFFD")) {
-      return value;
+  for (let i = 0; i < 4; i += 1) {
+    if (containsHanText(best) || !hasMojibakeBytes(best)) {
+      return best;
     }
-    return repairKnownReplacementText(decodeNumericHtmlEntities(repaired));
-  } catch {
-    return value;
+    try {
+      const decoded = decodeMojibakeLayer(best);
+      if (!decoded) {
+        return best;
+      }
+      const candidate = repairKnownReplacementText(decodeNumericHtmlEntities(decoded));
+      if (!candidate || candidate === best || candidate.includes("\uFFFD")) {
+        return best;
+      }
+      const candidateScore = mojibakeScore(candidate);
+      if (containsHanText(candidate) || candidateScore < bestScore) {
+        best = candidate;
+        bestScore = candidateScore;
+        continue;
+      }
+      return best;
+    } catch {
+      return best;
+    }
   }
+
+  return best;
 }
 
 function repairKnownReplacementText(value: string) {
@@ -152,6 +254,79 @@ function decodeNumericHtmlEntities(value: string) {
     .replace(/&#x([0-9a-f]+);/gi, (_match, code: string) => safeCodePointToString(Number.parseInt(code, 16)));
 }
 
+function containsHanText(value: string) {
+  return /[\u4e00-\u9fff]/.test(value);
+}
+
+function hasMojibakeBytes(value: string) {
+  return /[\u0080-\u00ff]/.test(value) || Array.from(value).some((char) => WINDOWS_1252_BYTE_BY_CHAR.has(char));
+}
+
+function mojibakeScore(value: string) {
+  let score = 0;
+  for (const char of value) {
+    const code = char.charCodeAt(0);
+    if (code >= 0x80 && code <= 0xff) {
+      score += 2;
+    }
+    if (code >= 0x80 && code <= 0x9f) {
+      score += 3;
+    }
+    if (char === "\uFFFD") {
+      score += 10;
+    }
+  }
+  return score;
+}
+
+const WINDOWS_1252_BYTE_BY_CHAR = new Map<string, number>([
+  ["\u20ac", 0x80],
+  ["\u201a", 0x82],
+  ["\u0192", 0x83],
+  ["\u201e", 0x84],
+  ["\u2026", 0x85],
+  ["\u2020", 0x86],
+  ["\u2021", 0x87],
+  ["\u02c6", 0x88],
+  ["\u2030", 0x89],
+  ["\u0160", 0x8a],
+  ["\u2039", 0x8b],
+  ["\u0152", 0x8c],
+  ["\u017d", 0x8e],
+  ["\u2018", 0x91],
+  ["\u2019", 0x92],
+  ["\u201c", 0x93],
+  ["\u201d", 0x94],
+  ["\u2022", 0x95],
+  ["\u2013", 0x96],
+  ["\u2014", 0x97],
+  ["\u02dc", 0x98],
+  ["\u2122", 0x99],
+  ["\u0161", 0x9a],
+  ["\u203a", 0x9b],
+  ["\u0153", 0x9c],
+  ["\u017e", 0x9e],
+  ["\u0178", 0x9f]
+]);
+
+function decodeMojibakeLayer(value: string) {
+  const bytes: number[] = [];
+  for (const char of value) {
+    const mapped = WINDOWS_1252_BYTE_BY_CHAR.get(char);
+    if (mapped !== undefined) {
+      bytes.push(mapped);
+      continue;
+    }
+    const code = char.charCodeAt(0);
+    if (code <= 0xff) {
+      bytes.push(code);
+      continue;
+    }
+    return null;
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
 function safeCodePointToString(codePoint: number) {
   if (!Number.isFinite(codePoint) || codePoint <= 0 || codePoint > 0x10ffff) {
     return "";
@@ -161,6 +336,18 @@ function safeCodePointToString(codePoint: number) {
 
 function isTeamOrSystemSerializedMessage(fromNumber: string | null, content: string, rawInfo: string | null) {
   const text = `${fromNumber ?? ""}\n${content}\n${rawInfo ?? ""}`;
+  if (containsTeamOrSystemText(text)) {
+    return true;
+  }
+  if (/叮咚团队|说道团队|系統消息|系统消息/i.test(text)) {
+    return true;
+  }
   return /^(dingtone|talku|talkyou|dingdong|dingtone team|talku team|dingdong team|team)$/i.test((fromNumber ?? "").trim()) ||
     /dingtone team|talku team|dingdong team|叮咚团队|说道团队|系统消息|TalkU number|free calling and messaging/i.test(text);
+}
+
+function containsTeamOrSystemText(value: string) {
+  return /dingtone team|talku team|talkyou team|dingdong team|TalkU number|free calling and messaging|\u53ee\u549a\u56e2\u961f|\u8bf4\u9053\u56e2\u961f|\u7cfb\u7d71\u6d88\u606f|\u7cfb\u7edf\u6d88\u606f/i.test(
+    value
+  );
 }

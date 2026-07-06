@@ -1,4 +1,4 @@
-// 通用响应格式
+// 閫氱敤鍝嶅簲鏍煎紡
 export interface ApiResponse<T = unknown> {
   code: number;
   message: string;
@@ -12,7 +12,7 @@ export interface PagedData<T> {
   pageSize: number;
 }
 
-// 认证
+// 璁よ瘉
 export interface LoginRequest {
   username: string;
   password: string;
@@ -29,7 +29,7 @@ export interface AdminUser {
   created_at: string;
 }
 
-// 说道账户
+// 璇撮亾璐︽埛
 export type LoginType = 'email_code' | 'phone_code' | 'email_password' | 'phone_password' | 'manual_session';
 export type AppVariant = 'dingtone' | 'dingdong';
 export type AccountStatus = 'pending' | 'offline' | 'online' | 'error' | 'expired';
@@ -41,9 +41,11 @@ export interface DtAccountListItem {
   email: string | null;
   phone: string | null;
   dt_user_id: string | null;
+  dt_device_id: string;
   status: AccountStatus;
   monitor_enabled: boolean;
   telegram_notify: boolean;
+  last_error: string | null;
   unread_count: number;
   active_phone_count: number;
   last_login_at: string | null;
@@ -118,6 +120,7 @@ export interface CreateAccountRequest {
   email?: string;
   phone?: string;
   password?: string;
+  device_id?: string;
   telegram_notify?: boolean;
   proxy_enabled?: boolean;
 }
@@ -231,6 +234,7 @@ export interface UpdateAccountRequest {
   password?: string;
   telegram_notify?: boolean;
   proxy_enabled?: boolean;
+  device_id?: string | null;
 }
 
 // 手机号
@@ -318,6 +322,69 @@ export interface PurchasePhoneNumberResult {
   verification?: PhoneActionVerification;
 }
 
+export interface PointStoreProduct {
+  product_id: string;
+  name: string;
+  stock: number | null;
+  price: number | null;
+  raw_json?: string | null;
+}
+
+export interface PointStoreData {
+  point_uid: string;
+  email: string | null;
+  user_name: string | null;
+  user_grade: number | null;
+  valid_point: number | null;
+  history_point: number | null;
+  expire_point: number | null;
+  expire_time: string | null;
+  products: PointStoreProduct[];
+  snapshot: AccountSnapshot | null;
+  raw?: {
+    userInfo: unknown;
+    store: unknown;
+  };
+}
+
+export interface PointBenefit {
+  code: string;
+  name: string;
+  price: number | null;
+  stock: number | null;
+}
+
+export interface PointData {
+  point_uid: string | null;
+  user_id: string | null;
+  game_uid: string | null;
+  app_type: number;
+  game_app_id: number;
+  user_name: string | null;
+  user_grade: number | null;
+  valid_point: number | null;
+  history_point: number | null;
+  expire_point: number | null;
+  expire_time: string | null;
+  game_benefits: PointBenefit[];
+  snapshot: AccountSnapshot | null;
+  raw?: {
+    userInfo: unknown;
+    gradeInfo: unknown;
+    gameHomePage: unknown;
+    gameRedeemInfo: unknown;
+  };
+}
+
+export interface PointStoreOrderResult {
+  product: PointStoreProduct;
+  email: string;
+  order_id: string | null;
+  order: unknown;
+  order_info: unknown;
+  point_store: PointStoreData;
+}
+
 export interface PhoneActionVerification {
   source: string;
   confirmed: boolean;
@@ -355,7 +422,7 @@ export interface RefreshMessagesResult {
   messages: Message[];
 }
 
-// 消息
+// 娑堟伅
 export type MessageDirection = 'incoming' | 'outgoing';
 export type MessageType = 'sms' | 'verification' | 'mms' | 'system';
 
@@ -396,7 +463,7 @@ export interface DashboardStats {
   activePhoneNumbers: number;
 }
 
-// 设置
+// 璁剧疆
 export interface SettingItem {
   id: number;
   key: string;
@@ -405,7 +472,7 @@ export interface SettingItem {
   updated_at: string;
 }
 
-// SSE 事件
+// SSE 浜嬩欢
 export interface SSENewMessageEvent {
   id?: number;
   accountId: number;
@@ -422,7 +489,7 @@ export interface SSEAccountStatusEvent {
   message?: string;
 }
 
-// 监听会话
+// 鐩戝惉浼氳瘽
 export interface MonitorSession {
   session_id: number;
   status: string;

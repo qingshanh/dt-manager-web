@@ -58,7 +58,8 @@ export class RealDingtoneGateway implements DingtoneGateway {
     return {
       message: pickString(body, ["message", "detail"]) ?? "Verification code request accepted",
       mock: pickBoolean(body, ["mock"]),
-      verificationCode: pickString(body, ["verificationCode", "verification_code"])
+      verificationCode: pickString(body, ["verificationCode", "verification_code"]),
+      verificationFlow: "register"
     };
   }
 
@@ -180,12 +181,14 @@ export class RealDingtoneGateway implements DingtoneGateway {
 
   private async callBridge(action: BridgeAction, payload: JsonRecord) {
     const runtime = await getBridgeRuntimeConfig();
+    const timeoutMs = resolveBridgeActionTimeoutMs(action, runtime.timeoutMs);
     const requestBody = {
       action,
       payload,
       meta: {
         appVersion: config.DT_APP_VERSION,
         apkCertificateSign: config.DT_APK_CERTIFICATE_SIGN,
+        timeoutMs,
         serverIp: runtime.serverIp,
         serverPort: runtime.serverPort,
         backupIp: runtime.backupIp,
@@ -197,7 +200,7 @@ export class RealDingtoneGateway implements DingtoneGateway {
     let lastError: Error | undefined;
     for (const path of BRIDGE_EXECUTE_PATHS) {
       try {
-        return await postBridgeRequest(runtime, path, requestBody);
+        return await postBridgeRequest(runtime, path, requestBody, timeoutMs);
       } catch (error) {
         if (error instanceof BridgeEndpointNotFoundError) {
           lastError = error;
@@ -218,6 +221,13 @@ export class RealDingtoneGateway implements DingtoneGateway {
       503
     );
   }
+}
+
+function resolveBridgeActionTimeoutMs(action: BridgeAction, fallbackMs: number) {
+  if (action === "send_verification_code" || action === "login") {
+    return Math.max(fallbackMs, 110_000);
+  }
+  return fallbackMs;
 }
 
 async function getBridgeRuntimeConfig(): Promise<BridgeRuntimeConfig> {
@@ -242,7 +252,7 @@ async function getBridgeRuntimeConfig(): Promise<BridgeRuntimeConfig> {
   };
 }
 
-async function postBridgeRequest(runtime: BridgeRuntimeConfig, path: string, body: JsonRecord) {
+async function postBridgeRequest(runtime: BridgeRuntimeConfig, path: string, body: JsonRecord, timeoutMs = runtime.timeoutMs) {
   const url = `${runtime.baseUrl}${path}`;
   let response: Response;
   try {
@@ -250,7 +260,7 @@ async function postBridgeRequest(runtime: BridgeRuntimeConfig, path: string, bod
       method: "POST",
       headers: buildBridgeHeaders(runtime),
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(runtime.timeoutMs)
+      signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (error) {
     logger.error("Real gateway bridge request failed", { url, error });
@@ -351,7 +361,9 @@ function normalizeSnapshot(value: unknown): DingtoneSnapshot {
   const records = collectCandidateRecords(value);
   return {
     dtDingtoneId: pickStringFromRecords(records, ["dtDingtoneId", "dt_dingtone_id", "dingtoneId", "dingtone_id", "uid"]),
-    fullName: pickStringFromRecords(records, ["fullName", "full_name", "nickname", "nickName", "name"]),
+    fullName:
+      pickStringFromRecords(records, ["fullName", "full_name", "displayName", "DisplayName", "nickname", "nickName", "userName"]) ??
+      pickStringFromRecords(records.filter((record) => hasAnyOwnKey(record, ["profileImg", "profileVerCode", "dingtoneID"])), ["name"]),
     avatarUrl: pickStringFromRecords(records, ["avatarUrl", "avatar_url", "photoUrl", "photo_url"]),
     gender: pickNumberFromRecords(records, ["gender", "sex"]),
     birthday: pickStringFromRecords(records, ["birthday", "birthDay"]),
@@ -661,6 +673,10 @@ function pickStringFromRecords(records: JsonRecord[], keys: string[]) {
     }
   }
   return undefined;
+}
+
+function hasAnyOwnKey(record: JsonRecord, keys: string[]) {
+  return keys.some((key) => Object.prototype.hasOwnProperty.call(record, key));
 }
 
 function pickNumberFromRecords(records: JsonRecord[], keys: string[]) {

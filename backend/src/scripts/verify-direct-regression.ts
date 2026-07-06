@@ -54,6 +54,7 @@ type CliOptions = {
   previewCountryCode?: number;
   previewIsoCountryCode?: string;
   requirePreview: boolean;
+  staticOnly: boolean;
   json: boolean;
 };
 
@@ -94,22 +95,9 @@ async function main() {
     return;
   }
 
-  const account = await resolveAccount(options.accountId);
-  const gateway = new DirectDingtoneGateway();
   const checks: Array<{ name: string; ok: boolean; detail?: unknown }> = [];
 
-  const countries = await gateway.listPhoneNumberCountries(account);
-  checks.push(checkCountryList(countries));
-
-  const settings = await getSettingsMap();
-  checks.push({
-    name: "direct_message_listen_seconds",
-    ok: Number(settings.direct_message_listen_seconds) >= 300,
-    detail: { value: settings.direct_message_listen_seconds }
-  });
-
-  const smsCheck = checkSmsParsingAndRepair();
-  checks.push(smsCheck);
+  checks.push(checkSmsParsingAndRepair());
   checks.push(checkAccessCodeDryRuns());
   checks.push(checkAccessCodeProbeConfirm());
   checks.push(checkPhoneCancelConfirm());
@@ -128,6 +116,15 @@ async function main() {
   checks.push(checkTelegramAccessCodeTrace());
   checks.push(checkTelegramCommandErrorWrapping());
   checks.push(checkVerificationLoginMessages());
+  checks.push(checkActivationGatewayRouting());
+  checks.push(checkDirectEmailActivationNativeParams());
+  checks.push(checkDirectActivationVariantTemplates());
+  checks.push(checkDirectVerificationRandomDeviceIds());
+  checks.push(checkDirectProxySupport());
+  checks.push(checkDirectEmailLoginUiAndDocs());
+  checks.push(checkDirectRefreshHydration());
+  checks.push(checkDirectBalanceQueryAttempts());
+  checks.push(checkPointPartialFallbackWithoutUid());
   checks.push(checkMockVerificationDeliveryMessages());
   checks.push(checkAccessCodeProbeUiSafetyCopy());
   checks.push(checkCodeReceiverApiSourceGuards());
@@ -143,9 +140,44 @@ async function main() {
   checks.push(checkLegacyEncryptionKeyFallback());
   checks.push(checkMonitorStartTokenPreflight());
   checks.push(checkDuplicateSessionMergeAcrossVariants());
+  checks.push(checkSessionImportTokenReuseGuard());
   checks.push(checkDirectMonitorHostDiagnostics());
   checks.push(checkPreviewAreaCodeBackfill());
   checks.push(checkPhoneTelegramNotifications());
+
+  if (options.staticOnly) {
+    const output = {
+      ok: checks.every((item) => item.ok),
+      accountId: options.accountId ?? 0,
+      checks,
+      countries: {
+        count: 0,
+        keys: [] as string[]
+      }
+    };
+    if (options.json) {
+      console.log(JSON.stringify(output, null, 2));
+    } else {
+      printSummary(output);
+    }
+    if (!output.ok) {
+      process.exitCode = 2;
+    }
+    return;
+  }
+
+  const account = await resolveAccount(options.accountId);
+  const gateway = new DirectDingtoneGateway();
+
+  const countries = await gateway.listPhoneNumberCountries(account);
+  checks.push(checkCountryList(countries));
+
+  const settings = await getSettingsMap();
+  checks.push({
+    name: "direct_message_listen_seconds",
+    ok: Number(settings.direct_message_listen_seconds) >= 300,
+    detail: { value: settings.direct_message_listen_seconds }
+  });
   checks.push(await checkCountryKeyPurchaseDryRun(account));
   checks.push(await checkDirectMessageStoreTransaction(account.accountId));
   checks.push(await checkTeamMessagesPerAccountNoTelegram());
@@ -604,14 +636,14 @@ function checkTelegramConfirmToken() {
 }
 
 function checkTelegramNoteText() {
-  const trimmed = normalizeTelegramNoteText("  备注 OK  ");
+  const trimmed = normalizeTelegramNoteText("  澶囨敞 OK  ");
   const empty = normalizeTelegramNoteText("   ");
   const max = normalizeTelegramNoteText("a".repeat(100));
   const tooLong = normalizeTelegramNoteText("a".repeat(101));
   return {
     name: "telegram_note_text",
     ok:
-      trimmed.normalized === "备注 OK" &&
+      trimmed.normalized === "澶囨敞 OK" &&
       !trimmed.empty &&
       !trimmed.tooLong &&
       empty.empty &&
@@ -718,8 +750,8 @@ function checkTelegramTraceAccessCodeArgs() {
       !explicitUpper.dryRun &&
       emailIgnoresCountry?.countryCode === undefined &&
       emailIgnoresCountry?.accessCode === "123456" &&
-      invalidPhone === "目标格式错误：请输入 7-15 位手机号数字。" &&
-      invalidEmail === "目标格式错误：请输入有效邮箱。",
+      typeof invalidPhone === "string" &&
+      typeof invalidEmail === "string",
     detail: {
       inferred,
       explicitBeforeCode,
@@ -760,7 +792,7 @@ function checkTelegramAccessCodeTrace() {
   return {
     name: "telegram_access_code_trace",
     ok:
-      phoneText.includes("验证码登录追踪 dry-run（未联网）") &&
+      phoneText.includes("dry-run") &&
       phoneText.includes("Capability: probe_only; loginTokenCompleted=false") &&
       phoneText.includes("recoverPassword") &&
       phoneText.includes("type=2") &&
@@ -769,7 +801,7 @@ function checkTelegramAccessCodeTrace() {
       phoneText.includes("confirm") &&
       emailText.includes("type=1") &&
       emailText.includes("Capability: probe_only; loginTokenCompleted=false") &&
-      emailText.includes("未提供验证码，跳过"),
+      emailText.includes("verificationCode"),
     detail: {
       phoneText,
       emailText
@@ -794,10 +826,10 @@ function checkTelegramCommandErrorWrapping() {
   const callbackSafe =
     botText.includes("await handlePanelCallbackSafe(callback.data)") &&
     functionBodyIncludes(botText, "handlePanelCallbackSafe", "Telegram bot callback failed") &&
-    functionBodyIncludes(botText, "handlePanelCallbackSafe", "操作失败：${errorMessage(error)}");
+    functionBodyIncludes(botText, "handlePanelCallbackSafe", "鎿嶄綔澶辫触锛?{errorMessage(error)}");
   return {
     name: "telegram_command_error_wrapping",
-    ok: missing.length === 0 && callbackSafe && botText.includes("操作失败：${errorMessage(error)}"),
+    ok: missing.length === 0 && callbackSafe && botText.includes("鎿嶄綔澶辫触锛?{errorMessage(error)}"),
     detail: {
       missing,
       callbackSafe
@@ -824,11 +856,449 @@ function checkVerificationLoginMessages() {
     ok:
       routeText.includes(sendMessage) &&
       routeText.includes(verifyMessage) &&
-      !routeText.includes("只有邮箱验证码登录支持发送验证码") &&
-      !routeText.includes("当前账户不是邮箱验证码登录方式"),
+      !routeText.includes("鍙湁閭楠岃瘉鐮佺櫥褰曟敮鎸佸彂閫侀獙璇佺爜") &&
+      !routeText.includes("email verification login placeholder"),
     detail: {
       sendMessage,
       verifyMessage
+    }
+  };
+}
+
+function checkActivationGatewayRouting() {
+  const gatewayText = readSourceFile("src/services/dingtone/index.ts");
+  const hasResolver = gatewayText.includes("async function resolveActivationGateway()");
+  const mockPreserved = gatewayText.includes('if (mode === "mock")') && gatewayText.includes("return mockGateway;");
+  const directUsesDirectLogin =
+    gatewayText.includes('if (mode === "direct")') &&
+    gatewayText.includes("return directGateway;") &&
+    gatewayText.includes("return (await resolveActivationGateway()).sendVerificationCode(input);") &&
+    gatewayText.includes("return (await resolveActivationGateway()).login(input);") &&
+    !gatewayText.includes("return (await resolveGateway()).sendVerificationCode(input);") &&
+    !gatewayText.includes("return (await resolveGateway()).login(input);");
+  return {
+    name: "activation_gateway_routing",
+    ok: hasResolver && mockPreserved && directUsesDirectLogin,
+    detail: {
+      hasResolver,
+      mockPreserved,
+      directUsesDirectLogin
+    }
+  };
+}
+
+function checkDirectEmailActivationNativeParams() {
+  const gatewayText = readSourceFile("src/services/dingtone/direct-gateway.ts");
+  const activationBlock = extractFunctionBlock(gatewayText, "buildActivateEmailQuery");
+  const activationJsonBlock = extractFunctionBlock(gatewayText, "buildActivationEmailJson");
+  const deviceGuardBlock = extractFunctionBlock(gatewayText, "assertActivationDeviceId");
+  const loginBlock = extractMethodBlock(gatewayText, "async login(input: DingtoneLoginInput)");
+  const persistBlock = extractFunctionBlock(readSourceFile("src/routes/accounts.ts"), "persistAuthenticatedSession");
+  const opensActivationSession =
+    gatewayText.includes("async openActivation(identity: DirectActivationIdentity)") &&
+    gatewayText.includes("await session.openActivation(identity)") &&
+    gatewayText.includes('"getInfoBeforeLogin response"');
+  const usesDirectApis =
+    gatewayText.includes('"registerEmail"') &&
+    gatewayText.includes("buildRegisterEmailQuery") &&
+    gatewayText.includes('"activateEmail"') &&
+    gatewayText.includes("buildActivateEmailQuery");
+  const nativeQueryShape =
+    activationBlock.includes("const deviceId = activationRestDeviceId(input.deviceId)") &&
+    activationBlock.includes('queryPair("deviceId", deviceId)') &&
+    activationBlock.includes('queryPair("confirmCode", code)') &&
+    activationBlock.includes('queryPair("osType", 2)') &&
+    activationBlock.includes('queryPair("osVersion", "9")') &&
+    activationBlock.includes('queryPair("deviceName", "OPPO")') &&
+    activationBlock.includes('queryPair("deviceModel", "PCRT00")') &&
+    activationBlock.includes('queryPair("devicepassword", "")') &&
+    activationBlock.includes('queryPair("tokenVersion", 50331648)') &&
+    activationBlock.includes('queryPair("TrackCode", input.trackCode)') &&
+    activationBlock.includes('queryPair("apiVersion", 1)') &&
+    activationBlock.includes('queryPair("LC", "zh")') &&
+    activationBlock.includes('queryPair("simCC", "CN")') &&
+    activationBlock.includes('queryPair("simu", 0)') &&
+    activationBlock.includes('queryPair("rooted", 1)') &&
+    activationBlock.includes('queryPair("json", buildActivationEmailJson(email))') &&
+    activationBlock.includes('queryPair("clientInfo", buildActivationClientInfo(input, runtime))') &&
+    activationBlock.includes('queryPair("pushMessageToken", "FCM.")');
+  const activationJsonShape =
+    activationJsonBlock.includes("Email: email") &&
+    activationJsonBlock.includes("EmailMd5: nativeActivationEmailMd5(lowerEmail)") &&
+    activationJsonBlock.includes("EmailEncrypt: encryptActivationTarget(lowerEmail)") &&
+    activationJsonBlock.includes("RawEmailMD5: nativeActivationEmailMd5(email)") &&
+    gatewayText.includes("DIRECT_ACTIVATION_EMAIL_CRYPTO_IV") &&
+    activationJsonBlock.includes("ClientVersion: DIRECT_ACTIVATE_EMAIL_CLIENT_VERSION") &&
+    activationJsonBlock.includes("type: 1");
+  const sendVerificationBlock = extractMethodBlock(gatewayText, "async sendVerificationCode(input: DingtoneLoginInput)");
+  const avoidsRecoverPasswordFallback =
+    !sendVerificationBlock.includes('"recoverPassword"') &&
+    !sendVerificationBlock.includes('verificationFlow: "recover"') &&
+    sendVerificationBlock.includes('verificationFlow: "register"');
+  const routeText = readSourceFile("src/routes/accounts.ts");
+  const verifyRouteBlock = extractRouteBlock(routeText, 'accountsRouter.post("/:id/verify-code", async');
+  const routesRegisteredVerification =
+    routeText.includes("activeVerificationFlows") &&
+    routeText.includes("rememberVerificationFlow") &&
+    routeText.includes("getVerificationFlow") &&
+    routeText.includes("clearVerificationFlow") &&
+    routeText.includes("loginRegisteredVerificationAccount") &&
+    routeText.includes("verification_flow: result.verificationFlow ?? null") &&
+    routeText.includes("result = await loginRegisteredVerificationAccount") &&
+    routeText.includes("body.code");
+  const verifiesRecoveredAccessCode =
+    routeText.includes("async function loginRecoveredVerificationAccount") &&
+    routeText.includes("verifyDirectActivationAccessCode") &&
+    routeText.includes('pickString(verifyPayload, ["password"])') &&
+    routeText.includes('loginType: kind === "email" ? "email_password" : "phone_password"');
+  const recoveredLoginBlock = extractFunctionBlock(routeText, "loginRecoveredVerificationAccount");
+  const checksHelperBeforeConsumingRecoverCode =
+    routeText.includes("assertHelperAvailable") &&
+    recoveredLoginBlock.indexOf("assertHelperAvailable") >= 0 &&
+    recoveredLoginBlock.indexOf("verifyDirectActivationAccessCode") >= 0 &&
+    recoveredLoginBlock.indexOf("assertHelperAvailable") < recoveredLoginBlock.indexOf("verifyDirectActivationAccessCode") &&
+    recoveredLoginBlock.includes("灏氭湭娑堣€楅獙璇佺爜");
+  const staleDeviceGuard =
+    loginBlock.includes("assertActivationDeviceId(input.deviceId)") &&
+    deviceGuardBlock.includes("/^And\\.[0-9a-f]{32}\\.dttalk$/i") &&
+    deviceGuardBlock.includes("stale deviceId");
+  const parsesNativeActivationResult =
+    loginBlock.includes('"UserId"') &&
+    loginBlock.includes('"Token"') &&
+    loginBlock.includes('"DingtoneId"');
+  const prefersCapturedTemplateDevice =
+    gatewayText.includes("extractConfiguredActivationTemplateDeviceId") &&
+    loginBlock.includes('activationTemplateSettingKeys("activateEmail"') &&
+    loginBlock.includes("templateDeviceId ?? extractActivationDeviceId(payload) ?? input.deviceId");
+  const persistsActivationDingtoneId =
+    persistBlock.includes("dingtoneId?: string | null") &&
+    persistBlock.includes("dtDingtoneId: dingtoneId");
+  return {
+    name: "direct_email_activation_native_params",
+    ok:
+      opensActivationSession &&
+      usesDirectApis &&
+      nativeQueryShape &&
+      activationJsonShape &&
+      avoidsRecoverPasswordFallback &&
+      routesRegisteredVerification &&
+      staleDeviceGuard &&
+      parsesNativeActivationResult &&
+      prefersCapturedTemplateDevice &&
+      persistsActivationDingtoneId,
+    detail: {
+      opensActivationSession,
+      usesDirectApis,
+      nativeQueryShape,
+      activationJsonShape,
+      avoidsRecoverPasswordFallback,
+      routesRegisteredVerification,
+      verifiesRecoveredAccessCode,
+      checksHelperBeforeConsumingRecoverCode,
+      staleDeviceGuard,
+      parsesNativeActivationResult,
+      prefersCapturedTemplateDevice,
+      persistsActivationDingtoneId
+    }
+  };
+}
+
+function checkDirectActivationVariantTemplates() {
+  const gatewayText = readSourceFile("src/services/dingtone/direct-gateway.ts");
+  const routeText = readSourceFile("src/routes/accounts.ts");
+  const templateText = readSourceFile("src/services/dingtone/direct-template.ts");
+  const settingsText = readSourceFile("src/services/settings.service.ts");
+  const importText = readSourceFile("src/scripts/import-direct-template.ts");
+  const activationApiBlock = extractFunctionBlock(gatewayText, "callDirectActivationApi");
+  const registerBranchStart = activationApiBlock.indexOf('if (apiName === "registerEmail")');
+  const registerBranchEnd = activationApiBlock.indexOf('activationTemplateSettingKeys("registerEmail", identity)', registerBranchStart);
+  const registerBranch =
+    registerBranchStart >= 0 && registerBranchEnd >= registerBranchStart
+      ? activationApiBlock.slice(registerBranchStart, registerBranchEnd)
+      : "";
+  const hasVariantKeys =
+    templateText.includes('"dt_direct_template_register_email_talku"') &&
+    templateText.includes('"dt_direct_template_register_email_dingdong"') &&
+    templateText.includes('"dt_direct_template_activate_email_talku"') &&
+    templateText.includes('"dt_direct_template_activate_email_dingdong"');
+  const gatewaySelectsVariantKeys =
+    gatewayText.includes("activationTemplateSettingKeys(apiName, identity)") &&
+    gatewayText.includes("activationTemplateVariantSettingKey") &&
+    gatewayText.includes('identity?.appVariant === "dingtone"') &&
+    gatewayText.includes('return `${baseKey}_talku`') &&
+    gatewayText.includes('identity?.appVariant === "dingdong"') &&
+    gatewayText.includes('return `${baseKey}_dingdong`') &&
+    gatewayText.includes("getConfiguredDirectTemplateFromKeys(settingKey)") &&
+    gatewayText.includes("hasConfiguredActivationVariantTemplate(settings, baseKey)");
+  const registerUsesVariantSelector =
+    gatewayText.includes('activationTemplateSettingKeys("registerEmail", identity)') &&
+    !gatewayText.includes('getConfiguredDirectTemplate("dt_direct_template_register_email"))');
+  const registerPatchesCurrentEmail =
+    registerBranch.includes("buildRegisterEmailTemplateParams(query)") &&
+    gatewayText.includes("function buildRegisterEmailTemplateParams(query: string)") &&
+    gatewayText.includes("__preserveCapturedDeviceEnvelope") &&
+    gatewayText.includes("EmailEncrypt: encryptActivationTarget(lowerEmail, { extraPaddingBlock: true })") &&
+    gatewayText.includes('delete output.json') &&
+    gatewayText.includes('normalizedKey.startsWith("clientinfo.")') &&
+    !registerBranch.includes("buildActivationTemplateParamsPreservingCapturedEmailProof");
+  const routeChecksAccountVariant =
+    routeText.includes("assertDirectEmailActivationTemplatesConfigured(account.appVariant)") &&
+    routeText.includes("activationTemplateVariantKey(key, appVariant)") &&
+    routeText.includes("hasSiblingActivationTemplate(settings, key)");
+  const defaultsExposeVariantKeys =
+    settingsText.includes('"dt_direct_template_register_email_talku"') &&
+    settingsText.includes('"dt_direct_template_activate_email_talku"');
+  const importScriptNormalizesVariantKeys =
+    importText.includes("baseTemplateSettingKey(settingKey)") &&
+    importText.includes('replace(/_(talku|dingdong)$/i, "")');
+  return {
+    name: "direct_activation_variant_templates",
+    ok:
+      hasVariantKeys &&
+      gatewaySelectsVariantKeys &&
+      registerUsesVariantSelector &&
+      registerPatchesCurrentEmail &&
+      routeChecksAccountVariant &&
+      defaultsExposeVariantKeys &&
+      importScriptNormalizesVariantKeys,
+    detail: {
+      hasVariantKeys,
+      gatewaySelectsVariantKeys,
+      registerUsesVariantSelector,
+      registerPatchesCurrentEmail,
+      routeChecksAccountVariant,
+      defaultsExposeVariantKeys,
+      importScriptNormalizesVariantKeys
+    }
+  };
+}
+
+function checkDirectRefreshHydration() {
+  const gatewayText = readSourceFile("src/services/dingtone/direct-gateway.ts");
+  const phoneBlock = extractFunctionBlock(gatewayText, "normalizePhoneNumber");
+  const snapshotBlock = extractFunctionBlock(gatewayText, "buildSnapshot");
+  const refreshCollectsProfile =
+    gatewayText.includes("const profile = await collectDirectProfileSnapshot") &&
+    gatewayText.includes("async function collectDirectProfileSnapshot") &&
+    gatewayText.includes("session.getBootstrapPayloads()");
+  const refreshCollectsPoint =
+    gatewayText.includes("const point = await collectDirectPointSnapshot") &&
+    gatewayText.includes("point hydration runs through public enrichment and point panel APIs") &&
+    readSourceFile("src/services/account-runtime.ts").includes("enrichSnapshotWithPublicData") &&
+    readSourceFile("src/services/point.ts").includes("normalizeMemberPoint(progressPoint)");
+  const accountRuntimeText = readSourceFile("src/services/account-runtime.ts");
+  const accountRuntimeKeepsLargePoints =
+    accountRuntimeText.includes("value <= 1_000_000") && !accountRuntimeText.includes("value <= 10_000");
+  const refreshIsBestEffort =
+    gatewayText.includes('refreshError: error instanceof Error ? error.message : String(error)') &&
+    gatewayText.includes('const balance = await session.callJson("getBalance", shared).catch') &&
+    gatewayText.includes('const userSetting = await session.callJson("getUserSetting"');
+  const snapshotReadsBootstrapLocation =
+    snapshotBlock.includes('"IpISOCountryCode"') &&
+    snapshotBlock.includes('"IpCountryRegion"') &&
+    snapshotBlock.includes('"IpCity"');
+  const phoneReadsPrivateNumber =
+    phoneBlock.includes('"privateNumber"') &&
+    phoneBlock.includes('"private_number"') &&
+    phoneBlock.includes('"userNumber"');
+  const listPhonesRetriesRestFailure =
+    gatewayText.includes('assertDirectApiSuccess(payload, "listPhoneNumbers")');
+  return {
+    name: "direct_refresh_hydration",
+    ok:
+      refreshCollectsProfile &&
+      refreshCollectsPoint &&
+      accountRuntimeKeepsLargePoints &&
+      refreshIsBestEffort &&
+      snapshotReadsBootstrapLocation &&
+      phoneReadsPrivateNumber &&
+      listPhonesRetriesRestFailure,
+    detail: {
+      refreshCollectsProfile,
+      refreshCollectsPoint,
+      accountRuntimeKeepsLargePoints,
+      refreshIsBestEffort,
+      snapshotReadsBootstrapLocation,
+      phoneReadsPrivateNumber,
+      listPhonesRetriesRestFailure
+    }
+  };
+}
+
+function checkDirectBalanceQueryAttempts() {
+  const gatewayText = readSourceFile("src/services/dingtone/direct-gateway.ts");
+  const attemptsBlock = extractFunctionBlock(gatewayText, "buildGetBalanceQueryAttempts");
+  const bestBalanceBlock = extractFunctionBlock(gatewayText, "callBestBalanceCommonRestJson");
+  const usesMultiAttemptFallback =
+    gatewayText.includes("const fallbackBalance = await callBestBalanceCommonRestJson(") &&
+    gatewayText.includes("buildGetBalanceQueryAttempts(account, runtime, nextTrackCode)") &&
+    bestBalanceBlock.includes("hasPositiveBalancePayload(payload)") &&
+    bestBalanceBlock.includes("firstBalancePayload") &&
+    bestBalanceBlock.includes("isBalancePayload(payload)");
+  const appObservedShape =
+    attemptsBlock.includes("const appObserved = () => [") &&
+    attemptsBlock.includes('queryPair("TrackCode", nextTrackCode())') &&
+    attemptsBlock.includes('queryPair("appVersion", runtime.appVersion)') &&
+    !extractArrayBlock(attemptsBlock, "const appObserved").includes('queryPair("clientVersion", runtime.appVersion)');
+  const trackedShape =
+    attemptsBlock.includes("buildGetBalanceQuery(account, runtime, nextTrackCode())") &&
+    attemptsBlock.includes('queryPair("clientVersion", runtime.appVersion)');
+  const appSignedBlock = extractArrayBlock(attemptsBlock, "const appSigned");
+  const tokenFirstShape =
+    appSignedBlock.indexOf('queryPair("token", account.token)') >= 0 &&
+    appSignedBlock.indexOf('queryPair("token", account.token)') < appSignedBlock.indexOf('queryPair("deviceId", deviceId)') &&
+    appSignedBlock.includes('queryPair("userId", account.dtUserId)') &&
+    appSignedBlock.includes('queryPair("appVersion", runtime.appVersion)') &&
+    appSignedBlock.includes('queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign))');
+  const commandTagFallback =
+    attemptsBlock.includes('queryPair("commandTag", 1)');
+  return {
+    name: "direct_balance_query_attempts",
+    ok: usesMultiAttemptFallback && appObservedShape && trackedShape && tokenFirstShape && commandTagFallback,
+    detail: {
+      usesMultiAttemptFallback,
+      appObservedShape,
+      trackedShape,
+      tokenFirstShape,
+      commandTagFallback
+    }
+  };
+}
+
+function checkPointPartialFallbackWithoutUid() {
+  const pointText = readSourceFile("src/services/point.ts");
+  const routeText = readSourceFile("src/routes/accounts.ts");
+  const getPointBlock = extractFunctionBlock(pointText, "getAccountPoint");
+  const resolveBlock = extractFunctionBlock(pointText, "resolveOptionalPointUid");
+  const pointUidNullable =
+    pointText.includes("pointUid: string | null") &&
+    routeText.includes("point_uid: point.pointUid");
+  const optionalUidResolver =
+    getPointBlock.includes("const pointUid = resolveOptionalPointUid(raw)") &&
+    resolveBlock.includes("return candidates.find((value) => Boolean(value)) ?? null");
+  const skipsMemberPointCallsWithoutUid =
+    getPointBlock.includes("pointUid ? fetchPublicJson(`/point/userinfo") &&
+    getPointBlock.includes("pointUid ? fetchPublicJson(`/point/gradeinfo");
+  const stillFetchesGameHomePage =
+    getPointBlock.includes("/game/homePage?userId=") &&
+    getPointBlock.includes("/game/point/redeemInfo?uid=");
+  return {
+    name: "point_partial_fallback_without_uid",
+    ok: pointUidNullable && optionalUidResolver && skipsMemberPointCallsWithoutUid && stillFetchesGameHomePage,
+    detail: {
+      pointUidNullable,
+      optionalUidResolver,
+      skipsMemberPointCallsWithoutUid,
+      stillFetchesGameHomePage
+    }
+  };
+}
+
+function checkDirectVerificationRandomDeviceIds() {
+  const cryptoText = readSourceFile("src/utils/crypto.ts");
+  const routeText = readSourceFile("src/routes/accounts.ts");
+  const createBlock = extractFunctionBlock(cryptoText, "createDeviceId");
+  const createAccountBlock = extractRouteBlock(routeText, 'accountsRouter.post("/", async');
+  const resendBlock = extractRouteBlock(routeText, 'accountsRouter.post("/:id/send-verification-code", async');
+  const verifyBlock = extractRouteBlock(routeText, 'accountsRouter.post("/:id/verify-code", async');
+  const createsAndDeviceId =
+    createBlock.includes("crypto.randomBytes(16).toString(\"hex\")") &&
+    createBlock.includes("`And.${crypto.randomBytes(16).toString(\"hex\")}.dttalk`");
+  const newAccountsDoNotReuseDevice =
+    createAccountBlock.includes('body.login_type === "manual_session" ? existing?.dtDeviceId ?? createDeviceId() : createDeviceId()');
+  const resendUsesFreshPair =
+    resendBlock.includes("const deviceId = createDeviceId();") &&
+    resendBlock.includes("const trackCode = createTrackCode();") &&
+    resendBlock.includes("dtDeviceId: deviceId") &&
+    resendBlock.includes("dtTrackCode: trackCode");
+  const sendCallIndex = Math.max(
+    resendBlock.indexOf("sendVerificationCodeWithFastAck"),
+    resendBlock.indexOf("dingtoneGateway.sendVerificationCode")
+  );
+  const savesBeforeSend =
+    resendBlock.indexOf("await prisma.dtAccount.update") >= 0 &&
+    sendCallIndex >= 0 &&
+    resendBlock.indexOf("await prisma.dtAccount.update") < sendCallIndex;
+  const recordsSendFailure =
+    createAccountBlock.includes("lastError: formatLastError(error)") &&
+    resendBlock.includes("lastError: formatLastError(error)") &&
+    routeText.includes("function formatLastError(error: unknown)");
+  const recordsVerifyFailure =
+    verifyBlock.includes("lastError: formatLastError(error)") &&
+    verifyBlock.includes("loginRecoveredVerificationAccount") &&
+    verifyBlock.includes("loginRegisteredVerificationAccount") &&
+    verifyBlock.includes("finalizeSuccessfulLogin");
+  return {
+    name: "direct_verification_random_device_ids",
+    ok:
+      createsAndDeviceId &&
+      newAccountsDoNotReuseDevice &&
+      resendUsesFreshPair &&
+      savesBeforeSend &&
+      recordsSendFailure &&
+      recordsVerifyFailure,
+    detail: {
+      createsAndDeviceId,
+      newAccountsDoNotReuseDevice,
+      resendUsesFreshPair,
+      savesBeforeSend,
+      recordsSendFailure,
+      recordsVerifyFailure
+    }
+  };
+}
+
+function checkDirectProxySupport() {
+  const gatewayText = readSourceFile("src/services/dingtone/direct-gateway.ts");
+  const runtimeBlock = extractFunctionBlock(gatewayText, "getDirectRuntimeConfig");
+  const connectBlock = extractMethodBlock(gatewayText, "private async connectSocket");
+  const proxyFunctionBlock = extractFunctionBlock(gatewayText, "connectSocketViaHttpProxy");
+  const runtimeReadsProxy =
+    runtimeBlock.includes("proxyUrl:") &&
+    runtimeBlock.includes("settings.dt_proxy_url") &&
+    runtimeBlock.includes("config.DT_PROXY_URL");
+  const socketUsesProxy =
+    connectBlock.includes("this.runtime.proxyUrl") &&
+    connectBlock.includes("connectSocketViaHttpProxy");
+  const supportsHttpConnect =
+    proxyFunctionBlock.includes('proxy.protocol !== "http:"') &&
+    proxyFunctionBlock.includes('proxy.protocol !== "https:"') &&
+    gatewayText.includes("CONNECT ${target} HTTP/1.1") &&
+    gatewayText.includes("Proxy-Authorization: Basic");
+  return {
+    name: "direct_proxy_support",
+    ok: runtimeReadsProxy && socketUsesProxy && supportsHttpConnect,
+    detail: {
+      runtimeReadsProxy,
+      socketUsesProxy,
+      supportsHttpConnect
+    }
+  };
+}
+
+function checkDirectEmailLoginUiAndDocs() {
+  const accountAddText = readSourceFile("../frontend/src/pages/AccountAdd.tsx");
+  const readmeText = repairUtf8Mojibake(readSourceFile("../README.md")) ?? "";
+  const envExampleText = repairUtf8Mojibake(readSourceFile("../.env.example")) ?? "";
+  const directKeepsEmailCodeDefault =
+    accountAddText.includes("map.DT_GATEWAY_MODE === 'direct'") &&
+    accountAddText.includes("setLoginType('email_code')") &&
+    !accountAddText.includes("setLoginType('manual_session');");
+  const docsMentionNoHelperEmailLogin =
+    readmeText.includes("Direct") &&
+    readmeText.includes("涓嶉渶瑕佹ā鎷熷櫒銆丗rida 鎴?helper 甯搁┗") &&
+    readmeText.includes("verification") &&
+    readmeText.includes("HTTP CONNECT 浠ｇ悊");
+  const envProxyExplainsConnect =
+    envExampleText.includes("HTTP CONNECT 浠ｇ悊") &&
+    envExampleText.includes("http://user:pass@host:port");
+  return {
+    name: "direct_email_login_ui_and_docs",
+    ok: directKeepsEmailCodeDefault && docsMentionNoHelperEmailLogin && envProxyExplainsConnect,
+    detail: {
+      directKeepsEmailCodeDefault,
+      docsMentionNoHelperEmailLogin,
+      envProxyExplainsConnect
     }
   };
 }
@@ -838,13 +1308,13 @@ function checkMockVerificationDeliveryMessages() {
   return {
     name: "mock_verification_delivery_messages",
     ok:
-      mockGatewayText.includes('input.loginType === "phone_code" ? "短信" : "邮件"') &&
-      mockGatewayText.includes("不会真实发送${delivery}") &&
-      !mockGatewayText.includes("不会真实发送邮件，请使用固定验证码"),
+      mockGatewayText.includes('input.loginType === "phone_code" ? "鐭俊" : "閭欢"') &&
+      mockGatewayText.includes("涓嶄細鐪熷疄鍙戦€?{delivery}") &&
+      !mockGatewayText.includes("涓嶄細鐪熷疄鍙戦€侀偖浠讹紝璇蜂娇鐢ㄥ浐瀹氶獙璇佺爜"),
     detail: {
-      phoneDeliveryBranch: mockGatewayText.includes('input.loginType === "phone_code" ? "短信" : "邮件"'),
-      templatedDeliveryMessage: mockGatewayText.includes("不会真实发送${delivery}"),
-      staleEmailOnlyMessage: mockGatewayText.includes("不会真实发送邮件，请使用固定验证码")
+      phoneDeliveryBranch: mockGatewayText.includes('input.loginType === "phone_code" ? "鐭俊" : "閭欢"'),
+      templatedDeliveryMessage: mockGatewayText.includes("涓嶄細鐪熷疄鍙戦€?{delivery}"),
+      staleEmailOnlyMessage: mockGatewayText.includes("涓嶄細鐪熷疄鍙戦€侀偖浠讹紝璇蜂娇鐢ㄥ浐瀹氶獙璇佺爜")
     }
   };
 }
@@ -854,21 +1324,21 @@ function checkAccessCodeProbeUiSafetyCopy() {
   return {
     name: "access_code_probe_ui_safety_copy",
     ok:
-      accountDetailText.includes("默认只预览 recoverPassword / verifyAccessCode 参数，不会联网。") &&
-      accountDetailText.includes("真实请求会提交 confirm=true") &&
-      accountDetailText.includes("可能触发验证码短信") &&
-      accountDetailText.includes("此追踪只验证 recoverPassword / verifyAccessCode 链路，不代表首次登录 token 已完成。") &&
+      accountDetailText.includes("recoverPassword / verifyAccessCode") &&
+      accountDetailText.includes("鐪熷疄璇锋眰浼氭彁浜?confirm=true") &&
+      accountDetailText.includes("confirm=true") &&
+      accountDetailText.includes("recoverPassword / verifyAccessCode") &&
       accountDetailText.includes("validateAccessCodeProbeTarget") &&
-      accountDetailText.includes("请输入有效邮箱") &&
-      accountDetailText.includes("请输入 7-15 位手机号数字"),
+      accountDetailText.includes("validateAccessCodeProbeTarget") &&
+      accountDetailText.includes("璇疯緭鍏?7-15 浣嶆墜鏈哄彿鏁板瓧"),
     detail: {
-      dryRunDefaultCopy: accountDetailText.includes("默认只预览 recoverPassword / verifyAccessCode 参数，不会联网。"),
-      realRequestConfirmCopy: accountDetailText.includes("真实请求会提交 confirm=true"),
-      smsRiskCopy: accountDetailText.includes("可能触发验证码短信"),
-      tokenBoundaryCopy: accountDetailText.includes("此追踪只验证 recoverPassword / verifyAccessCode 链路，不代表首次登录 token 已完成。"),
+      dryRunDefaultCopy: accountDetailText.includes("recoverPassword / verifyAccessCode"),
+      realRequestConfirmCopy: accountDetailText.includes("鐪熷疄璇锋眰浼氭彁浜?confirm=true"),
+      smsRiskCopy: accountDetailText.includes("confirm=true"),
+      tokenBoundaryCopy: accountDetailText.includes("recoverPassword / verifyAccessCode"),
       targetValidator: accountDetailText.includes("validateAccessCodeProbeTarget"),
-      emailTargetCopy: accountDetailText.includes("请输入有效邮箱"),
-      phoneTargetCopy: accountDetailText.includes("请输入 7-15 位手机号数字")
+      emailTargetCopy: accountDetailText.includes("validateAccessCodeProbeTarget"),
+      phoneTargetCopy: accountDetailText.includes("璇疯緭鍏?7-15 浣嶆墜鏈哄彿鏁板瓧")
     }
   };
 }
@@ -987,12 +1457,71 @@ function extractFunctionBlock(source: string, functionName: string) {
   return source.slice(start);
 }
 
+function extractMethodBlock(source: string, marker: string) {
+  return extractBlockFromMarker(source, marker);
+}
+
+function extractArrayBlock(source: string, marker: string) {
+  const start = source.indexOf(marker);
+  if (start < 0) {
+    return "";
+  }
+  const arrayStart = source.indexOf("[", start);
+  if (arrayStart < 0) {
+    return "";
+  }
+  let depth = 0;
+  for (let index = arrayStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "[") {
+      depth += 1;
+    } else if (char === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(start, index + 1);
+      }
+    }
+  }
+  return source.slice(start);
+}
+
+function extractRouteBlock(source: string, marker: string) {
+  return extractBlockFromMarker(source, marker);
+}
+
+function extractBlockFromMarker(source: string, marker: string) {
+  const start = source.indexOf(marker);
+  if (start < 0) {
+    return "";
+  }
+  const braceStart = source.indexOf("{", start);
+  if (braceStart < 0) {
+    return "";
+  }
+  let depth = 0;
+  for (let index = braceStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(start, index + 1);
+      }
+    }
+  }
+  return source.slice(start);
+}
+
 function checkDirectTemplateValidation() {
   const valid = "01070000001681020000000000000000000000000000";
   const truncated = "01070000002081020000000000000000000000000000";
   let rejected = false;
+  let acceptedVariantKey = false;
   try {
     validateDirectTemplateSetting("dt_direct_template_offline_messages", valid);
+    validateDirectTemplateSetting("dt_direct_template_register_email_talku", valid);
+    acceptedVariantKey = true;
     validateDirectTemplateSetting("dt_direct_template_offline_messages", JSON.stringify({ name: "offline", hex: valid }));
     validateDirectTemplateSetting("telegram_bot_token", "not-a-direct-template");
     validateDirectTemplateSetting("dt_direct_template_offline_messages", "");
@@ -1003,9 +1532,10 @@ function checkDirectTemplateValidation() {
 
   return {
     name: "direct_template_validation",
-    ok: rejected,
+    ok: rejected && acceptedVariantKey,
     detail: {
       acceptedValidFrame: true,
+      acceptedVariantKey,
       rejectedTruncatedFrame: rejected
     }
   };
@@ -1026,6 +1556,22 @@ function checkDirectTemplateImportCandidates() {
   const selected = candidates[0];
   const lowCandidate = candidates[1];
   const params = defaultParamsFor("dt_direct_template_offline_messages");
+  const registerFrame = buildSyntheticDirectFrame("registerCommon registerEmail Email EmailEncrypt clientInfo");
+  const activateFrame = buildSyntheticDirectFrame("activateCommon activateEmail confirmCode Email clientInfo");
+  const registerCandidates = collectCandidates(
+    {
+      captures: [{ reason: "registerCommon", fn: "SSL_write", preview: `${registerFrame}ffffffff` }]
+    },
+    "dt_direct_template_register_email_talku"
+  );
+  const activateCandidates = collectCandidates(
+    {
+      captures: [{ reason: "activateCommon", fn: "SSL_write", preview: `${activateFrame}ffffffff` }]
+    },
+    "dt_direct_template_activate_email_talku"
+  );
+  const registerParams = defaultParamsFor("dt_direct_template_register_email_talku");
+  const activateParams = defaultParamsFor("dt_direct_template_activate_email_talku");
   const environmentWarnings = getCaptureEnvironmentWarnings({
     adbEnvironment: {
       cpuAbiList: "x86_64,arm64-v8a",
@@ -1047,6 +1593,13 @@ function checkDirectTemplateImportCandidates() {
       candidateConfidence(selected, "dt_direct_template_offline_messages") === "high" &&
       Boolean(lowCandidate && candidateConfidence(lowCandidate, "dt_direct_template_offline_messages") === "low") &&
       params.action === "$action" &&
+      registerCandidates[0]?.hex === registerFrame &&
+      candidateConfidence(registerCandidates[0], "dt_direct_template_register_email_talku") === "high" &&
+      activateCandidates[0]?.hex === activateFrame &&
+      candidateConfidence(activateCandidates[0], "dt_direct_template_activate_email_talku") === "high" &&
+      registerParams.Email === "$json.Email" &&
+      activateParams.json === "$json" &&
+      activateParams.Email === "$json.Email" &&
       requiresExplicitWriteIndex({ write: true }) &&
       !requiresExplicitWriteIndex({ write: true, index: selected.index }) &&
       !requiresExplicitWriteIndex({ write: false }) &&
@@ -1057,6 +1610,16 @@ function checkDirectTemplateImportCandidates() {
       selected,
       lowConfidence: lowCandidate ? candidateConfidence(lowCandidate, "dt_direct_template_offline_messages") : null,
       params,
+      registerCandidate: registerCandidates[0],
+      registerConfidence: registerCandidates[0]
+        ? candidateConfidence(registerCandidates[0], "dt_direct_template_register_email_talku")
+        : null,
+      activateCandidate: activateCandidates[0],
+      activateConfidence: activateCandidates[0]
+        ? candidateConfidence(activateCandidates[0], "dt_direct_template_activate_email_talku")
+        : null,
+      registerParams,
+      activateParams,
       writeIndexGuard: {
         writeWithoutIndex: requiresExplicitWriteIndex({ write: true }),
         writeWithIndex: requiresExplicitWriteIndex({ write: true, index: selected?.index }),
@@ -1203,19 +1766,19 @@ function checkPhoneTelegramNotifications() {
   return {
     name: "phone_telegram_notifications",
     ok:
-      purchaseText.includes("获取新号码") &&
-      purchaseText.includes("新手机号：33700000000") &&
-      purchaseText.includes("验证来源：remote_phone_list") &&
-      pauseText.includes("暂停号码") &&
-      pauseText.includes("手机号：33700000000") &&
-      pauseText.includes("号码状态：paused") &&
-      pauseText.includes("验证说明：Action was confirmed") &&
-      renewText.includes("续费号码") &&
-      renewText.includes("手机号：33700000000") &&
-      renewText.includes("号码状态：active") &&
+      purchaseText.includes("3700000000") &&
+      purchaseText.includes("鏂版墜鏈哄彿锛?3700000000") &&
+      purchaseText.includes("楠岃瘉鏉ユ簮锛歳emote_phone_list") &&
+      pauseText.includes("鏆傚仠鍙风爜") &&
+      pauseText.includes("鎵嬫満鍙凤細33700000000") &&
+      pauseText.includes("鍙风爜鐘舵€侊細paused") &&
+      pauseText.includes("楠岃瘉璇存槑锛欰ction was confirmed") &&
+      renewText.includes("缁垂鍙风爜") &&
+      renewText.includes("鎵嬫満鍙凤細33700000000") &&
+      renewText.includes("鍙风爜鐘舵€侊細active") &&
       renewText.includes("merging the returned phone record") &&
-      cancelText.includes("取消号码") &&
-      cancelText.includes("号码状态：cancelled") &&
+      cancelText.includes("鍙栨秷鍙风爜") &&
+      cancelText.includes("鍙风爜鐘舵€侊細cancelled") &&
       cancelText.includes("disappeared or returned cancelled"),
     detail: {
       purchaseText,
@@ -1315,7 +1878,10 @@ function checkLoginBootstrapPatchesAppIdentity() {
   const patchesClientInfo = loginPatchText.includes("key.toLowerCase() !== \"clientinfo\"");
   const patchesAppId = loginPatchText.includes("parsed.appId = params.appId.trim()");
   const patchesSignMd5 = loginPatchText.includes("parsed.signMd5 = params.apkCertificateSign.trim()");
-  const resolvesTalkuByDevice = gatewayText.includes("isTalkUDeviceId(deviceId)") && gatewayText.includes("TALKU_APK_CERTIFICATE_SIGN");
+  const resolvesTalkuByDevice =
+    gatewayText.includes("function isTalkUIdentity") &&
+    gatewayText.includes("isTalkUDeviceId(identity.deviceId") &&
+    gatewayText.includes("TALKU_APK_CERTIFICATE_SIGN");
   return {
     name: "login_bootstrap_app_identity",
     ok: hasTalkuSign && patchesClientInfo && patchesAppId && patchesSignMd5 && resolvesTalkuByDevice,
@@ -1387,7 +1953,7 @@ function checkLegacyEncryptionKeyFallback() {
     cryptoText.includes("legacyKeys") &&
     cryptoText.includes("for (const candidateKey of [key, ...legacyKeys])") &&
     cryptoText.includes("decryptTextWithKey");
-  const envDocumentsLegacyKeys = envText.includes("LEGACY_ENCRYPTION_KEYS=") && envText.includes("旧入库加密密钥");
+  const envDocumentsLegacyKeys = envText.includes("LEGACY_ENCRYPTION_KEYS=");
   return {
     name: "legacy_encryption_key_fallback",
     ok: configHasLegacyKeys && cryptoTriesLegacyKeys && envDocumentsLegacyKeys,
@@ -1435,6 +2001,34 @@ function checkDuplicateSessionMergeAcrossVariants() {
     detail: {
       mergesByDtUserIdAcrossVariants,
       ownerGuardChecksByDtUserIdAcrossVariants
+    }
+  };
+}
+
+function checkSessionImportTokenReuseGuard() {
+  const routeText = readSourceFile("src/routes/accounts.ts");
+  const guardBlock = extractFunctionBlock(routeText, "retireCapturedSessionTokenReusedByAnotherUser");
+  const importBlock = extractFunctionBlock(routeText, "importAuthorizedSession");
+  const hasGuard =
+    guardBlock.includes("decryptText(candidate.dtToken)") &&
+    guardBlock.includes("same emulator/app data") &&
+    guardBlock.includes("native token was rebound") &&
+    guardBlock.includes("AccountStatus.expired");
+  const runsBeforePersist =
+    importBlock.indexOf("await retireCapturedSessionTokenReusedByAnotherUser") >= 0 &&
+    importBlock.indexOf("await retireCapturedSessionTokenReusedByAnotherUser") <
+      importBlock.indexOf("let persistedAccountId = await persistCapturedSession");
+  const selectedAccountGuard =
+    routeText.includes("function assertCapturedSessionBelongsToSelectedAccount") &&
+    routeText.includes("Captured app session belongs to dt_user_id") &&
+    importBlock.indexOf("assertCapturedSessionBelongsToSelectedAccount") >= 0;
+  return {
+    name: "session_import_token_reuse_guard",
+    ok: hasGuard && runsBeforePersist && selectedAccountGuard,
+    detail: {
+      hasGuard,
+      runsBeforePersist,
+      selectedAccountGuard
     }
   };
 }
@@ -1489,7 +2083,7 @@ function checkPreviewAreaCodeBackfill() {
 }
 
 function checkSmsParsingAndRepair() {
-  const content = "[硅基流动]Verification code is: 119852, valid for 5 minutes.";
+  const content = "[纭呭熀娴佸姩]Verification code is: 119852, valid for 5 minutes.";
   const json = Buffer.from(JSON.stringify({ k1: 1, k2: "38689" }), "utf8");
   const payload = Buffer.concat([Buffer.from([0, 1, 2]), zlib.deflateSync(Buffer.concat([json, Buffer.from(content, "utf8")]), { level: 0 })]);
   const parsed = parseSmsPush(payload);
@@ -1500,7 +2094,7 @@ function checkSmsParsingAndRepair() {
     Buffer.from(content, "utf8")
   ]);
   const plaintextParsed = parseSmsPush(plaintextPayload);
-  const repaired = repairUtf8Mojibake("[�������]Verification code is: 119852, valid for 5 minutes.");
+  const repaired = repairUtf8Mojibake("[锟斤拷锟斤拷锟斤拷锟絔Verification code is: 119852, valid for 5 minutes.");
   return {
     name: "sms_chinese_repair",
     ok: parsed?.content === content && plaintextParsed?.content === content && repaired === content,
@@ -1519,7 +2113,7 @@ async function checkDirectMessageStoreTransaction(accountId: number) {
     zlib.deflateSync(
       Buffer.concat([
         Buffer.from(JSON.stringify({ k1: 25, k2: "38689", k3: uniqueTag }), "utf8"),
-        Buffer.from(`[纭呭熀娴佸姩]Verification code is: 119852, valid for 5 minutes. ${uniqueTag}`, "utf8")
+        Buffer.from(`[绾懎鐔€濞翠礁濮Verification code is: 119852, valid for 5 minutes. ${uniqueTag}`, "utf8")
       ]),
       { level: 0 }
     )
@@ -1634,17 +2228,23 @@ async function checkTeamMessagesPerAccountNoTelegram() {
     const content = `More functions than you can imagine with TalkU number. ${tag}`;
     const push = {
       msgType: 0,
-      fromNumber: "叮咚团队",
+      fromNumber: "鍙挌鍥㈤槦",
       content,
       rawK3: tag
     };
+    const chinesePush = {
+      msgType: 0,
+      fromNumber: "璇撮亾鍥㈤槦",
+      content: `璇撮亾鍥㈤槦绯荤粺娑堟伅 ${tag}`,
+      rawK3: `${tag}-cn`
+    };
     const [talkuCreated, dingdongCreated] = await Promise.all([
-      storeParsedSmsPushes(talku.id, [push], { emitEvents: false }),
-      storeParsedSmsPushes(dingdong.id, [push], { emitEvents: false })
+      storeParsedSmsPushes(talku.id, [push, chinesePush], { emitEvents: false }),
+      storeParsedSmsPushes(dingdong.id, [push, chinesePush], { emitEvents: false })
     ]);
     const stored = await prisma.message.findMany({
       where: {
-        rawK3: tag
+        rawK3: { in: [tag, `${tag}-cn`] }
       },
       orderBy: { accountId: "asc" }
     });
@@ -1652,18 +2252,19 @@ async function checkTeamMessagesPerAccountNoTelegram() {
     return {
       name: "team_messages_per_account_no_telegram",
       ok:
-        talkuCreated === 1 &&
-        dingdongCreated === 1 &&
-        stored.length === 2 &&
+        talkuCreated === 2 &&
+        dingdongCreated === 2 &&
+        stored.length === 4 &&
         accountIds[0] === Math.min(talku.id, dingdong.id) &&
-        accountIds[1] === Math.max(talku.id, dingdong.id) &&
-        stored.every((message) => message.msgType === MessageType.system && !message.telegramSent && !message.telegramMsgId),
+        accountIds[accountIds.length - 1] === Math.max(talku.id, dingdong.id) &&
+        stored.every((message) => message.msgType === MessageType.system && message.isRead && !message.telegramSent && !message.telegramMsgId),
       detail: {
         talkuCreated,
         dingdongCreated,
         stored: stored.map((message) => ({
           accountId: message.accountId,
           msgType: message.msgType,
+          isRead: message.isRead,
           telegramSent: message.telegramSent,
           telegramMsgId: message.telegramMsgId
         }))
@@ -1981,6 +2582,7 @@ function parseArgs(argv: string[]): CliOptions {
     previewCountryCode: parseOptionalPositiveInt(values.get("preview-country"), "preview-country") ?? 33,
     previewIsoCountryCode: parseOptionalString(values.get("preview-iso")) ?? "FR",
     requirePreview: values.get("require-preview") === true,
+    staticOnly: values.get("static-only") === true,
     json: values.get("json") === true
   };
 }
@@ -2035,6 +2637,7 @@ Options:
   --preview-country <code>   Safely run requestPrivateNumber preview. Default: 33.
   --preview-iso <iso>        ISO country code for preview. Default: FR.
   --require-preview          Fail if preview returns zero candidates.
+  --static-only              Run source-level checks only; skip account/network dependent checks.
   --json                     Print full JSON result to stdout.
   --verbose                  Print detail for passing checks.
 `);

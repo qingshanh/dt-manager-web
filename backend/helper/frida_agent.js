@@ -7,6 +7,11 @@ let latestPrivateNumberEvent = null;
 let edgeRequestCallbackClass = null;
 let edgeRequestSequence = 0;
 let edgeRequestPending = {};
+let nativeRestCapture = [];
+let nativeFrameCapture = [];
+let nativeEncoderCapture = [];
+let captureNativeFramesUntil = 0;
+let registerEmailEncoderHooksInstalled = false;
 
 function sendLog(level, message, data) {
   send({
@@ -42,6 +47,13 @@ function publishBridgeEvent(name, data) {
     name: name,
     data: data === undefined ? null : data
   });
+}
+
+function pushBounded(list, item, maxItems) {
+  list.push(item);
+  while (list.length > maxItems) {
+    list.shift();
+  }
 }
 
 function cleanString(value) {
@@ -82,6 +94,14 @@ function toBoolean(value) {
     }
   }
   return null;
+}
+
+function normalizeMemberPoint(value) {
+  const num = toNumber(value);
+  if (num === null || num < 0 || num > 10000) {
+    return null;
+  }
+  return num;
 }
 
 function readField(obj, fieldName) {
@@ -156,6 +176,309 @@ function serializeJavaForTransport(value) {
   }
 
   return serializeJavaValue(value, 0);
+}
+
+function captureNativeRestCall(type, obj) {
+  const payload = {
+    at: new Date().toISOString(),
+    type: toNumber(type),
+    className: null,
+    text: null,
+    json: null
+  };
+  try {
+    payload.className = cleanString(obj && obj.getClass && obj.getClass().getName());
+  } catch (_error) {
+    payload.className = null;
+  }
+  try {
+    payload.text = cleanString(obj && obj.toString && obj.toString());
+  } catch (_error) {
+    payload.text = null;
+  }
+  try {
+    payload.json = serializeJavaForTransport(obj);
+  } catch (error) {
+    payload.json = { error: String(error) };
+  }
+  pushBounded(nativeRestCapture, payload, 80);
+  publishBridgeEvent("native_rest_call", payload);
+  if (payload.type === 773 || payload.type === 774 || payload.type === 258 || payload.type === 257) {
+    if (payload.type === 773) {
+      installRegisterEmailEncoderHooks();
+    }
+    captureNativeFramesUntil = Date.now() + 8_000;
+  }
+}
+
+function captureNativeFrame(source, dataPtr, length) {
+  const size = Number(length);
+  if (!Number.isFinite(size) || size < 6 || size > 65536 || dataPtr.isNull()) {
+    return;
+  }
+  try {
+    const bytes = new Uint8Array(dataPtr.readByteArray(size));
+    let offset = -1;
+    for (let index = 0; index < bytes.length - 1; index += 1) {
+      if (bytes[index] === 0x01 && bytes[index + 1] === 0x07) {
+        offset = index;
+        break;
+      }
+    }
+    if (offset < 0 && Date.now() > captureNativeFramesUntil) {
+      return;
+    }
+    if (offset < 0 && size <= 16) {
+      return;
+    }
+    const hex = Array.prototype.map.call(bytes, (value) => (`0${value.toString(16)}`).slice(-2)).join("");
+    const payload = {
+      at: new Date().toISOString(),
+      source: source,
+      length: size,
+      frameOffset: offset,
+      hex: hex
+    };
+    pushBounded(nativeFrameCapture, payload, 40);
+    publishBridgeEvent("native_frame_write", {
+      at: payload.at,
+      source: payload.source,
+      length: payload.length,
+      frameOffset: payload.frameOffset,
+      hexPreview: hex.slice(0, 512),
+      hexChunks: hex.length <= 16384 ? hex.match(/.{1,16}/g) : null
+    });
+  } catch (_error) {
+    // Ignore non-readable buffers; these hooks are diagnostic only.
+  }
+}
+
+function captureNativeIovFrames(source, iovPtr, iovcnt) {
+  const count = Number(iovcnt);
+  if (!Number.isFinite(count) || count <= 0 || count > 64 || iovPtr.isNull()) {
+    return;
+  }
+  const pointerSize = Process.pointerSize || 8;
+  const iovSize = pointerSize * 2;
+  for (let index = 0; index < count; index += 1) {
+    try {
+      const base = iovPtr.add(index * iovSize).readPointer();
+      const length = pointerSize === 8 ? iovPtr.add(index * iovSize + pointerSize).readU64() : iovPtr.add(index * iovSize + pointerSize).readU32();
+      captureNativeFrame(`${source}[${index}]`, base, Number(String(length)));
+    } catch (_error) {
+      // Ignore unreadable iovec entries.
+    }
+  }
+}
+
+function captureNativeMsgFrames(source, msgPtr) {
+  if (!msgPtr || msgPtr.isNull()) {
+    return;
+  }
+  try {
+    const pointerSize = Process.pointerSize || 8;
+    let iovPtr;
+    let iovLen;
+    if (pointerSize === 8) {
+      iovPtr = msgPtr.add(16).readPointer();
+      iovLen = Number(String(msgPtr.add(24).readU64()));
+    } else {
+      iovPtr = msgPtr.add(8).readPointer();
+      iovLen = msgPtr.add(12).readU32();
+    }
+    captureNativeIovFrames(source, iovPtr, iovLen);
+  } catch (_error) {
+    // Ignore unreadable msghdr values.
+  }
+}
+
+function readLibcxxString(valuePtr) {
+  if (!valuePtr || valuePtr.isNull()) {
+    return null;
+  }
+  try {
+    const pointerSize = Process.pointerSize || 8;
+    const first = valuePtr.readU8();
+    if ((first & 1) === 0) {
+      const length = first >> 1;
+      return valuePtr.add(1).readUtf8String(length);
+    }
+    const length = pointerSize === 8 ? Number(String(valuePtr.add(8).readU64())) : valuePtr.add(4).readU32();
+    const dataPtr = valuePtr.add(pointerSize === 8 ? 16 : 8).readPointer();
+    if (!Number.isFinite(length) || length < 0 || length > 65536 || dataPtr.isNull()) {
+      return null;
+    }
+    return dataPtr.readUtf8String(length);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function captureNativeEncoderCall(name, data) {
+  const payload = {
+    at: new Date().toISOString(),
+    name: name,
+    ...data
+  };
+  pushBounded(nativeEncoderCapture, payload, 40);
+  publishBridgeEvent("native_encoder_call", payload);
+}
+
+function installRegisterEmailEncoderHooks() {
+  if (registerEmailEncoderHooksInstalled) {
+    return;
+  }
+  try {
+    const mod = Process.enumerateModules().find((candidate) => candidate.name.indexOf("libtzim") >= 0);
+    if (!mod) {
+      sendLog("debug", "Register email native encoder module not loaded yet");
+      return;
+    }
+    const symbols = mod.enumerateSymbols().filter((symbol) => {
+      return symbol.name.indexOf("EncodeWebRegisterEmailParams") >= 0 || symbol.name.indexOf("RegisterEmail_Proxycall") >= 0;
+    });
+    if (symbols.length === 0) {
+      sendLog("debug", "Register email native encoder symbols not found");
+      return;
+    }
+    symbols.forEach((symbol) => {
+      sendLog("debug", "Hooking register email native encoder", { name: symbol.name, address: String(symbol.address) });
+      Interceptor.attach(symbol.address, {
+        onEnter(args) {
+          this.symbolName = symbol.name;
+          if (symbol.name.indexOf("EncodeWebRegisterEmailParams") >= 0) {
+            this.registerEmailOut = args[3];
+            this.registerEmailDevice = args[2];
+            captureNativeEncoderCall(symbol.name, {
+              phase: "enter",
+              device: readLibcxxString(args[2])
+            });
+          }
+        },
+        onLeave() {
+          if (this.symbolName && this.symbolName.indexOf("EncodeWebRegisterEmailParams") >= 0) {
+            captureNativeEncoderCall(this.symbolName, {
+              phase: "leave",
+              device: readLibcxxString(this.registerEmailDevice),
+              encoded: readLibcxxString(this.registerEmailOut)
+            });
+          }
+        }
+      });
+    });
+    registerEmailEncoderHooksInstalled = true;
+  } catch (error) {
+    sendLog("warn", "Failed to hook register email native encoder", { message: String(error) });
+  }
+}
+
+function installNativeFrameHooks() {
+  function findExportAddress(name) {
+    if (typeof Module.findExportByName === "function") {
+      const address = Module.findExportByName(null, name);
+      if (address) {
+        return address;
+      }
+    }
+    if (typeof Module.findGlobalExportByName === "function") {
+      const address = Module.findGlobalExportByName(name);
+      if (address) {
+        return address;
+      }
+    }
+    if (typeof Module.getGlobalExportByName === "function") {
+      try {
+        const address = Module.getGlobalExportByName(name);
+        if (address) {
+          return address;
+        }
+      } catch (_lookupError) {
+        // Continue with module enumeration.
+      }
+    }
+    try {
+      const modules = Process.enumerateModules();
+      for (let moduleIndex = 0; moduleIndex < modules.length; moduleIndex += 1) {
+        const mod = modules[moduleIndex];
+        let exports = [];
+        try {
+          exports = mod.enumerateExports();
+        } catch (_exportError) {
+          continue;
+        }
+        for (let exportIndex = 0; exportIndex < exports.length; exportIndex += 1) {
+          const item = exports[exportIndex];
+          if (item && item.name === name) {
+            return item.address;
+          }
+        }
+      }
+    } catch (_error) {
+      return null;
+    }
+    return null;
+  }
+
+  [
+    { name: "send", bufferArg: 1, lengthArg: 2 },
+    { name: "sendto", bufferArg: 1, lengthArg: 2 },
+    { name: "write", bufferArg: 1, lengthArg: 2 },
+    { name: "BIO_write", bufferArg: 1, lengthArg: 2 },
+    { name: "SSL_write", bufferArg: 1, lengthArg: 2 },
+    { name: "SSL_write_ex", bufferArg: 1, lengthArg: 2 },
+    { name: "compress", bufferArg: 2, lengthArg: 3 },
+    { name: "compress2", bufferArg: 2, lengthArg: 3 }
+  ].forEach((entry) => {
+    try {
+      const address = findExportAddress(entry.name);
+      if (!address) {
+        sendLog("debug", `Native export not found: ${entry.name}`);
+        return;
+      }
+      sendLog("debug", `Hooking native export ${entry.name}`, { address: String(address) });
+      Interceptor.attach(address, {
+        onEnter(args) {
+          captureNativeFrame(entry.name, args[entry.bufferArg], args[entry.lengthArg].toInt32());
+        }
+      });
+    } catch (error) {
+      sendLog("warn", `Failed to hook ${entry.name}`, { message: String(error) });
+    }
+  });
+
+  try {
+    const writev = findExportAddress("writev");
+    if (writev) {
+      sendLog("debug", "Hooking native export writev", { address: String(writev) });
+      Interceptor.attach(writev, {
+        onEnter(args) {
+          captureNativeIovFrames("writev", args[1], args[2].toInt32());
+        }
+      });
+    } else {
+      sendLog("debug", "Native export not found: writev");
+    }
+  } catch (error) {
+    sendLog("warn", "Failed to hook writev", { message: String(error) });
+  }
+
+  try {
+    const sendmsg = findExportAddress("sendmsg");
+    if (sendmsg) {
+      sendLog("debug", "Hooking native export sendmsg", { address: String(sendmsg) });
+      Interceptor.attach(sendmsg, {
+        onEnter(args) {
+          captureNativeMsgFrames("sendmsg", args[1]);
+        }
+      });
+    } else {
+      sendLog("debug", "Native export not found: sendmsg");
+    }
+  } catch (error) {
+    sendLog("warn", "Failed to hook sendmsg", { message: String(error) });
+  }
+
+  installRegisterEmailEncoderHooks();
 }
 
 function buildEdgeRequestCallbackClass() {
@@ -541,8 +864,8 @@ function waitForEvent(name, timeoutMs, predicate) {
 function emitEvent(name, payload) {
   if (name === "request_private_number") {
     latestPrivateNumberEvent = payload;
-    publishBridgeEvent(name, payload);
   }
+  publishBridgeEvent(name, payload);
   const next = [];
   for (let index = 0; index < waiters.length; index += 1) {
     const waiter = waiters[index];
@@ -678,6 +1001,37 @@ function writeField(obj, fieldName, value) {
     return;
   }
   obj[fieldName] = value;
+}
+
+function writeDeclaredField(obj, fieldName, value) {
+  if (!obj) {
+    return false;
+  }
+  try {
+    const field = obj[fieldName];
+    if (field && typeof field === "object" && "value" in field) {
+      field.value = value;
+      return true;
+    }
+  } catch (_error) {
+    // Fall back to Java reflection below.
+  }
+  try {
+    let clazz = obj.getClass();
+    while (clazz) {
+      try {
+        const declaredField = clazz.getDeclaredField(fieldName);
+        declaredField.setAccessible(true);
+        declaredField.set(obj, value);
+        return true;
+      } catch (_fieldError) {
+        clazz = clazz.getSuperclass();
+      }
+    }
+  } catch (_error) {
+    return false;
+  }
+  return false;
 }
 
 function collectRecords(value, depth, bucket, visited) {
@@ -932,12 +1286,17 @@ async function waitForOwnedPhoneItem(phoneNumber, timeoutMs) {
 }
 
 function extractRestResponse(resp) {
+  const errCode = toNumber(tryCall(() => resp.getErrCode(), null)) ?? toNumber(readField(resp, "errCode"));
+  const reason = cleanString(tryCall(() => resp.getReason(), null)) ?? cleanString(readField(resp, "reason"));
+  const resultCode = toNumber(tryCall(() => resp.getResult(), null)) ?? toNumber(readField(resp, "result"));
+  const commandCookie = toNumber(tryCall(() => resp.getCommandCookie(), null)) ?? toNumber(readField(resp, "commandCookie"));
+  const commandTag = toNumber(tryCall(() => resp.getCommandTag(), null)) ?? toNumber(readField(resp, "commandTag"));
   const result = {
-    errCode: toNumber(tryCall(() => resp.getErrCode(), null)),
-    reason: cleanString(tryCall(() => resp.getReason(), null)),
-    result: toNumber(tryCall(() => resp.getResult(), null)),
-    commandCookie: toNumber(tryCall(() => resp.getCommandCookie(), null)),
-    commandTag: toNumber(tryCall(() => resp.getCommandTag(), null)),
+    errCode,
+    reason,
+    result: resultCode,
+    commandCookie,
+    commandTag,
     toString: cleanString(tryCall(() => resp.toString(), null))
   };
   const returnedAccessCode = toNumber(readField(resp, "returnedAccessCode"));
@@ -1185,18 +1544,9 @@ function buildSnapshotPayload(extraPayload) {
       pointGradeLevel ||
       pointGrade,
     validPoint:
-      toNumber(pointUserInfoData && pointUserInfoData.validPoint) ||
-      toNumber(pointGradeInfoData && pointGradeInfoData.validPoint) ||
-      pickNumberFromRecords(snapshotRecords, [
-        "validPoint",
-        "valid_point",
-        "usablePoint",
-        "usable_point",
-        "availablePoint",
-        "available_point",
-        "tokenNumber",
-        "token_number"
-      ]) || toNumber(tryCall(() => (pointManager ? pointManager.getValidPoint() : null), null)),
+      normalizeMemberPoint(pointUserInfoData && pointUserInfoData.validPoint) ??
+      normalizeMemberPoint(pointGradeInfoData && pointGradeInfoData.validPoint) ??
+      normalizeMemberPoint(tryCall(() => (pointManager ? pointManager.getValidPoint() : null), null)),
     progressPoint:
       toNumber(pointUserInfoData && pointUserInfoData.historyPoint) ||
       pickNumberFromRecords(snapshotRecords, [
@@ -1467,6 +1817,168 @@ function prepareActivationContext() {
   return manager;
 }
 
+function getActivationDebugState() {
+  const ActivationManager = Java.use("me.dingtone.app.im.manager.ActivationManager");
+  const DtAppInfo = Java.use("me.dingtone.app.im.manager.DtAppInfo");
+  const manager = ActivationManager.getInstance();
+  const appInfo = DtAppInfo.getInstance();
+  return {
+    registerEmail: cleanString(tryCall(() => manager.getRegisterEmail(), null)),
+    activationType: cleanString(tryCall(() => manager.getActivationType().toString(), null)),
+    isActivated: toBoolean(tryCall(() => appInfo.isActivated(), null)),
+    activatedEmail: cleanString(tryCall(() => appInfo.getActivatedEmail(), null)),
+    dtUserId: cleanString(tryCall(() => appInfo.getUserID(), null))
+  };
+}
+
+function getTpClientForJniInstance() {
+  const TpClientForJNI = Java.use("me.tzim.app.im.tp.TpClientForJNI");
+  return tryCall(() => TpClientForJNI.INSTANCE.value, null) || tryCall(() => TpClientForJNI.INSTANCE, null);
+}
+
+function stopActivationEmailPolling(manager) {
+  const stopped = {
+    stopQueryingEmailValidteTimer: false,
+    stopRestCallTimer: false
+  };
+  stopped.stopQueryingEmailValidteTimer = !!tryCall(() => {
+    manager.stopQueryingEmailValidteTimer();
+    return true;
+  }, false);
+  stopped.stopRestCallTimer = !!tryCall(() => {
+    manager.stopRestCallTimer();
+    return true;
+  }, false);
+  return stopped;
+}
+
+function patchActivationCmdRuntimeFields(activationCmd) {
+  const BuildVersion = Java.use("android.os.Build$VERSION");
+  const JString = Java.use("java.lang.String");
+  const osVersion = cleanString(tryCall(() => BuildVersion.RELEASE.value, null)) || cleanString(tryCall(() => BuildVersion.RELEASE, null));
+  const clientInfoText = cleanString(readField(activationCmd, "clientInfo"));
+  const patched = {
+    clientInfoDeviceOSVer: false
+  };
+  if (osVersion) {
+    const clientInfo = tryCall(() => JSON.parse(clientInfoText || "{}"), {});
+    if (clientInfo && typeof clientInfo === "object") {
+      clientInfo.deviceOSVer = clientInfo.deviceOSVer || osVersion;
+      clientInfo.deviceOSVersion = clientInfo.deviceOSVersion || osVersion;
+      clientInfo.osVersion = clientInfo.osVersion || osVersion;
+      patched.clientInfoDeviceOSVer = writeDeclaredField(activationCmd, "clientInfo", JString.$new(JSON.stringify(clientInfo)));
+    }
+  }
+  return {
+    osVersion: osVersion,
+    hadClientInfo: !!clientInfoText,
+    patched: patched
+  };
+}
+
+function patchRegisterEmailCmdRuntimeFields(registerEmailCmd) {
+  const Build = Java.use("android.os.Build");
+  const BuildVersion = Java.use("android.os.Build$VERSION");
+  const JString = Java.use("java.lang.String");
+  const osVersion = cleanString(tryCall(() => BuildVersion.RELEASE.value, null)) || cleanString(tryCall(() => BuildVersion.RELEASE, null));
+  const deviceModel = cleanString(tryCall(() => Build.MODEL.value, null)) || cleanString(tryCall(() => Build.MODEL, null));
+  const deviceName = cleanString(tryCall(() => Build.MANUFACTURER.value, null)) || cleanString(tryCall(() => Build.MANUFACTURER, null));
+  const clientInfoText = cleanString(readField(registerEmailCmd, "clientInfo"));
+  const patched = {
+    deviceOSVer: false,
+    deviceModel: false,
+    deviceName: false,
+    clientInfoDeviceOSVer: false
+  };
+
+  if (osVersion) {
+    patched.deviceOSVer = writeDeclaredField(registerEmailCmd, "deviceOSVer", JString.$new(osVersion));
+  }
+  if (deviceModel) {
+    patched.deviceModel = writeDeclaredField(registerEmailCmd, "deviceModel", JString.$new(deviceModel));
+  }
+  if (deviceName) {
+    patched.deviceName = writeDeclaredField(registerEmailCmd, "deviceName", JString.$new(deviceName));
+  }
+  if (clientInfoText && osVersion) {
+    const clientInfo = tryCall(() => JSON.parse(clientInfoText), {});
+    if (clientInfo && typeof clientInfo === "object") {
+      clientInfo.deviceOSVer = clientInfo.deviceOSVer || osVersion;
+      clientInfo.deviceOSVersion = clientInfo.deviceOSVersion || osVersion;
+      clientInfo.osVersion = clientInfo.osVersion || osVersion;
+      patched.clientInfoDeviceOSVer = writeDeclaredField(registerEmailCmd, "clientInfo", JString.$new(JSON.stringify(clientInfo)));
+    }
+  }
+
+  return {
+    osVersion: osVersion,
+    deviceModel: deviceModel,
+    deviceName: deviceName,
+    hadClientInfo: !!clientInfoText,
+    patched: patched
+  };
+}
+
+function registerEmailViaNativeRest(registerEmailCmd) {
+  const TpClientForJNI = Java.use("me.tzim.app.im.tp.TpClientForJNI");
+  const jni = getTpClientForJniInstance();
+  if (!jni) {
+    return {
+      ok: false,
+      message: "TpClientForJNI.INSTANCE is unavailable"
+    };
+  }
+
+  const ptr = tryCall(() => jni.getmPtr(), null);
+  const ptrText = ptr === null || ptr === undefined ? null : String(ptr);
+  if (ptr === null || ptr === undefined || ptrText === "0") {
+    return {
+      ok: false,
+      ptr: ptrText,
+      message: "TpClientForJNI pointer is empty"
+    };
+  }
+
+  const nativeRestCall = TpClientForJNI.nativeRestCall.overload("long", "int", "java.lang.Object");
+  captureNativeRestCall(773, registerEmailCmd);
+  nativeRestCall.call(jni, ptr, 773, registerEmailCmd);
+  return {
+    ok: true,
+    ptr: ptrText,
+    type: 773
+  };
+}
+
+function activateEmailViaNativeRest(activationCmd) {
+  const TpClientForJNI = Java.use("me.tzim.app.im.tp.TpClientForJNI");
+  const jni = getTpClientForJniInstance();
+  if (!jni) {
+    return {
+      ok: false,
+      message: "TpClientForJNI.INSTANCE is unavailable"
+    };
+  }
+
+  const ptr = tryCall(() => jni.getmPtr(), null);
+  const ptrText = ptr === null || ptr === undefined ? null : String(ptr);
+  if (ptr === null || ptr === undefined || ptrText === "0") {
+    return {
+      ok: false,
+      ptr: ptrText,
+      message: "TpClientForJNI pointer is empty"
+    };
+  }
+
+  const nativeRestCall = TpClientForJNI.nativeRestCall.overload("long", "int", "java.lang.Object");
+  captureNativeRestCall(774, activationCmd);
+  nativeRestCall.call(jni, ptr, 774, activationCmd);
+  return {
+    ok: true,
+    ptr: ptrText,
+    type: 774
+  };
+}
+
 async function performNativeLogin(meta, timeoutMs) {
   const loginResponsePromise = waitForEvent("login_response", timeoutMs, () => true);
   const loginSuccessPromise = waitForEvent("login_success", timeoutMs, () => true);
@@ -1521,7 +2033,25 @@ async function handleSendVerificationCode(request) {
   const timeoutMs = Math.max(10_000, toNumber(request.meta && request.meta.timeoutMs) || 60_000);
   const responsePromise = waitForEvent("register_email", timeoutMs, () => true);
   await runOnMainThread(() => {
-    prepareActivationContext().registerEmail(email, true);
+    const manager = prepareActivationContext();
+    manager.registerEmail(email, true);
+    const registerEmailCmd = readField(manager, "mRegisterEmailCmd");
+    if (registerEmailCmd) {
+      const TpClient = Java.use("me.dingtone.app.im.tp.TpClient");
+      const cmdPatch = patchRegisterEmailCmdRuntimeFields(registerEmailCmd);
+      sendLog("info", "direct TpClient.registerEmail fallback", {
+        cmdPatch: cmdPatch,
+        cmd: serializeJavaForTransport(registerEmailCmd)
+      });
+      const registerEmail = TpClient.registerEmail.overload("me.dingtone.app.im.datatype.DTRegisterEmailCmd");
+      registerEmail.call(TpClient.getInstance(), registerEmailCmd);
+      const nativeResult = registerEmailViaNativeRest(registerEmailCmd);
+      sendLog(nativeResult.ok ? "info" : "warn", "direct native registerEmail fallback", nativeResult);
+    } else {
+      sendLog("warn", "registerEmail did not create mRegisterEmailCmd", {
+        state: getActivationDebugState()
+      });
+    }
   });
   const response = await responsePromise;
   if (response.errCode !== 0) {
@@ -1564,8 +2094,36 @@ async function handleLogin(request) {
       };
     }
     const responsePromise = waitForEvent("activate_email", timeoutMs, () => true);
+    const beforeState = await runInJava(() => getActivationDebugState()).catch((error) => ({ error: error.message || String(error) }));
+    sendLog("info", "activateEmail starting", {
+      email: email,
+      codeLength: String(code).length,
+      state: beforeState
+    });
     await runOnMainThread(() => {
-      prepareActivationContext().activateEmail(email, code);
+      const manager = prepareActivationContext();
+      const stoppedTimers = stopActivationEmailPolling(manager);
+      manager.activateEmail(email, code);
+      sendLog("info", "activateEmail invoked", {
+        state: getActivationDebugState(),
+        stoppedTimers: stoppedTimers
+      });
+      const activationCmd = readField(manager, "mActivationCmd");
+      if (activationCmd) {
+        const TpClient = Java.use("me.dingtone.app.im.tp.TpClient");
+        const cmdPatch = patchActivationCmdRuntimeFields(activationCmd);
+        sendLog("info", "direct TpClient.activateEmail fallback", {
+          cmdPatch: cmdPatch,
+          cmd: serializeJavaForTransport(activationCmd)
+        });
+        TpClient.getInstance().activateEmail(activationCmd);
+        const nativeResult = activateEmailViaNativeRest(activationCmd);
+        sendLog(nativeResult.ok ? "info" : "warn", "direct native activateEmail fallback", nativeResult);
+      } else {
+        sendLog("warn", "activateEmail did not create mActivationCmd", {
+          state: getActivationDebugState()
+        });
+      }
     });
     const activation = await responsePromise;
     if (activation.errCode !== 0) {
@@ -1605,6 +2163,59 @@ async function handleLogin(request) {
   }
 
   return performNativeLogin(request.meta || {}, timeoutMs);
+}
+
+async function handleVerifyAccessCode(request) {
+  const input = (request.payload && (request.payload.input || request.payload.payload)) || {};
+  const kind = cleanString(input.kind || input.type || "email");
+  const target = cleanString(input.target || input.email || input.phone);
+  const code = parseInt(cleanString(input.accessCode || input.access_code || input.code), 10);
+  const countryCode = toNumber(input.countryCode || input.country_code) || 1;
+  const timeoutMs = Math.max(10_000, toNumber(request.meta && request.meta.timeoutMs) || 60_000);
+  if (!target || !Number.isFinite(code)) {
+    throw {
+      message: "target and numeric accessCode are required for verify_access_code",
+      statusCode: 400,
+      code: 400
+    };
+  }
+
+  const responsePromise = waitForEvent("verify_access_code", timeoutMs, () => true);
+  await runOnMainThread(() => {
+    const TpClient = Java.use("me.dingtone.app.im.tp.TpClient");
+    const DTVerifyAccessCodeCmd = Java.use("me.dingtone.app.im.datatype.DTVerifyAccessCodeCmd");
+    const cmd = DTVerifyAccessCodeCmd.$new();
+    const normalizedKind = kind === "phone" || kind === "phoneNumber" ? "phoneNumber" : "email";
+    cmd.type.value = normalizedKind === "email" ? 1 : 2;
+    cmd.accessCode.value = code;
+    cmd.json.value = DTVerifyAccessCodeCmd.toJsonRep(normalizedKind, normalizedKind === "email" ? target : stripPhonePrefixForAgent(target), countryCode);
+    try {
+      const dtUserId = cleanString(input.dtUserId || input.dt_user_id || input.userId || input.user_id);
+      if (dtUserId) {
+        cmd.userId.value = parseInt(dtUserId, 10);
+      }
+    } catch (_error) {
+      // userId is optional for recover-password verification.
+    }
+    TpClient.getInstance().verifyAccessCode(cmd);
+  });
+
+  const response = await responsePromise;
+  if (response.errCode !== 0) {
+    throw {
+      message: response.reason || `verifyAccessCode failed with errCode=${response.errCode}`,
+      statusCode: 400,
+      code: response.errCode || 400
+    };
+  }
+  return {
+    password: response.password || response.Password || null,
+    response
+  };
+}
+
+function stripPhonePrefixForAgent(value) {
+  return cleanString(value).replace(/^\+/, "").replace(/[^\d]/g, "");
 }
 
 async function handleRefreshSnapshot(request) {
@@ -1725,12 +2336,25 @@ async function handleDescribeClassMethods(request) {
   return runInJava(() => {
     const Target = Java.use(className);
     const methods = Target.class.getDeclaredMethods();
+    const fields = Target.class.getDeclaredFields();
+    const hierarchy = [];
+    let clazz = Target.class;
+    while (clazz) {
+      hierarchy.push(String(clazz.getName()));
+      clazz = clazz.getSuperclass();
+    }
     const result = [];
     for (let index = 0; index < methods.length; index += 1) {
       result.push(String(methods[index].toString()));
     }
+    const fieldResult = [];
+    for (let index = 0; index < fields.length; index += 1) {
+      fieldResult.push(String(fields[index].toString()));
+    }
     return {
       className,
+      hierarchy,
+      fields: fieldResult.sort(),
       methods: result.sort()
     };
   });
@@ -2284,6 +2908,22 @@ async function handleCancelPhoneNumber(request) {
   return { phoneNumber: phoneNumber, status: "cancelled" };
 }
 
+async function handleGetNativeRestCapture() {
+  return {
+    nativeRestCalls: nativeRestCapture.slice(),
+    nativeFrames: nativeFrameCapture.slice(),
+    nativeEncoderCalls: nativeEncoderCapture.slice()
+  };
+}
+
+async function handleClearNativeRestCapture() {
+  nativeRestCapture = [];
+  nativeFrameCapture = [];
+  nativeEncoderCapture = [];
+  registerEmailEncoderHooksInstalled = false;
+  return { cleared: true };
+}
+
 async function dispatch(request) {
   if (!hooksInstalled) {
     installHooks();
@@ -2291,6 +2931,8 @@ async function dispatch(request) {
   switch (request.action) {
     case "send_verification_code":
       return handleSendVerificationCode(request);
+    case "verify_access_code":
+      return handleVerifyAccessCode(request);
     case "login":
       return handleLogin(request);
     case "export_session":
@@ -2325,6 +2967,10 @@ async function dispatch(request) {
       return handlePausePhoneNumber(request);
     case "resume_phone_number":
       return handleResumePhoneNumber(request);
+    case "get_native_rest_capture":
+      return handleGetNativeRestCapture();
+    case "clear_native_rest_capture":
+      return handleClearNativeRestCapture();
     default:
       throw {
         message: `Action ${request.action} is not implemented in the bundled helper yet`,
@@ -2343,11 +2989,35 @@ function installHooks() {
     const ActivationManager = Java.use("me.dingtone.app.im.manager.ActivationManager");
     const LoginMgr = Java.use("me.dingtone.app.im.manager.LoginMgr");
     const ServiceMgr = Java.use("me.dingtone.app.im.manager.ServiceMgr");
+    const TpClient = Java.use("me.dingtone.app.im.tp.TpClient");
     const TpEventHandler = Java.use("me.dingtone.app.im.tp.TpEventHandler");
+    const TpClientForJNI = Java.use("me.tzim.app.im.tp.TpClientForJNI");
     const PrivatePhoneNumberManager = Java.use("me.dingtone.app.im.phonenumber.privatephone.PrivatePhoneNumberManager");
+
+    installNativeFrameHooks();
+
+    const nativeRestCall = TpClientForJNI.nativeRestCall.overload("long", "int", "java.lang.Object");
+    nativeRestCall.implementation = function (ptr, type, obj) {
+      captureNativeRestCall(type, obj);
+      return nativeRestCall.call(this, ptr, type, obj);
+    };
 
     ActivationManager.onRegisterEmailResponse.implementation = function (resp) {
       const result = this.onRegisterEmailResponse(resp);
+      emitEvent("register_email", extractRestResponse(resp));
+      return result;
+    };
+
+    const onRegisterEmailResponse = TpEventHandler.onRegisterEmailResponse.overload("me.tzim.app.im.datatype.DTRestCallBase");
+    onRegisterEmailResponse.implementation = function (resp) {
+      const result = onRegisterEmailResponse.call(this, resp);
+      emitEvent("register_email", extractRestResponse(resp));
+      return result;
+    };
+
+    const onTpClientRegisterEmailResponse = TpClient.onRegisterEmailResponse.overload("me.tzim.app.im.datatype.DTRestCallBase");
+    onTpClientRegisterEmailResponse.implementation = function (resp) {
+      const result = onTpClientRegisterEmailResponse.call(this, resp);
       emitEvent("register_email", extractRestResponse(resp));
       return result;
     };
@@ -2361,6 +3031,49 @@ function installHooks() {
     ActivationManager.onActivatePassword.implementation = function (resp) {
       const result = this.onActivatePassword(resp);
       emitEvent("activate_password", extractRestResponse(resp));
+      return result;
+    };
+
+    const activateEmail = TpClient.activateEmail.overload("me.dingtone.app.im.datatype.DTActivationCmd");
+    activateEmail.implementation = function (cmd) {
+      sendLog("info", "TpClient.activateEmail called", {
+        cmd: serializeJavaForTransport(cmd)
+      });
+      return activateEmail.call(this, cmd);
+    };
+
+    const onActivateEmailResponse = TpEventHandler.onActivateEmailResponse.overload("me.tzim.app.im.datatype.DTActivationResponse");
+    onActivateEmailResponse.implementation = function (resp) {
+      const result = onActivateEmailResponse.call(this, resp);
+      emitEvent("activate_email", extractRestResponse(resp));
+      return result;
+    };
+
+    const onTpClientActivateEmailResponse = TpClient.onActivateEmailResponse.overload("me.tzim.app.im.datatype.DTActivationResponse");
+    onTpClientActivateEmailResponse.implementation = function (resp) {
+      const result = onTpClientActivateEmailResponse.call(this, resp);
+      emitEvent("activate_email", extractRestResponse(resp));
+      return result;
+    };
+
+    const onActivateEmailLaterResponse = TpEventHandler.onActivateEmailLaterResponse.overload("me.tzim.app.im.datatype.DTRestCallBase");
+    onActivateEmailLaterResponse.implementation = function (resp) {
+      const result = onActivateEmailLaterResponse.call(this, resp);
+      emitEvent("activate_email_later", extractRestResponse(resp));
+      return result;
+    };
+
+    const onActivateEmailReplaceResponse = TpEventHandler.onActivateEmailReplaceResponse.overload("me.tzim.app.im.datatype.DTRestCallBase");
+    onActivateEmailReplaceResponse.implementation = function (resp) {
+      const result = onActivateEmailReplaceResponse.call(this, resp);
+      emitEvent("activate_email_replace", extractRestResponse(resp));
+      return result;
+    };
+
+    const onVerifyAccessCodeResponse = TpEventHandler.onVerifyAccessCodeResponse.overload("me.dingtone.app.im.datatype.DTVerifyAccessCodeResponse");
+    onVerifyAccessCodeResponse.implementation = function (resp) {
+      const result = onVerifyAccessCodeResponse.call(this, resp);
+      emitEvent("verify_access_code", extractRestResponse(resp));
       return result;
     };
 

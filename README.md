@@ -223,6 +223,24 @@ docker compose up -d
 
 需要区号的国家，例如美国、加拿大，面板会在未填写区号时按内置常用区号随机尝试；也可以手动指定区号提高命中率。
 
+## 积分与会员商城接口
+
+部署后后端会提供两组独立接口，避免把游戏积分入口和会员商城混在一起：
+
+- `GET /api/accounts/:id/point`：刷新并返回 `point` 游戏/积分入口相关数据。
+- `GET /api/accounts/:id/pointstore`：刷新并返回 `pointstore` 会员商城商品、有效积分和兑换邮箱。
+- `POST /api/accounts/:id/pointstore/order`：兑换会员商城商品，请求体需要 `product_id` 和 `confirm=true`，兑换地址自动使用当前账户邮箱。
+
+旧的 `/api/accounts/:id/point-store...` 仅作为兼容别名保留，新部署和前端默认使用 `pointstore`。
+
+## Direct 邮箱验证码登录
+
+`DT_GATEWAY_MODE=direct` 时，邮箱 + 验证码登录由后端直接连接 TalkU/Dingtone 服务端完成，不需要模拟器、Frida 或 helper 常驻。每次创建验证码账号或点击“重新发送验证码”都会生成新的随机 `And.<32hex>.dttalk` 设备号和新的 `TrackCode`，验证码必须和这一次发码保存的设备号配套使用。
+
+如果发码返回 `ip region is restricted`，说明当前服务器出口 IP 被对方限制。可以在 `.env` 或设置页填写 `DT_PROXY_URL=http://user:pass@proxy-host:port`，direct TCP 连接会通过 HTTP CONNECT 代理转发；不需要代理时留空。
+
+验证码登录成功后，后端会保存 `dtUserId`、`token`、`deviceId`，并把复用同一原生会话但绑定到其他 `dt_user_id` 的旧账号标记为失效，避免多账号混用同一个设备会话导致后续账号状态互相污染。
+
 ## Telegram Bot
 
 开启 bot 后可用命令包括：

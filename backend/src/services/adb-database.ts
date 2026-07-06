@@ -6,6 +6,7 @@ import type { DingtonePhoneNumber } from "./dingtone/types.js";
 import type { HelperSmsMessageRecord } from "./message-runtime.js";
 import { ADB_PATH, execAdb, resolveAdbApp, resolveAdbSerial, type AdbAppVariant } from "./adb-app.js";
 
+
 const execFileAsync = promisify(execFile);
 
 export async function dumpSmsMessagesFromAdb(limit: number, variant: AdbAppVariant = "dingtone"): Promise<HelperSmsMessageRecord[]> {
@@ -43,7 +44,7 @@ export async function listPhoneNumbersFromAdb(variant: AdbAppVariant = "dingtone
   const rows = await queryDatabase(sql, variant);
   return rows
     .map((row, index) => {
-      const reservedJson = parseJsonRecord(cleanString(row.reserved10));
+      const reservedJson = parseFirstJsonRecord([cleanString(row.reserved10), cleanString(row.reserved9)]);
       const usePeriod = toNumber(reservedJson.usePeriod);
       return {
         phoneNumber: cleanString(row.phoneNumber) ?? "",
@@ -153,6 +154,23 @@ function parseJsonRecord(value: string | null) {
   }
 }
 
+function parseFirstJsonRecord(values: Array<string | null>) {
+  for (const value of values) {
+    const parsed = parseJsonRecord(value);
+    if (Object.keys(parsed).length > 0) {
+      return parsed;
+    }
+  }
+  return {} as Record<string, unknown>;
+}
+
+function safeJsonStringify(value: unknown) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return JSON.stringify({ serializeError: true });
+  }
+}
 function repairUtf8Mojibake(value: string) {
   if (!value) {
     return value;
@@ -162,7 +180,7 @@ function repairUtf8Mojibake(value: string) {
   }
   try {
     const repaired = Buffer.from(value, "latin1").toString("utf8");
-    if (!repaired || repaired === value || repaired.includes("�")) {
+    if (!repaired || repaired === value || repaired.includes("锟")) {
       return value;
     }
     return repaired;

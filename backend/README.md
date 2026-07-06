@@ -163,6 +163,10 @@ npm run dev
 - `POST /api/auth/login`
 - `GET /api/dashboard/stats`
 - `GET /api/accounts`
+- `GET /api/accounts/:id/point`：刷新并返回 `point` / 游戏积分相关数据，包含积分用户信息、等级信息和游戏积分入口数据。
+- `GET /api/accounts/:id/pointstore`：刷新并返回 `pointstore` 会员商城商品、有效积分和兑换邮箱。
+- `POST /api/accounts/:id/pointstore/order`：兑换会员商城商品，必须传 `confirm=true`，兑换地址使用当前账户邮箱。
+- `GET|POST /api/accounts/:id/point-store...`：旧路径兼容别名，建议新部署统一使用 `pointstore`。
 - `GET /api/events?token=<jwt>`
 - `POST /api/settings/mock-message`
 

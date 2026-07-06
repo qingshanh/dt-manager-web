@@ -1,6 +1,8 @@
 import net from "node:net";
 import tls from "node:tls";
 import zlib from "node:zlib";
+import crypto from "node:crypto";
+import fs from "node:fs";
 import { config } from "../../config.js";
 import { AppError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
@@ -25,12 +27,16 @@ type DirectRuntimeConfig = {
   primaryHost: string;
   backupHost: string;
   port: number;
+  registerEmailPort: number;
   connectTimeoutMs: number;
   ioTimeoutMs: number;
   useTls: boolean;
+  registerEmailUseTls: boolean;
   appVersion: string;
+  dingdongAppVersion: string;
   apkCertificateSign: string;
   listenHostConcurrency: number;
+  proxyUrl: string;
 };
 
 type ParsedFrame = {
@@ -74,7 +80,23 @@ type DirectSessionAccount = {
   token: string;
   deviceId?: string | null;
   email?: string | null;
+  appVariant?: "dingtone" | "dingdong";
 };
+type DirectAccountIdentity = {
+  deviceId?: string | null;
+  appVariant?: "dingtone" | "dingdong";
+};
+type DirectActivationIdentity = string | DirectAccountIdentity;
+type DirectActivationTemplateSettingKey =
+  | "dt_direct_template_check_activated_user"
+  | "dt_direct_template_check_activated_user_talku"
+  | "dt_direct_template_check_activated_user_dingdong"
+  | "dt_direct_template_register_email"
+  | "dt_direct_template_register_email_talku"
+  | "dt_direct_template_register_email_dingdong"
+  | "dt_direct_template_activate_email"
+  | "dt_direct_template_activate_email_talku"
+  | "dt_direct_template_activate_email_dingdong";
 type DirectPhoneTemplateSettingKey =
   | "dt_direct_template_request_phone"
   | "dt_direct_template_purchase_phone"
@@ -83,7 +105,24 @@ type DirectPhoneTemplateSettingKey =
   | "dt_direct_template_pause_phone"
   | "dt_direct_template_resume_phone"
   | "dt_direct_template_phone_setting";
-type DirectTemplateSettingKey = DirectPhoneTemplateSettingKey | "dt_direct_template_offline_messages";
+type DirectTemplateSettingKey =
+  | "dt_direct_template_check_activated_user"
+  | "dt_direct_template_check_activated_user_talku"
+  | "dt_direct_template_check_activated_user_dingdong"
+  | "dt_direct_template_register_email"
+  | "dt_direct_template_register_email_talku"
+  | "dt_direct_template_register_email_dingdong"
+  | "dt_direct_template_activate_email"
+  | "dt_direct_template_activate_email_talku"
+  | "dt_direct_template_activate_email_dingdong"
+  | "dt_direct_template_request_phone"
+  | "dt_direct_template_purchase_phone"
+  | "dt_direct_template_renew_phone"
+  | "dt_direct_template_cancel_phone"
+  | "dt_direct_template_pause_phone"
+  | "dt_direct_template_resume_phone"
+  | "dt_direct_template_phone_setting"
+  | "dt_direct_template_offline_messages";
 
 export type DirectProbeCustomTemplate = {
   name: string;
@@ -135,6 +174,13 @@ export type DirectAccessCodeProbeResult = {
   capability: DirectAccessCodeProbeCapability;
   recoverPassword?: DirectProbeCallResult;
   verifyAccessCode?: DirectProbeCallResult;
+  trace?: DirectProbeFrameTrace[];
+};
+export type DirectActivatedUserProbeResult = {
+  ok: boolean;
+  host: string;
+  target: string;
+  calls: DirectProbeCallResult[];
   trace?: DirectProbeFrameTrace[];
 };
 
@@ -221,8 +267,13 @@ const APP_DIRECT_PUSH_HOSTS = [
 ];
 const TALKU_APP_ID = "me.talkyou.app.im";
 const DINGTONE_APP_ID = "me.dingtone.app.im";
+const DINGTONE_BUSINESS_APP_ID = "me.dingtone.im";
 const TALKU_APK_CERTIFICATE_SIGN = "bf6bf7a31a53d5c06dd1c7d03fd3d917";
 const TALKU_DIRECT_API_CERTIFICATE_SIGN = "458cf4f3e576f61a26187d218e4af9d3";
+const DIRECT_ACTIVATION_CLIENT_VERSION = 1023;
+const DIRECT_ACTIVATE_EMAIL_CLIENT_VERSION = -1610218240;
+const DIRECT_ACTIVATION_EMAIL_CRYPTO_IV = Buffer.from("5875b9f15ed445239539cb455cdcbed7", "hex");
+const DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS = 4_000;
 const CAPTURED_OFFLINE_FIELDS = {
   deviceId: "And.11111111111111111111111111111111.dttalk"
 } as const;
@@ -293,43 +344,91 @@ const TEMPLATES = {
 } as const;
 
 const APP_PHONE_COUNTRY_CONFIGS: PrivatePhoneRequestConfig[] = [
-  { countryKey: "US", label: "美国 +1", countryCode: 1, isoCountryCode: "US", providerIdList: ["2000", "2001"], packageServiceId: "DT01001", applyType: 1, randomAreaCodes: [213, 646, 312, 415, 305, 212, 323, 424, 469, 512, 628, 702, 786, 929, 971] },
-  { countryKey: "CA", label: "加拿大 +1", countryCode: 1, isoCountryCode: "CA", providerIdList: ["2000", "2001"], packageServiceId: "DT02002", applyType: 2, randomAreaCodes: [416, 647, 437, 604, 778, 236, 514, 438, 613, 343] },
-  { countryKey: "GB", label: "英国 +44", countryCode: 44, isoCountryCode: "GB", providerIdList: ["2001", "2007"], packageServiceId: "DT02001", applyType: 3 },
-  { countryKey: "BE", label: "比利时 +32", countryCode: 32, isoCountryCode: "BE", providerIdList: ["2002"], packageServiceId: "DT03001", applyType: 5 },
-  { countryKey: "NL", label: "荷兰 +31", countryCode: 31, isoCountryCode: "NL", providerIdList: ["2006"], packageServiceId: "DT03005", applyType: 9 },
-  { countryKey: "RU", label: "俄罗斯 +7", countryCode: 7, isoCountryCode: "RU", providerIdList: ["2003"], packageServiceId: "DT03002", applyType: 6 },
-  { countryKey: "ES", label: "西班牙 +34", countryCode: 34, isoCountryCode: "ES", providerIdList: ["2004"], packageServiceId: "DT03003", applyType: 7 },
-  { countryKey: "CN", label: "中国 +86", countryCode: 86, isoCountryCode: "CN", providerIdList: ["2030"], packageServiceId: "DT04001", applyType: 11 },
-  { countryKey: "AU", label: "澳大利亚 +61", countryCode: 61, isoCountryCode: "AU", providerIdList: ["2008"], packageServiceId: "DT03007", applyType: 13 },
-  { countryKey: "AT", label: "奥地利 +43", countryCode: 43, isoCountryCode: "AT", providerIdList: ["2100"], packageServiceId: "DT03008", applyType: 14 },
-  { countryKey: "FR", label: "法国 +33", countryCode: 33, isoCountryCode: "FR", providerIdList: ["2100"], packageServiceId: "DT03009", applyType: 15 },
-  { countryKey: "SE", label: "瑞典 +46", countryCode: 46, isoCountryCode: "SE", providerIdList: ["2100"], packageServiceId: "DT03010", applyType: 16 },
-  { countryKey: "MU", label: "毛里求斯 +230", countryCode: 230, isoCountryCode: "MU", providerIdList: ["2100"], packageServiceId: "DT03011", applyType: 17 },
-  { countryKey: "PL", label: "波兰 +48", countryCode: 48, isoCountryCode: "PL", providerIdList: ["2300"], packageServiceId: "DT05003", applyType: 18 },
-  { countryKey: "ID", label: "印度尼西亚 +62", countryCode: 62, isoCountryCode: "ID", providerIdList: ["2300"], packageServiceId: "DT05004", applyType: 19 },
-  { countryKey: "PR", label: "波多黎各 +1787", countryCode: 1787, isoCountryCode: "PR", providerIdList: ["2300"], packageServiceId: "DT05005", applyType: 20 },
-  { countryKey: "CZ", label: "捷克 +420", countryCode: 420, isoCountryCode: "CZ", providerIdList: ["2300"], packageServiceId: "DT05006", applyType: 21 },
-  { countryKey: "MY", label: "马来西亚 +60", countryCode: 60, isoCountryCode: "MY", providerIdList: ["2300"], packageServiceId: "DT05007", applyType: 22 },
-  { countryKey: "DK", label: "丹麦 +45", countryCode: 45, isoCountryCode: "DK", providerIdList: ["2300"], packageServiceId: "DT05008", applyType: 23 },
-  { countryKey: "RO", label: "罗马尼亚 +40", countryCode: 40, isoCountryCode: "RO", providerIdList: ["2300"], packageServiceId: "DT05009", applyType: 24 }
+  { countryKey: "US", label: "缂囧骸娴?+1", countryCode: 1, isoCountryCode: "US", providerIdList: ["2000", "2001"], packageServiceId: "DT01001", applyType: 1, randomAreaCodes: [213, 646, 312, 415, 305, 212, 323, 424, 469, 512, 628, 702, 786, 929, 971] },
+  { countryKey: "CA", label: "閸旂姵瀣佹径?+1", countryCode: 1, isoCountryCode: "CA", providerIdList: ["2000", "2001"], packageServiceId: "DT02002", applyType: 2, randomAreaCodes: [416, 647, 437, 604, 778, 236, 514, 438, 613, 343] },
+  { countryKey: "GB", label: "閼诲崬娴?+44", countryCode: 44, isoCountryCode: "GB", providerIdList: ["2001", "2007"], packageServiceId: "DT02001", applyType: 3 },
+  { countryKey: "BE", label: "濮ｆ柨鍩勯弮?+32", countryCode: 32, isoCountryCode: "BE", providerIdList: ["2002"], packageServiceId: "DT03001", applyType: 5 },
+  { countryKey: "NL", label: "閼藉嘲鍙?+31", countryCode: 31, isoCountryCode: "NL", providerIdList: ["2006"], packageServiceId: "DT03005", applyType: 9 },
+  { countryKey: "RU", label: "娣囧嫮缍忛弬?+7", countryCode: 7, isoCountryCode: "RU", providerIdList: ["2003"], packageServiceId: "DT03002", applyType: 6 },
+  { countryKey: "ES", label: "鐟楄法褰悧?+34", countryCode: 34, isoCountryCode: "ES", providerIdList: ["2004"], packageServiceId: "DT03003", applyType: 7 },
+  { countryKey: "CN", label: "娑擃厼娴?+86", countryCode: 86, isoCountryCode: "CN", providerIdList: ["2030"], packageServiceId: "DT04001", applyType: 11 },
+  { countryKey: "AU", label: "濠㈠啿銇囬崚鈺€绨?+61", countryCode: 61, isoCountryCode: "AU", providerIdList: ["2008"], packageServiceId: "DT03007", applyType: 13 },
+  { countryKey: "AT", label: "婵傘儱婀撮崚?+43", countryCode: 43, isoCountryCode: "AT", providerIdList: ["2100"], packageServiceId: "DT03008", applyType: 14 },
+  { countryKey: "FR", label: "濞夋洖娴?+33", countryCode: 33, isoCountryCode: "FR", providerIdList: ["2100"], packageServiceId: "DT03009", applyType: 15 },
+  { countryKey: "SE", label: "閻熺偛鍚€ +46", countryCode: 46, isoCountryCode: "SE", providerIdList: ["2100"], packageServiceId: "DT03010", applyType: 16 },
+  { countryKey: "MU", label: "濮ｆ盯鍣峰Ч鍌涙焿 +230", countryCode: 230, isoCountryCode: "MU", providerIdList: ["2100"], packageServiceId: "DT03011", applyType: 17 },
+  { countryKey: "PL", label: "濞夈垹鍙?+48", countryCode: 48, isoCountryCode: "PL", providerIdList: ["2300"], packageServiceId: "DT05003", applyType: 18 },
+  { countryKey: "ID", label: "閸楁澘瀹崇亸鑹般偪娴?+62", countryCode: 62, isoCountryCode: "ID", providerIdList: ["2300"], packageServiceId: "DT05004", applyType: 19 },
+  { countryKey: "PR", label: "濞夈垹顦挎搴℃倗 +1787", countryCode: 1787, isoCountryCode: "PR", providerIdList: ["2300"], packageServiceId: "DT05005", applyType: 20 },
+  { countryKey: "CZ", label: "閹瑰嘲鍘?+420", countryCode: 420, isoCountryCode: "CZ", providerIdList: ["2300"], packageServiceId: "DT05006", applyType: 21 },
+  { countryKey: "MY", label: "妞诡剚娼电憲澶哥肮 +60", countryCode: 60, isoCountryCode: "MY", providerIdList: ["2300"], packageServiceId: "DT05007", applyType: 22 },
+  { countryKey: "DK", label: "娑撳綊瀹?+45", countryCode: 45, isoCountryCode: "DK", providerIdList: ["2300"], packageServiceId: "DT05008", applyType: 23 },
+  { countryKey: "RO", label: "缂冩鈹堢亸闂寸肮 +40", countryCode: 40, isoCountryCode: "RO", providerIdList: ["2300"], packageServiceId: "DT05009", applyType: 24 }
 ];
 
 export class DirectDingtoneGateway implements DingtoneGateway {
-  async sendVerificationCode(_input: DingtoneLoginInput): Promise<VerificationRequestResult> {
-    throw new AppError(
-      "Direct gateway currently supports post-login operations only. First-login email/SMS verification still needs native activation logic.",
-      501,
-      501
-    );
+  async sendVerificationCode(input: DingtoneLoginInput): Promise<VerificationRequestResult> {
+    if (input.loginType !== "email_code") {
+      throw new AppError("Direct verification login currently supports email_code only.", 501, 501);
+    }
+    const email = normalizeEmailLoginTarget(input.email);
+    const runtime = await getDirectRuntimeConfig();
+
+    let activatedUser: any = null;
+    try {
+      const rawPayload = await callDirectActivationApi(
+        runtime,
+        { appVariant: input.appVariant, deviceId: input.deviceId },
+        "checkActivatedUser",
+        "checkActivatedUser",
+        buildCheckActivatedEmailQuery(email, input.trackCode)
+      );
+      activatedUser = extractActivatedEmailUser(rawPayload);
+    } catch {
+      // Ignore lookup failures so code delivery can continue.
+    }
+
+    const payload = await callDirectRegisterEmail(runtime, input, email);
+    return {
+      message: `Verification email sent to ${email}`,
+      verificationCode: pickString(payload, ["returnedAccessCode", "confirmCode", "accessCode"]) ?? undefined,
+      verificationFlow: "register",
+      expectedDtUserId: activatedUser?.dtUserId,
+      expectedDingtoneId: activatedUser?.dingtoneId
+    };
   }
 
-  async login(_input: DingtoneLoginInput): Promise<DingtoneLoginResult> {
-    throw new AppError(
-      "Direct gateway currently supports post-login operations only. First-login account activation is still under reverse engineering.",
-      501,
-      501
+  async login(input: DingtoneLoginInput): Promise<DingtoneLoginResult> {
+    if (input.loginType !== "email_code") {
+      throw new AppError("Direct verification login currently supports email_code only.", 501, 501);
+    }
+    assertActivationDeviceId(input.deviceId, input.appVariant);
+    const email = normalizeEmailLoginTarget(input.email);
+    const code = normalizeActivationCode(input.verificationCode);
+    const runtime = await getDirectRuntimeConfig();
+    const payload = await callDirectActivationApi(
+      runtime,
+      { appVariant: input.appVariant, deviceId: input.deviceId },
+      "activateEmail",
+      "activateEmail",
+      buildActivateEmailQuery(input, runtime, email, code)
     );
+    assertDirectActivationOk(payload, "activateEmail");
+    const dtUserId = pickString(payload, ["dtUserId", "dt_user_id", "userId", "userID", "UserId", "uid", "UserID"]);
+    const token = pickString(payload, ["token", "loginToken", "dtToken", "Token"]);
+    if (!dtUserId || !token) {
+      throw new AppError(`Direct activateEmail succeeded but did not return userId/token: ${redactSensitiveText(safeJsonStringify(payload))}`, 502, 502);
+    }
+    const templateDeviceId = await extractConfiguredActivationTemplateDeviceId(
+      activationTemplateSettingKeys("activateEmail", { appVariant: input.appVariant, deviceId: input.deviceId }),
+      code
+    );
+    return {
+      dtUserId,
+      token,
+      deviceId: normalizeActivationDeviceIdForVariant(input.deviceId ?? templateDeviceId ?? extractActivationDeviceId(payload) ?? "", input.appVariant),
+      dingtoneId: pickString(payload, ["dingtoneId", "dingtoneID", "DingtoneId", "DingtoneID"])
+    };
   }
 
   async exportSession(_input: DingtoneSessionExportInput): Promise<DingtoneSessionExport> {
@@ -342,50 +441,129 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     deviceId?: string | null;
     email?: string | null;
     phone?: string | null;
+    appVariant?: "dingtone" | "dingdong";
   }): Promise<DingtoneSnapshot> {
     const runtime = await getDirectRuntimeConfig();
     return this.withSession(runtime, account, async (session) => {
-      const nextTrackCode = createDirectTrackCodeGenerator(account.dtUserId);
+      const nextTrackCode = () => session.nextTrackCode();
       const shared = {
         deviceId: accountDeviceId(account),
         trackCode: nextTrackCode(),
         userId: account.dtUserId,
         token: account.token,
         appVersion: runtime.appVersion,
-        apkCertificateSign: resolveDirectApiApkCertificateSign(accountDeviceId(account), runtime.apkCertificateSign)
+        apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
       };
-      const balance = await session.callJson("getBalance", shared);
+      const fallbackBalance = await callBestBalanceCommonRestJson(
+        session,
+        "getBalanceCommonRest",
+        "billing/user/getBalance",
+        buildGetBalanceQueryAttempts(account, runtime, nextTrackCode)
+      );
+      let balance = fallbackBalance;
+      if (!hasPositiveBalancePayload(balance)) {
+        const templateBalance = await session.callJson("getBalance", {
+          ...shared,
+          trackCode: nextTrackCode()
+        }).catch((error) => ({
+          refreshError: error instanceof Error ? error.message : String(error)
+        }));
+        if (hasPositiveBalancePayload(templateBalance)) {
+          balance = templateBalance;
+        } else if (!isRecord(balance) || !balance.refreshError) {
+          balance = {
+            ...balance,
+            directTemplateFallback: {
+              apiName: "billing/user/getBalance",
+              result: templateBalance
+            }
+          };
+        }
+      }
+      const profile = await collectDirectProfileSnapshot(session, runtime, account, shared, nextTrackCode);
+      const point = await collectDirectPointSnapshot(session, runtime, account, nextTrackCode);
       const userSetting = await session.callJson("getUserSetting", {
         ...shared,
         trackCode: nextTrackCode(),
         clientUserId: account.dtUserId
-      });
+      }).catch((error) => ({
+        refreshError: error instanceof Error ? error.message : String(error)
+      }));
       cacheAccountPhoneCountryKeys(account.dtUserId, [balance, userSetting]);
-      const profile = {};
 
       return buildSnapshot({
         account,
         balance,
         userSetting,
-        profile
+        profile,
+        point
       });
     });
   }
 
-  async listPhoneNumbers(account: { dtUserId: string; token: string; deviceId?: string | null }): Promise<DingtonePhoneNumber[]> {
+  async listPhoneNumbers(account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" }): Promise<DingtonePhoneNumber[]> {
+    const nativeProbe = await runDirectSessionProbe({
+      account,
+      listenSeconds: 0,
+      maxPushFrames: 0,
+      focusCall: "getPrivateNumber"
+    }).catch(() => null);
+    const nativePayload = nativeProbe?.calls.find((call) => call.name === "getPrivateNumber" && call.payload)?.payload;
+    if (nativePayload) {
+      const phones = normalizePhoneNumbers(nativePayload);
+      if (phones.length > 0 || hasPhoneListPayload(nativePayload)) {
+        return phones;
+      }
+    }
+
     const runtime = await getDirectRuntimeConfig();
     return this.withSession(runtime, account, async (session) => {
-      const nextTrackCode = createDirectTrackCodeGenerator(account.dtUserId);
-      const payload = await session.callJson("getPrivateNumber", {
+      const nextTrackCode = () => session.nextTrackCode();
+      const shared = {
         deviceId: accountDeviceId(account),
-        trackCode: nextTrackCode(),
         userId: account.dtUserId,
         token: account.token,
         clientVersion: runtime.appVersion,
         appVersion: runtime.appVersion,
-        apkCertificateSign: resolveDirectApiApkCertificateSign(accountDeviceId(account), runtime.apkCertificateSign)
-      });
-      return normalizePhoneNumbers(payload);
+        apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
+      };
+      let lastError: unknown;
+
+      try {
+        const payload = await session.callJson("getPrivateNumber", {
+          ...shared,
+          trackCode: nextTrackCode()
+        });
+        assertDirectApiSuccess(payload, "listPhoneNumbers");
+        const phones = normalizePhoneNumbers(payload);
+        if (phones.length > 0 || hasPhoneListPayload(payload)) {
+          return phones;
+        }
+        lastError = new Error("getPrivateNumber returned no phone list");
+      } catch (error) {
+        lastError = error;
+      }
+
+      for (const [index, query] of buildGetPrivateNumberListQueryAttempts(account, runtime, nextTrackCode).entries()) {
+        try {
+          const payload = await session.callCommonRestJson(
+            index === 0 ? "getPrivateNumberListFallback" : `getPrivateNumberListFallback#${index + 1}`,
+            "/pstn/share/getPrivateNumber",
+            query,
+            DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS
+          );
+          assertDirectApiSuccess(payload, "listPhoneNumbers");
+          const phones = normalizePhoneNumbers(payload);
+          if (phones.length > 0 || hasPhoneListPayload(payload)) {
+            return phones;
+          }
+          lastError = new Error("getPrivateNumber returned no phone list");
+        } catch (error) {
+          lastError = error;
+        }
+      }
+
+      throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "getPrivateNumber returned no phone list"));
     });
   }
 
@@ -430,15 +608,18 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     payload: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null; areaCode?: number | null }
   ): Promise<DingtonePhonePurchasePreview> {
     const runtime = await getDirectRuntimeConfig();
-    const nextTrackCode = createDirectTrackCodeGenerator(account.dtUserId);
     const requestConfig = resolvePrivatePhoneRequestConfig(payload.countryCode, payload.isoCountryCode, payload.countryKey);
-    const attempts = buildRequestPrivateNumberQueryAttempts(account, runtime, requestConfig, nextTrackCode(), payload.areaCode);
     const previews: DingtonePhonePurchasePreview[] = [];
     let directError: unknown;
 
-    for (const [index, query] of attempts.entries()) {
+    for (let index = 0; index < 200; index += 1) {
       try {
         const result = await this.withSession(runtime, account, async (session) => {
+          const attempts = buildRequestPrivateNumberQueryAttempts(account, runtime, requestConfig, () => session.nextTrackCode(), payload.areaCode);
+          const query = attempts[index];
+          if (!query) {
+            throw new Error("No more requestPrivateNumber parameter attempts");
+          }
           const preview = await session.callCommonRestJson(
             `requestPrivateNumber#${index + 1}`,
             "/pstn/share/requestPrivateNumber",
@@ -455,6 +636,9 @@ export class DirectDingtoneGateway implements DingtoneGateway {
           return result;
         }
       } catch (error) {
+        if (error instanceof Error && error.message === "No more requestPrivateNumber parameter attempts") {
+          break;
+        }
         directError = error;
         logger.warn("Direct requestPrivateNumber attempt failed; trying next app-compatible parameter set", {
           countryCode: requestConfig.countryCode,
@@ -882,6 +1066,7 @@ export async function runDirectSessionProbe(input: {
   maxPushFrames?: number;
   customTemplates?: DirectProbeCustomTemplate[];
   phonePreviewCountryCode?: number;
+  focusCall?: "getBalance" | "getUserSetting" | "getPrivateNumber";
 }): Promise<DirectProbeResult> {
   const runtime = await getDirectRuntimeConfig();
   const hosts = uniqueHosts([runtime.primaryHost, runtime.backupHost]);
@@ -891,7 +1076,7 @@ export async function runDirectSessionProbe(input: {
     const session = new DirectSession(runtime, host);
     try {
       await session.open(input.account);
-      const calls = await runProbeCalls(session, runtime, input.account, input.customTemplates ?? [], input.phonePreviewCountryCode);
+      const calls = await runProbeCalls(session, runtime, input.account, input.customTemplates ?? [], input.phonePreviewCountryCode, input.focusCall);
       const pushes =
         input.listenSeconds && input.listenSeconds > 0
           ? await session.waitForPushes(input.listenSeconds * 1000, input.maxPushFrames ?? 5)
@@ -1085,6 +1270,7 @@ async function discoverDirectPushHosts(
     deviceId?: string | null;
     email?: string | null;
     phone?: string | null;
+    appVariant?: "dingtone" | "dingdong";
   },
   hosts: string[],
   listener: ActiveDirectPushListener,
@@ -1097,9 +1283,8 @@ async function discoverDirectPushHosts(
     token: account.token,
     clientVersion: runtime.appVersion,
     appVersion: runtime.appVersion,
-    apkCertificateSign: resolveDirectApiApkCertificateSign(accountDeviceId(account), runtime.apkCertificateSign)
+    apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
   };
-  const nextTrackCode = createDirectTrackCodeGenerator(account.dtUserId);
   const discovered: string[] = [];
   const visited = new Set<string>();
   const pending = uniqueHosts(hosts);
@@ -1133,7 +1318,7 @@ async function discoverDirectPushHosts(
       try {
         await session.open(account);
         const call = await timeProbeCall(session, `discover.queryRtcServersEx@${host}`, () =>
-          session.callJson("queryRtcServersEx", { ...shared, trackCode: nextTrackCode() })
+          session.callJson("queryRtcServersEx", { ...shared, trackCode: session.nextTrackCode() })
         );
         calls.push(call);
         if (call.payload) {
@@ -1178,9 +1363,9 @@ async function runPushListenPrimeCalls(
     token: account.token,
     clientVersion: runtime.appVersion,
     appVersion: runtime.appVersion,
-    apkCertificateSign: resolveDirectApiApkCertificateSign(accountDeviceId(account), runtime.apkCertificateSign)
+    apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
   };
-  const nextTrackCode = createDirectTrackCodeGenerator(account.dtUserId);
+  const nextTrackCode = () => session.nextTrackCode();
   const calls: DirectProbeCallResult[] = [];
 
   // The Android app refreshes balance and private-number state immediately before
@@ -1377,6 +1562,103 @@ export async function runDirectAccessCodeProbe(input: {
   throw normalizeDirectError(lastError);
 }
 
+export async function runDirectActivatedUserProbe(input: {
+  kind: "email" | "phone";
+  target: string;
+  deviceId: string;
+  appVariant?: "dingtone" | "dingdong";
+  countryCode?: number;
+}): Promise<DirectActivatedUserProbeResult> {
+  assertValidAccessCodeTarget(input.kind, input.target);
+  assertActivationDeviceId(input.deviceId, input.appVariant);
+  const runtime = await getDirectRuntimeConfig();
+  const hosts = uniqueHosts([runtime.primaryHost, runtime.backupHost]);
+  const apiNames = [
+    "checkActivatedUser",
+    "checkUserActivate",
+    "checkUserActivated",
+    "checkActivatedAccount",
+    "activation/checkActivatedUser",
+    "user/checkActivatedUser"
+  ];
+  let lastError: unknown;
+
+  for (const host of hosts) {
+    const session = new DirectSession(runtime, host);
+    try {
+      await session.openActivation({ appVariant: input.appVariant, deviceId: input.deviceId });
+      const calls: DirectProbeCallResult[] = [];
+      let emptyPayload: ApiResult | undefined;
+      for (const apiName of apiNames) {
+        const queries = buildCheckActivatedUserQueries(input.kind, input.target, input.countryCode, session.nextTrackCode());
+        for (const [queryIndex, query] of queries.entries()) {
+          const label = queryIndex === 0 ? apiName : `${apiName}#${queryIndex + 1}`;
+          const call = await timeProbeCall(session, label, () => session.callCommonRestJson(label, apiName, query, 2_500));
+          const tracedPayload = findLastCommonRestPayload(call.frames ?? [], apiName);
+          const payload = call.payload ?? tracedPayload ?? undefined;
+          const normalizedCall = tracedPayload && !call.payload ? { ...call, payload, ok: true, error: undefined } : call;
+          calls.push(normalizedCall);
+          if (hasActivatedUserPayload(payload)) {
+            await session.close();
+            return {
+              ok: true,
+              host,
+              target: redactAccessCodeTarget(input.kind, input.target),
+              calls,
+              trace: session.getTrace()
+            };
+          }
+          if (!emptyPayload && hasActivationDefinitiveEmptyPayload(payload)) {
+            emptyPayload = payload;
+          }
+        }
+      }
+      await session.close();
+      return {
+        ok: calls.some((call) => hasActivatedUserPayload(call.payload)) || (!emptyPayload && calls.some((call) => call.ok)),
+        host,
+        target: redactAccessCodeTarget(input.kind, input.target),
+        calls,
+        trace: session.getTrace()
+      };
+    } catch (error) {
+      lastError = error;
+      await session.close().catch(() => undefined);
+      logger.warn("Direct activated-user probe failed, trying next endpoint", {
+        host,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  throw normalizeDirectError(lastError);
+}
+
+export async function verifyDirectActivationAccessCode(input: {
+  kind: "email" | "phone";
+  target: string;
+  accessCode: string | number;
+  deviceId: string;
+  appVariant?: "dingtone" | "dingdong";
+  countryCode?: number;
+}) {
+  assertValidAccessCodeTarget(input.kind, input.target);
+  const code = String(input.accessCode).trim();
+  if (!code) {
+    throw new AppError("accessCode is required", 400, 400);
+  }
+  const runtime = await getDirectRuntimeConfig();
+  const payload = await callDirectActivationApi(
+    runtime,
+    { appVariant: input.appVariant, deviceId: input.deviceId },
+    "verifyAccessCode",
+    "verifyAccessCode",
+    buildVerifyAccessCodeQuery(input.kind, input.target, resolveAccessCodeCountryCode(input.kind, input.target, input.countryCode), code)
+  );
+  assertDirectActivationOk(payload, "verifyAccessCode");
+  return payload;
+}
+
 async function runProbeCalls(
   session: DirectSession,
   runtime: DirectRuntimeConfig,
@@ -1388,7 +1670,8 @@ async function runProbeCalls(
     phone?: string | null;
   },
   customTemplates: DirectProbeCustomTemplate[],
-  phonePreviewCountryCode?: number
+  phonePreviewCountryCode?: number,
+  focusCall?: "getBalance" | "getUserSetting" | "getPrivateNumber"
 ) {
   const shared = {
     deviceId: accountDeviceId(account),
@@ -1396,18 +1679,36 @@ async function runProbeCalls(
     token: account.token,
     clientVersion: runtime.appVersion,
     appVersion: runtime.appVersion,
-    apkCertificateSign: resolveDirectApiApkCertificateSign(accountDeviceId(account), runtime.apkCertificateSign)
+    apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
   };
   const calls: DirectProbeCallResult[] = [];
-  const nextTrackCode = createDirectTrackCodeGenerator(account.dtUserId);
+  const nextTrackCode = () => session.nextTrackCode();
 
-  for (const item of [
+  const standardCalls = [
     { name: "getBalance" as const, params: { ...shared, trackCode: nextTrackCode() } },
     { name: "getUserSetting" as const, params: { ...shared, trackCode: nextTrackCode(), clientUserId: account.dtUserId } },
-    { name: "getPrivateNumber" as const, params: { ...shared, trackCode: nextTrackCode() } }
-  ]) {
+    { name: "getPrivateNumber" as const, params: { ...shared, trackCode: nextTrackCode() } },
+    { name: "followerListInfo" as const, params: { ...shared, trackCode: nextTrackCode() } },
+    { name: "infoBus" as const, params: { ...shared, trackCode: nextTrackCode() } }
+  ];
+  for (const item of focusCall ? standardCalls.filter((candidate) => candidate.name === focusCall) : standardCalls) {
     calls.push(await timeProbeCall(session, item.name, () => session.callJson(item.name, item.params)));
   }
+
+  if (focusCall) {
+    return calls;
+  }
+
+  calls.push(
+    await timeProbeCall(session, "gwebInfoBus", () =>
+      session.callCommonRestJson("gwebInfoBus", "gwebsvr/infoBus", buildGwebInfoBusQuery(account, runtime, nextTrackCode()))
+    )
+  );
+  calls.push(
+    await timeProbeCall(session, "glbUserPropertites", () =>
+      session.callCommonRestJson("glbUserPropertites", "glb/userPropertites", buildGlbUserPropertiesQuery(account, runtime, nextTrackCode()))
+    )
+  );
 
   if (phonePreviewCountryCode) {
     calls.push(
@@ -1470,7 +1771,7 @@ async function timeProbeCall(
 
 function expandTemplateParams(
   params: DirectTemplateParams,
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
   runtime: DirectRuntimeConfig,
   extraVars: DirectTemplateParams = {}
 ) {
@@ -1482,7 +1783,7 @@ function expandTemplateParams(
     deviceId: accountDeviceId(account),
     trackCode: createDirectTrackCode(account.dtUserId),
     appVersion: runtime.appVersion,
-    apkCertificateSign: resolveDirectApiApkCertificateSign(accountDeviceId(account), runtime.apkCertificateSign),
+    apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign),
     ...extraVars
   };
 
@@ -1498,7 +1799,7 @@ function expandTemplateParams(
 }
 
 function buildSharedTemplateParams(
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
   runtime: DirectRuntimeConfig
 ): DirectTemplateParams {
   return {
@@ -1508,7 +1809,7 @@ function buildSharedTemplateParams(
     trackCode: createDirectTrackCode(account.dtUserId),
     clientVersion: runtime.appVersion,
     appVersion: runtime.appVersion,
-    apkCertificateSign: resolveDirectApiApkCertificateSign(accountDeviceId(account), runtime.apkCertificateSign)
+    apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
   };
 }
 
@@ -1531,10 +1832,10 @@ function extractBootstrapPhoneCountryKeys(payloads: ApiResult[]) {
 
 async function seedAccountPhoneCountryKeys(
   session: DirectSession,
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
   runtime: DirectRuntimeConfig
 ) {
-  const nextTrackCode = createDirectTrackCodeGenerator(account.dtUserId);
+  const nextTrackCode = () => session.nextTrackCode();
   const shared = {
     deviceId: accountDeviceId(account),
     trackCode: nextTrackCode(),
@@ -1542,7 +1843,7 @@ async function seedAccountPhoneCountryKeys(
     token: account.token,
     clientVersion: runtime.appVersion,
     appVersion: runtime.appVersion,
-    apkCertificateSign: resolveDirectApiApkCertificateSign(accountDeviceId(account), runtime.apkCertificateSign)
+    apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
   };
   const balance = await session.callJson("getBalance", shared).catch(() => null);
   const userSetting = await session.callJson("getUserSetting", {
@@ -1591,12 +1892,15 @@ class DirectSession {
   private sessionId = Buffer.alloc(4);
   private route = Buffer.alloc(8);
   private trace: DirectProbeFrameTrace[] = [];
+  private bootstrapPayloads: ApiResult[] = [];
   private pushDeliveryConfirmSerial = 6;
+  private trackCodeGenerator: (() => string) | null = null;
 
   constructor(private runtime: DirectRuntimeConfig, private host: string) {}
 
   async open(account: DirectSessionAccount) {
     this.account = account;
+    this.trackCodeGenerator = createDirectTrackCodeGenerator(account.dtUserId);
     this.socket = await this.connectSocket(this.host, this.runtime.port, this.runtime.connectTimeoutMs);
     this.attachSocketEvents();
     await this.write(CONNECT_REQUEST);
@@ -1626,8 +1930,46 @@ class DirectSession {
     await this.bootstrapAuthenticatedSession(account);
   }
 
+  async openActivation(identity: DirectActivationIdentity) {
+    const deviceId = activationDeviceId(identity);
+    this.trackCodeGenerator = createDirectTrackCodeGenerator(deviceId);
+    this.socket = await this.connectSocket(this.host, this.runtime.port, this.runtime.connectTimeoutMs);
+    this.attachSocketEvents();
+    await this.write(CONNECT_REQUEST);
+
+    const connectResp = await this.waitForFrame((frame) => frame.type === 0x8102, this.runtime.ioTimeoutMs, "connect response");
+    this.sessionId = Buffer.from(connectResp.raw.subarray(14, 18));
+
+    const prelogin = buildRequestFrame({
+      template: TEMPLATES.getInfoBeforeLogin,
+      session: this.sessionId,
+      route: undefined,
+      status: 0x0101,
+      params: {
+        deviceID: deviceId,
+        notPreLogin: "true",
+        userID: 100000000000000
+      }
+    });
+    await this.write(prelogin);
+
+    const preloginResp = await this.waitForFrame(
+      (frame) => frame.type === 0x8107 && frame.status === 0x0101,
+      this.runtime.ioTimeoutMs,
+      "getInfoBeforeLogin response"
+    );
+    this.route = Buffer.from(preloginResp.body.subarray(8, 16));
+  }
+
   async callJson(templateName: keyof typeof TEMPLATES, params: DirectTemplateParams) {
     return this.callJsonFromTemplate(String(templateName), TEMPLATES[templateName], params);
+  }
+
+  nextTrackCode() {
+    if (!this.trackCodeGenerator) {
+      this.trackCodeGenerator = createDirectTrackCodeGenerator(this.account?.dtUserId ?? this.host);
+    }
+    return this.trackCodeGenerator();
   }
 
   async sendJson(templateName: keyof typeof TEMPLATES, params: DirectTemplateParams) {
@@ -1646,7 +1988,7 @@ class DirectSession {
     await this.write(request);
   }
 
-  async callCommonRestJson(label: string, apiName: string, query: string) {
+  async callCommonRestJson(label: string, apiName: string, query: string, timeoutMs = this.runtime.ioTimeoutMs) {
     const request = buildCommonRestRequestFrame({
       template: TEMPLATES.getPrivateNumber,
       session: this.sessionId,
@@ -1658,7 +2000,132 @@ class DirectSession {
 
     this.clearJsonQueue();
     await this.write(request);
-    return this.waitForJsonPayload(this.runtime.ioTimeoutMs, `${label} JSON response`);
+    return this.waitForJsonPayload(timeoutMs, `${label} JSON response`, (payload) => {
+      const expected = isExpectedCommonRestJsonPayload(apiName, payload);
+      return (
+        expected &&
+        (matchesExpectedTrackCode(payload, extractQueryParam(query, "TrackCode")) ||
+          hasStrongExpectedCommonRestShape(apiName, payload) ||
+          isActivationCommonRestResult(apiName, payload))
+      );
+    });
+  }
+
+  async callConfiguredActivationTemplate(
+    settingKey: DirectActivationTemplateSettingKey | DirectActivationTemplateSettingKey[],
+    label: string,
+    deviceId: string,
+    extraParams: DirectTemplateParams,
+    proofFallbackQuery?: string
+  ) {
+    const configured = await getConfiguredDirectTemplateFromKeys(settingKey);
+    const template = configured?.template ?? null;
+    if (!template) {
+      throw new AppError(
+        `Direct ${label} requires native activation template ${formatDirectTemplateKeys(settingKey)}; refusing to use the legacy CommonRest fallback.`,
+        503,
+        503
+      );
+    }
+    const preserveCapturedEnvelope = isPreserveCapturedEnvelope(extraParams);
+    const account = { dtUserId: "100000000000000", token: "", deviceId };
+    let params = expandTemplateParams(
+      buildConfiguredActivationParamSet(label, template.params ?? {}, extraParams),
+      account,
+      this.runtime
+    );
+    let effectiveDeviceId = normalizeTemplateString(params.deviceId) ?? deviceId;
+    const templateBuffer = Buffer.from(template.hex.replace(/\s+/g, ""), "hex");
+    const preserveRawPayload =
+      preserveCapturedEnvelope &&
+      label.toLowerCase().includes("activateemail") &&
+      templateQueryParam(templateBuffer, "confirmCode") === stringifyPrimitive(params.confirmCode);
+
+    // 婵″倹鐏夋稉宥嗗姬鐡掑啿甯崠鍛村櫢閺€鍓ф畱閺夆€叉閿涘牆宓嗘稉宥嗘Ц闁藉牆顕弮褑澶勯幋宄版嫲閹舵挸瀵橀弮鍓佹畱閻楃懓鐣炬宀冪槈閻礁浠涢柌宥嗘杹閿涘绱濇稉鏃€鍨滄禒顑跨炊閸忋儰绨￠崢鐔奉潗閻?query閿?    // 閸掓瑦鍨滄禒顒€绻€妞よ濞囬悽銊︾梾閺堝绮℃潻鍥у灩闂勩倗鐗崸蹇曟畱閸樼喎顫愭０婵嗩樆閸欏倹鏆熼敍宀勫櫢閺傞绻氶悾娆戞埂鐎圭偟娈戦柇顔绢唸閻╃鍙ч崣鍌涙殶娴犮儱鍘戠拋?patch 閺囨寧宕叉稉鐑樻煀鐠愶箑褰?
+    if (!preserveRawPayload && proofFallbackQuery) {
+      const fullExtraParams = buildActivationTemplateParams(proofFallbackQuery);
+      params = expandTemplateParams(
+        buildConfiguredActivationParamSet(label, template.params ?? {}, fullExtraParams),
+        account,
+        this.runtime
+      );
+      effectiveDeviceId = normalizeTemplateString(params.deviceId) ?? deviceId;
+    }
+
+    const frame = buildTemplateSendFrame({
+      template: templateBuffer,
+      session: this.sessionId,
+      route: this.route,
+      status: 0x0102,
+      preserveRawPayload,
+      params: {
+        ...routeQueryParams(this.route),
+        ...params,
+        ...(preserveCapturedEnvelope && preserveRawPayload
+          ? {}
+          : {
+              deviceId: effectiveDeviceId,
+              deviceID: normalizeTemplateString(params.deviceID) ?? effectiveDeviceId
+            }),
+        appVersion: params.appVersion ?? this.runtime.appVersion,
+        apkCertificateSign: params.apkCertificateSign ?? this.runtime.apkCertificateSign
+      }
+    });
+
+    this.clearJsonQueue();
+    dumpDirectDebugFrame(label, frame);
+    await this.write(frame);
+    return this.waitForJsonPayload(this.runtime.ioTimeoutMs, `${label} native activation response`, (payload) => {
+      return isExpectedActivationPayload(label, payload);
+    });
+  }
+
+  async callConfiguredRegisterEmailTemplate(
+    label: string,
+    deviceId: string,
+    extraParams: DirectTemplateParams,
+    settingKey: DirectActivationTemplateSettingKey | DirectActivationTemplateSettingKey[] = "dt_direct_template_register_email"
+  ) {
+    const configured = await getConfiguredDirectTemplateFromKeys(settingKey);
+    const template = configured?.template ?? null;
+    if (!template) {
+      throw new AppError(
+        `Direct registerEmail requires native activation template ${formatDirectTemplateKeys(settingKey)}.`,
+        503,
+        503
+      );
+    }
+    const preserveCapturedEnvelope = isPreserveCapturedEnvelope(extraParams);
+    const account = { dtUserId: "100000000000000", token: "", deviceId };
+    const params = expandTemplateParams(
+      buildConfiguredActivationParamSet(label, template.params ?? {}, extraParams),
+      account,
+      this.runtime
+    );
+    const effectiveDeviceId = normalizeTemplateString(params.deviceId) ?? deviceId;
+    const frame = buildTemplateSendFrame({
+      template: Buffer.from(template.hex.replace(/\s+/g, ""), "hex"),
+      session: this.sessionId,
+      route: this.route,
+      status: 0x0102,
+      preserveRawPayload: false,
+      params: {
+        ...routeQueryParams(this.route),
+        ...params,
+        deviceId: effectiveDeviceId,
+        deviceID: normalizeTemplateString(params.deviceID) ?? effectiveDeviceId,
+        appVersion: params.appVersion ?? this.runtime.appVersion,
+        apkCertificateSign: params.apkCertificateSign ?? this.runtime.apkCertificateSign
+      }
+    });
+
+    this.clearJsonQueue();
+    this.queue = [];
+    dumpDirectDebugFrame(label, frame);
+    await this.write(frame);
+    return this.waitForJsonPayload(this.runtime.ioTimeoutMs, `${label} native activation response`, (payload) => {
+      return isExpectedActivationPayload(label, payload);
+    });
   }
 
   async sendCommonRestJson(label: string, apiName: string, query: string) {
@@ -1678,6 +2145,10 @@ class DirectSession {
     return this.accountPhoneCountryKeys;
   }
 
+  getBootstrapPayloads() {
+    return [...this.bootstrapPayloads];
+  }
+
   async callJsonFromTemplate(label: string, template: Buffer, params: DirectTemplateParams) {
     const request = buildRequestFrame({
       template,
@@ -1694,7 +2165,10 @@ class DirectSession {
 
     this.clearJsonQueue();
     await this.write(request);
-    return this.waitForJsonPayload(this.runtime.ioTimeoutMs, `${label} JSON response`);
+    return this.waitForJsonPayload(this.runtime.ioTimeoutMs, `${label} JSON response`, (payload) => {
+      const expected = isExpectedTemplateJsonPayload(label, payload);
+      return expected && (matchesExpectedTrackCode(payload, stringifyPrimitive(params.trackCode ?? params.TrackCode)) || hasStrongExpectedTemplateShape(label, payload));
+    });
   }
 
   async sendConfiguredTemplate(
@@ -1797,7 +2271,18 @@ class DirectSession {
   }
 
   private async connectSocket(host: string, port: number, timeoutMs: number) {
-    const socket = this.runtime.useTls
+    const useTls = port === 465 ? true : this.runtime.useTls;
+    if (this.runtime.proxyUrl) {
+      return connectSocketViaHttpProxy({
+        proxyUrl: this.runtime.proxyUrl,
+        host,
+        port,
+        useTls,
+        timeoutMs
+      });
+    }
+
+    const socket = useTls
       ? tls.connect({ host, port, servername: host, rejectUnauthorized: false })
       : net.connect({ host, port });
 
@@ -1856,6 +2341,14 @@ class DirectSession {
       this.buffer = this.buffer.subarray(totalLen);
       const parsed = parseFrame(frame);
       const jsonPayload = extractJsonPayload(parsed.raw);
+
+      if (process.env.DT_DIRECT_DEBUG_DUMP_DIR) {
+        console.log(`[Socket Read] Length: ${parsed.raw.length}, Type: 0x${parsed.type.toString(16)}, Status: ${parsed.status !== undefined ? `0x${parsed.status.toString(16)}` : "undefined"}, Hex: ${parsed.raw.toString("hex")}`);
+        if (jsonPayload) {
+          console.log(`[Socket Read JSON]:`, JSON.stringify(jsonPayload));
+        }
+      }
+
       this.trace.push({
         receivedAt: new Date().toISOString(),
         frameType: parsed.type,
@@ -1891,6 +2384,9 @@ class DirectSession {
   private async write(frame: Buffer) {
     if (!this.socket) {
       throw new Error("Direct gateway socket is not open");
+    }
+    if (process.env.DT_DIRECT_DEBUG_DUMP_DIR) {
+      console.log(`[Socket Write] Length: ${frame.length}, Hex: ${frame.toString("hex")}`);
     }
     await new Promise<void>((resolve, reject) => {
       this.socket!.write(frame, (error) => {
@@ -1933,17 +2429,17 @@ class DirectSession {
     deviceId?: string | null;
     email?: string | null;
   }) {
-    const nextTrackCode = createDirectTrackCodeGenerator(account.dtUserId);
     const packet = buildLoginInitPacket({
       session: this.sessionId,
       route: this.route,
       runtime: this.runtime,
       account,
-      loginTrackCode: nextTrackCode(),
-      configTrackCode: nextTrackCode()
+      loginTrackCode: this.nextTrackCode(),
+      configTrackCode: this.nextTrackCode()
     });
     await this.write(packet);
     await this.drainBootstrapFrames(3_000);
+    this.bootstrapPayloads = [...this.jsonQueue];
     this.accountPhoneCountryKeys = extractBootstrapPhoneCountryKeys(this.jsonQueue);
     if (this.accountPhoneCountryKeys) {
       directAccountPhoneCountryKeyCache.set(account.dtUserId, this.accountPhoneCountryKeys);
@@ -2049,11 +2545,43 @@ class DirectSession {
     });
   }
 
-  private waitForJsonPayload(timeoutMs: number, label: string) {
-    if (this.jsonQueue.length > 0) {
-      return Promise.resolve(this.jsonQueue.shift()!);
+  private async waitForJsonPayload(timeoutMs: number, label: string, predicate: (payload: ApiResult) => boolean = () => true) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const queuedIndex = this.jsonQueue.findIndex((payload) => predicate(payload));
+      if (queuedIndex >= 0) {
+        const [payload] = this.jsonQueue.splice(queuedIndex, 1);
+        if (payload) {
+          return payload;
+        }
+      }
+
+      if (this.jsonQueue.length > 0) {
+        const skipped = this.jsonQueue.shift();
+        logger.debug("Skipped unrelated direct JSON payload while waiting for typed response", {
+          host: this.host,
+          label,
+          payload: summarizeJsonPayload(skipped)
+        });
+        continue;
+      }
+
+      const remaining = Math.max(250, deadline - Date.now());
+      const payload = await this.nextJsonPayload(remaining, label);
+      if (predicate(payload)) {
+        return payload;
+      }
+      logger.debug("Skipped unrelated direct JSON payload while waiting for typed response", {
+        host: this.host,
+        label,
+        payload: summarizeJsonPayload(payload)
+      });
     }
 
+    throw new AppError(`Timed out waiting for ${label}`, 504, 504);
+  }
+
+  private nextJsonPayload(timeoutMs: number, label: string) {
     if (this.closed) {
       return Promise.reject(new Error(`Direct gateway socket closed while waiting for ${label}`));
     }
@@ -2142,6 +2670,245 @@ class DirectSession {
   }
 }
 
+function isExpectedTemplateJsonPayload(label: string, payload: ApiResult) {
+  const normalized = label.toLowerCase();
+  if (normalized.includes("getbalance")) {
+    return isBalancePayload(payload);
+  }
+  if (normalized.includes("getusersetting")) {
+    return hasAnyOwnKey(payload, ["userSettingVerId", "userSettingContent", "removeAdRemainingTime"]);
+  }
+  if (normalized.includes("getprivatenumber")) {
+    return hasPhoneListPayload(payload);
+  }
+  return true;
+}
+
+function isExpectedCommonRestJsonPayload(apiName: string, payload: ApiResult) {
+  const normalized = apiName.toLowerCase();
+  if (!normalized.includes("billing/user/getbalance") && isBalancePayload(payload)) {
+    return false;
+  }
+  if (normalized.includes("point/summary")) {
+    return hasNestedOwnKey(payload, "uid") || hasNestedOwnKey(payload, "validPoint") || hasNestedOwnKey(payload, "userGrade") || hasErrCode(payload, 7001);
+  }
+  if (normalized.includes("point/gradeinfo")) {
+    return hasNestedOwnKey(payload, "validPoint") || hasNestedOwnKey(payload, "userGrade") || hasErrCode(payload, 7001);
+  }
+  if (normalized.includes("billing/product/v3/get")) {
+    return (
+      hasNestedOwnKey(payload, "products") ||
+      hasNestedOwnKey(payload, "paymentTypes") ||
+      hasNestedOwnKey(payload, "paypalInfo") ||
+      hasNestedOwnKey(payload, "braintreeInfo") ||
+      hasErrCode(payload, 7001)
+    );
+  }
+  if (normalized.includes("pstn/share/getprivatenumber")) {
+    return hasPhoneListPayload(payload) || hasErrCode(payload, 7001);
+  }
+  if (normalized.includes("checkactivated") || normalized.includes("checkuseractivate")) {
+    return hasActivatedUserPayload(payload) || hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]);
+  }
+  return true;
+}
+
+function isExpectedActivationPayload(label: string, payload: ApiResult) {
+  const normalized = label.toLowerCase();
+  if (normalized.includes("activateemail")) {
+    return (
+      isActivationLoginSuccessPayload(payload) ||
+      hasAnyOwnKey(payload, ["dtUserId", "dt_user_id", "userId", "userID", "UserId", "uid", "UserID", "token", "loginToken", "dtToken", "Token"]) ||
+      hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"])
+    );
+  }
+  return hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode", "returnedAccessCode", "confirmCode", "accessCode"]);
+}
+
+function findLastActivationPayload(trace: DirectProbeFrameTrace[], label: string) {
+  for (let index = trace.length - 1; index >= 0; index -= 1) {
+    const payload = trace[index]?.jsonPayload;
+    if (payload && isExpectedActivationPayload(label, payload)) {
+      return payload;
+    }
+  }
+  return null;
+}
+
+function findLastCommonRestPayload(trace: DirectProbeFrameTrace[], apiName: string) {
+  for (let index = trace.length - 1; index >= 0; index -= 1) {
+    const payload = trace[index]?.jsonPayload;
+    if (payload && isExpectedCommonRestJsonPayload(apiName, payload)) {
+      return payload;
+    }
+  }
+  return null;
+}
+
+function isActivationLoginSuccessPayload(payload: ApiResult) {
+  const result = payload.Result ?? payload.result;
+  return Number(result) === 1 && Boolean(pickString(payload, ["Token", "token", "loginToken", "dtToken"])) && Boolean(pickString(payload, ["UserId", "userId", "UserID", "dtUserId", "uid"]));
+}
+
+function hasStrongExpectedCommonRestShape(apiName: string, payload: ApiResult) {
+  const normalized = apiName.toLowerCase();
+  if (normalized.includes("billing/user/getbalance")) {
+    return isBalancePayload(payload);
+  }
+  if (normalized.includes("gwebsvr/infobus") || normalized.includes("glb/userpropertites") || normalized.includes("glb/userproperties")) {
+    return hasUserProfileOrPropertyPayload(payload);
+  }
+  if (normalized.includes("point/summary") || normalized.includes("point/gradeinfo")) {
+    return hasNestedOwnKey(payload, "uid") || hasNestedOwnKey(payload, "validPoint") || hasNestedOwnKey(payload, "userGrade");
+  }
+  if (normalized.includes("billing/product/v3/get")) {
+    return hasNestedOwnKey(payload, "products") || hasNestedOwnKey(payload, "paymentTypes") || hasNestedOwnKey(payload, "paypalInfo");
+  }
+  if (normalized.includes("pstn/share/getprivatenumber")) {
+    return hasPhoneListPayload(payload);
+  }
+  if (normalized.includes("checkactivated") || normalized.includes("checkuseractivate")) {
+    return hasActivatedUserPayload(payload);
+  }
+  return false;
+}
+
+function hasStrongExpectedTemplateShape(label: string, payload: ApiResult) {
+  const normalized = label.toLowerCase();
+  if (normalized.includes("getbalance")) {
+    return isBalancePayload(payload);
+  }
+  if (normalized.includes("getusersetting")) {
+    return hasAnyOwnKey(payload, ["userSettingVerId", "userSettingContent", "removeAdRemainingTime"]);
+  }
+  if (normalized.includes("getprivatenumber")) {
+    return hasPhoneListPayload(payload);
+  }
+  if (normalized.includes("infobus") || normalized.includes("userpropertites") || normalized.includes("userproperties")) {
+    return hasUserProfileOrPropertyPayload(payload);
+  }
+  return false;
+}
+
+function isActivationCommonRestResult(apiName: string, payload: ApiResult) {
+  const normalized = apiName.toLowerCase();
+  if (
+    !normalized.includes("registercommon") &&
+    !normalized.includes("activatecommon") &&
+    !normalized.includes("activationcommon") &&
+    !normalized.includes("checkactivated")
+  ) {
+    return false;
+  }
+  return hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]);
+}
+
+function matchesExpectedTrackCode(payload: ApiResult, expectedTrackCode: string | null | undefined) {
+  if (!expectedTrackCode) {
+    return true;
+  }
+  const actual = stringifyPrimitive(payload.TrackCode ?? payload.trackCode);
+  return !actual || actual === expectedTrackCode;
+}
+
+function extractQueryParam(query: string, key: string) {
+  const params = new URLSearchParams(query.startsWith("&") ? query.slice(1) : query);
+  return params.get(key) ?? params.get(key.toLowerCase()) ?? undefined;
+}
+
+function isBalancePayload(payload: ApiResult) {
+  return hasAnyOwnKey(payload, [
+    "primaryBalance",
+    "primary_balance",
+    "balance",
+    "creditExchangeRatio",
+    "giftableBalance",
+    "subscriptionBalance",
+    "creditBonuses",
+    "callPlans"
+  ]);
+}
+
+function hasPositiveBalancePayload(payload: unknown) {
+  return pickPositiveNumberFromRecords(collectNestedRecords(payload), [
+    "primaryBalance",
+    "primary_balance",
+    "balance",
+    "balanceAmount",
+    "balance_amount",
+    "availableBalance",
+    "available_balance",
+    "walletBalance",
+    "wallet_balance",
+    "coinBalance",
+    "coin_balance",
+    "creditBalance",
+    "credit_balance"
+  ]) !== undefined;
+}
+
+function hasPhoneListPayload(payload: ApiResult) {
+  return hasAnyOwnKey(payload, ["numberExList", "numberExlist", "numberList", "phoneNumbers", "items", "list"]) || hasNestedOwnKey(payload, "phoneNumber");
+}
+
+function hasActivatedUserPayload(payload: ApiResult | undefined) {
+  if (!payload) {
+    return false;
+  }
+  return (
+    hasAnyOwnKey(payload, ["activatedUserList", "activatedUsers", "userList", "users"]) ||
+    hasNestedOwnKey(payload, "activatedUserList") ||
+    hasNestedOwnKey(payload, "hasPassword") ||
+    hasNestedOwnKey(payload, "isPrivateNumber") ||
+    (hasNestedOwnKey(payload, "userId") && hasNestedOwnKey(payload, "dingtoneId"))
+  );
+}
+
+function hasActivationDefinitiveEmptyPayload(payload: ApiResult | undefined) {
+  if (!payload) {
+    return false;
+  }
+  const result = payload.Result ?? payload.result;
+  const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode;
+  return Number(result) === 0 || (errCode !== undefined && Number(errCode) === 0);
+}
+
+function hasUserProfileOrPropertyPayload(payload: ApiResult) {
+  return (
+    hasNestedOwnKey(payload, "DingtoneId") ||
+    hasNestedOwnKey(payload, "dingtoneId") ||
+    hasNestedOwnKey(payload, "publicUserId") ||
+    hasNestedOwnKey(payload, "PhoneNumberCount") ||
+    hasNestedOwnKey(payload, "Storage") ||
+    hasNestedOwnKey(payload, "IpISOCountryCode") ||
+    hasNestedOwnKey(payload, "userProperties") ||
+    hasNestedOwnKey(payload, "userProperty") ||
+    hasNestedOwnKey(payload, "properties")
+  );
+}
+
+function hasErrCode(payload: ApiResult, expected: number) {
+  const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode;
+  return Number(errCode) === expected;
+}
+
+function hasAnyOwnKey(payload: ApiResult, keys: string[]) {
+  return keys.some((key) => Object.prototype.hasOwnProperty.call(payload, key));
+}
+
+function hasNestedOwnKey(value: unknown, key: string): boolean {
+  if (Array.isArray(value)) {
+    return value.some((item) => hasNestedOwnKey(item, key));
+  }
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(value, key)) {
+    return true;
+  }
+  return Object.values(value).some((item) => hasNestedOwnKey(item, key));
+}
+
 function getDirectTemplateBody(template: Buffer) {
   const totalLen = template.readUInt32BE(2);
   const frame = template.subarray(0, totalLen);
@@ -2169,16 +2936,26 @@ function buildRequestFrame(input: {
     throw new Error("Template zlib payload is missing length fields");
   }
 
-  const prefix = Buffer.from(templateBody.subarray(0, zlibOffset - 8));
   const templateCompressedLength = templateBody.readUInt32BE(zlibOffset - 4);
   const suffix = templateBody.subarray(zlibOffset + templateCompressedLength);
   const templateQuery = zlib.inflateSync(templateBody.subarray(zlibOffset)).toString("utf8");
   const nextQuery = patchQuery(templateQuery, input.params);
   const compressed = zlib.deflateSync(Buffer.from(nextQuery, "utf8"));
 
+  let prefix = patchEmbeddedCommonRestQueryLength(
+    Buffer.from(templateBody.subarray(0, zlibOffset - 8)),
+    Buffer.byteLength(templateQuery, "utf8"),
+    Buffer.byteLength(nextQuery, "utf8")
+  );
+
+  const apiName = findTrailingLengthPrefixedAscii(prefix);
+  if (apiName) {
+    prefix = patchPrefixPayloadLength(prefix, apiName, templateCompressedLength, compressed.length);
+  }
+
   const body = Buffer.concat([
     replaceRouteBytes(
-      patchEmbeddedCommonRestQueryLength(prefix, Buffer.byteLength(templateQuery, "utf8"), Buffer.byteLength(nextQuery, "utf8")),
+      prefix,
       input.route
     ),
     u32be(Buffer.byteLength(nextQuery, "utf8")),
@@ -2190,18 +2967,117 @@ function buildRequestFrame(input: {
   return encodeFrame(input.session, input.status, body);
 }
 
+function patchPrefixPayloadLength(prefix: Buffer, apiName: string, oldCompressedLength: number, newCompressedLength: number) {
+  if (apiName !== "registerCommon" && apiName !== "activateCommon") {
+    return prefix;
+  }
+  const apiBytes = Buffer.from(apiName, "utf8");
+  const apiIndex = prefix.indexOf(apiBytes);
+  if (apiIndex < 8) {
+    return prefix;
+  }
+
+  const apiLengthOffset = apiIndex - 4;
+  if (prefix.readUInt32BE(apiLengthOffset) !== apiBytes.length) {
+    return prefix;
+  }
+
+  let lengthOffset = -1;
+  if (apiIndex >= 13 && prefix[apiIndex - 5] === 0x32 && prefix.readUInt32BE(apiIndex - 9) === 1) {
+    lengthOffset = apiIndex - 13;
+  } else if (apiIndex >= 12 && prefix.readUInt32BE(apiIndex - 8) === 0) {
+    lengthOffset = apiIndex - 12;
+  }
+
+  if (lengthOffset >= 0) {
+    const oldLength = prefix.readUInt32BE(lengthOffset);
+    const newLength = oldLength + (newCompressedLength - oldCompressedLength);
+    const patched = Buffer.from(prefix);
+    patched.writeUInt32BE(newLength, lengthOffset);
+    return patched;
+  }
+
+  return prefix;
+}
+
 function buildTemplateSendFrame(input: {
   template: Buffer;
   session: Buffer;
   route?: Buffer;
   status: number;
+  preserveRawPayload?: boolean;
   params: DirectTemplateParams;
 }) {
+  if (input.preserveRawPayload) {
+    const { body } = getDirectTemplateBody(input.template);
+    return encodeFrame(input.session, input.status, replaceRouteBytes(body, input.route));
+  }
   try {
     return buildRequestFrame(input);
   } catch {
     const { body } = getDirectTemplateBody(input.template);
     return encodeFrame(input.session, input.status, patchLengthPrefixedTemplateFields(replaceRouteBytes(body, input.route), input.params));
+  }
+}
+
+function templateQueryParam(template: Buffer, key: string) {
+  try {
+    const { body } = getDirectTemplateBody(template);
+    const zlibOffset = findZlibOffset(body);
+    if (zlibOffset < 0) {
+      return null;
+    }
+    const query = zlib.inflateSync(body.subarray(zlibOffset)).toString("utf8");
+    return new URLSearchParams(query).get(key);
+  } catch {
+    return null;
+  }
+}
+
+function buildConfiguredActivationParamSet(label: string, templateParams: DirectTemplateParams, extraParams: DirectTemplateParams) {
+  const params = {
+    ...templateParams,
+    ...extraParams
+  };
+  const preserveCapturedEnvelope = params.__preserveCapturedEnvelope === true || params.__preserveCapturedEnvelope === "true";
+  const preserveCapturedDeviceEnvelope =
+    params.__preserveCapturedDeviceEnvelope === true || params.__preserveCapturedDeviceEnvelope === "true";
+  delete params.__preserveCapturedEnvelope;
+  delete params.__preserveCapturedDeviceEnvelope;
+  if (preserveCapturedEnvelope || preserveCapturedDeviceEnvelope) {
+    delete params.deviceId;
+    delete params.deviceID;
+    delete params.email;
+    delete params.Email;
+    delete params.clientInfo;
+    if (preserveCapturedEnvelope) {
+      delete params.json;
+    }
+    for (const key of Object.keys(params)) {
+      const normalizedKey = key.toLowerCase();
+      if (
+        normalizedKey.startsWith("clientinfo.") ||
+        normalizedKey.startsWith("clientinfo_") ||
+        (preserveCapturedEnvelope && (normalizedKey.startsWith("json.") || normalizedKey.startsWith("json_")))
+      ) {
+        delete params[key];
+      }
+    }
+  }
+  return params;
+}
+
+function dumpDirectDebugFrame(label: string, frame: Buffer) {
+  const dir = process.env.DT_DIRECT_DEBUG_DUMP_DIR?.trim();
+  if (!dir) {
+    return;
+  }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const safeLabel = label.replace(/[^a-z0-9_.-]+/gi, "_");
+    fs.writeFileSync(`${dir}/${Date.now()}-${safeLabel}.bin`, frame);
+  } catch {
+    // Debug-only best effort.
   }
 }
 
@@ -2256,6 +3132,21 @@ function replaceCommonRestApiName(prefix: Buffer, apiName: string) {
     throw new Error("Common REST API name length prefix is invalid");
   }
   return Buffer.concat([prefix.subarray(0, lengthOffset), u32be(targetBytes.length), targetBytes, prefix.subarray(index + sourceBytes.length)]);
+}
+
+function findTrailingLengthPrefixedAscii(prefix: Buffer) {
+  for (let index = prefix.length - 1; index >= 4; index -= 1) {
+    const lengthOffset = index - 4;
+    const length = prefix.readUInt32BE(lengthOffset);
+    if (length <= 0 || length > 128 || index + length > prefix.length) {
+      continue;
+    }
+    const value = prefix.subarray(index, index + length).toString("utf8");
+    if (/^[A-Za-z0-9_./-]+$/.test(value)) {
+      return value;
+    }
+  }
+  return null;
 }
 
 function patchEmbeddedCommonRestPayloadLength(prefix: Buffer, apiName: string, compressedLength: number) {
@@ -2340,8 +3231,8 @@ function buildLoginInitPacket(input: {
     wSite: routeParams.wSite,
     dwHost: routeParams.dwHost,
     xip: routeParams.xip,
-    appId: resolveDirectAccountAppId(deviceId),
-    apkCertificateSign: resolveDirectAccountApkCertificateSign(deviceId, input.runtime.apkCertificateSign)
+    appId: resolveDirectAccountAppId(input.account),
+    apkCertificateSign: resolveDirectAccountApkCertificateSign(input.account, input.runtime.apkCertificateSign)
   });
   const configRequest = buildRequestFrame({
     template: configFrame,
@@ -2409,12 +3300,18 @@ function buildLoginInitBody(
     apkCertificateSign: params.apkCertificateSign
   });
   const nextQueryBytes = Buffer.from(nextQuery, "utf8");
-  return Buffer.concat([
+  const finalBody = Buffer.concat([
     body.subarray(0, queryLengthOffset),
     u32be(nextQueryBytes.length),
     nextQueryBytes,
     body.subarray(queryEnd)
   ]);
+
+  // Patch: update the sub-payload length prefix at offset 85
+  const subPayloadLength = finalBody.length - 89;
+  finalBody.writeUInt32BE(subPayloadLength, 85);
+
+  return finalBody;
 }
 
 function splitTemplateFrames(buffer: Buffer) {
@@ -2578,6 +3475,8 @@ function patchQuery(templateQuery: string, params: DirectTemplateParams) {
     replacements.set(key.toLowerCase(), String(value));
   }
 
+  const appendKeys = parseAppendQueryKeys(params.__appendQueryKeys);
+  const seenKeys = new Set<string>();
   const output: string[] = [];
   for (const entry of entries) {
     if (!entry.includes("=")) {
@@ -2586,14 +3485,75 @@ function patchQuery(templateQuery: string, params: DirectTemplateParams) {
     }
     const [key = "", ...rest] = entry.split("=");
     const value = rest.join("=");
-    const replacement = replacements.get(key.toLowerCase());
+    const normalizedKey = key.toLowerCase();
+    seenKeys.add(normalizedKey);
+    const replacement = replacements.get(normalizedKey);
     if (replacement === undefined) {
-      output.push(`${key}=${value}`);
+      output.push(`${key}=${patchNestedJsonQueryEntry(key, value, replacements)}`);
       continue;
     }
     output.push(`${key}=${encodeURIComponent(replacement)}`);
   }
+
+  for (const key of appendKeys) {
+    const normalizedKey = key.toLowerCase();
+    if (seenKeys.has(normalizedKey)) {
+      continue;
+    }
+    const replacement = replacements.get(normalizedKey);
+    if (replacement !== undefined) {
+      output.push(`${key}=${encodeURIComponent(replacement)}`);
+    }
+  }
+
   return output.join("&");
+}
+
+function parseAppendQueryKeys(value: unknown) {
+  const raw = stringifyPrimitive(value);
+  if (!raw) {
+    return [];
+  }
+  return raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function patchNestedJsonQueryEntry(key: string, value: string, replacements: Map<string, string>) {
+  const parsed = parseEncodedJsonObject(value);
+  if (!parsed) {
+    return value;
+  }
+  let changed = false;
+  const normalizedKey = key.toLowerCase();
+  for (const [replacementKey, replacementValue] of replacements.entries()) {
+    const dotPrefix = `${normalizedKey}.`;
+    const underscorePrefix = `${normalizedKey}_`;
+    let childKey: string | null = null;
+    if (replacementKey.startsWith(dotPrefix)) {
+      childKey = replacementKey.slice(dotPrefix.length);
+    } else if (replacementKey.startsWith(underscorePrefix)) {
+      childKey = replacementKey.slice(underscorePrefix.length);
+    }
+    if (!childKey) {
+      continue;
+    }
+    const existingKey = Object.keys(parsed).find((candidate) => candidate.toLowerCase() === childKey);
+    parsed[existingKey ?? childKey] = coerceNestedJsonReplacement(parsed[existingKey ?? childKey], replacementValue);
+    changed = true;
+  }
+  return changed ? encodeURIComponent(JSON.stringify(parsed)) : value;
+}
+
+function coerceNestedJsonReplacement(previous: unknown, value: string) {
+  if (typeof previous === "number" && /^-?\d+(?:\.\d+)?$/.test(value)) {
+    return Number(value);
+  }
+  if (typeof previous === "boolean" && /^(true|false)$/i.test(value)) {
+    return value.toLowerCase() === "true";
+  }
+  return value;
 }
 
 function patchLoginBootstrapQuery(templateQuery: string, params: DirectTemplateParams) {
@@ -2640,7 +3600,7 @@ function parseEncodedJsonObject(value: string) {
 }
 
 function buildRequestPrivateNumberQuery(
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
   runtime: DirectRuntimeConfig,
   requestConfig: PrivatePhoneRequestConfig,
   trackCode: string,
@@ -2682,7 +3642,7 @@ function buildRequestPrivateNumberQuery(
       queryPair("TrackCode", trackCode),
       queryPair("clientVersion", runtime.appVersion),
       queryPair("appVersion", runtime.appVersion),
-      queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(accountDeviceId(account), runtime.apkCertificateSign)),
+      queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
       queryPair("userId", account.dtUserId),
       queryPair("token", account.token)
     );
@@ -2693,7 +3653,7 @@ function buildRequestPrivateNumberQuery(
 }
 
 function buildGetNumberCountriesQuery(
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
   runtime: DirectRuntimeConfig,
   trackCode: string
 ) {
@@ -2702,14 +3662,110 @@ function buildGetNumberCountriesQuery(
     queryPair("TrackCode", trackCode),
     queryPair("apiVersion", 2),
     queryPair("appVersion", runtime.appVersion),
-    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(accountDeviceId(account), runtime.apkCertificateSign)),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
+    queryPair("userId", account.dtUserId),
+    queryPair("token", account.token)
+  ].join("&");
+}
+
+function buildGetBalanceQuery(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  trackCode: string
+) {
+  const deviceId = accountDeviceId(account);
+  return [
+    queryPair("deviceId", deviceId),
+    queryPair("TrackCode", trackCode),
+    queryPair("clientVersion", runtime.appVersion),
+    queryPair("appVersion", runtime.appVersion),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
+    queryPair("userId", account.dtUserId),
+    queryPair("token", account.token)
+  ].join("&");
+}
+
+function buildGetBalanceQueryAttempts(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  nextTrackCode: () => string
+) {
+  const deviceId = accountDeviceId(account);
+  const appObserved = () => [
+    queryPair("deviceId", deviceId),
+    queryPair("TrackCode", nextTrackCode()),
+    "",
+    queryPair("appVersion", runtime.appVersion),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
+    queryPair("userId", account.dtUserId),
+    queryPair("token", account.token)
+  ].join("&");
+  const appSigned = [
+    queryPair("token", account.token),
+    queryPair("deviceId", deviceId),
+    queryPair("userId", account.dtUserId),
+    queryPair("clientVersion", runtime.appVersion),
+    queryPair("appVersion", runtime.appVersion),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign))
+  ].join("&");
+  const tracked = () => buildGetBalanceQuery(account, runtime, nextTrackCode());
+  return [
+    appObserved(),
+    tracked(),
+    appSigned,
+    `${appObserved()}&${queryPair("commandTag", 1)}`,
+    `${tracked()}&${queryPair("commandTag", 1)}`,
+    `${appSigned}&${queryPair("commandTag", 1)}`
+  ];
+}
+
+function buildGetPrivateNumberListQueryAttempts(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  nextTrackCode: () => string
+) {
+  const base = () => buildGetPrivateNumberListQuery(account, runtime, nextTrackCode());
+  const deviceId = accountDeviceId(account);
+  const tokenFirst = [
+    queryPair("token", account.token),
+    queryPair("deviceId", deviceId),
+    queryPair("userId", account.dtUserId),
+    queryPair("clientVersion", runtime.appVersion),
+    queryPair("appVersion", runtime.appVersion),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign))
+  ].join("&");
+  const retry = () => `${base()}&${queryPair("commandTag", 1)}`;
+  return [
+    base(),
+    tokenFirst,
+    `${tokenFirst}&${queryPair("commandTag", 1)}`,
+    retry(),
+    retry(),
+    retry(),
+    `${base()}&${queryPair("requestFrom", 1)}&${queryPair("commandTag", 1)}`,
+    `${base()}&${queryPair("from", 1)}&${queryPair("commandTag", 1)}`
+  ];
+}
+
+function buildGetPrivateNumberListQuery(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  trackCode: string
+) {
+  const deviceId = accountDeviceId(account);
+  return [
+    queryPair("deviceId", deviceId),
+    queryPair("TrackCode", trackCode),
+    queryPair("clientVersion", runtime.appVersion),
+    queryPair("appVersion", runtime.appVersion),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
     queryPair("userId", account.dtUserId),
     queryPair("token", account.token)
   ].join("&");
 }
 
 function buildGlbUserPropertiesQuery(
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
   runtime: DirectRuntimeConfig,
   trackCode: string
 ) {
@@ -2722,14 +3778,14 @@ function buildGlbUserPropertiesQuery(
     queryPair("property", "inviteGroup_1"),
     queryPair("type", 1),
     queryPair("appVersion", runtime.appVersion),
-    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(deviceId, runtime.apkCertificateSign)),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
     queryPair("userId", account.dtUserId),
     queryPair("token", account.token)
   ].join("&");
 }
 
 function buildGwebInfoBusQuery(
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
   runtime: DirectRuntimeConfig,
   trackCode: string
 ) {
@@ -2738,27 +3794,141 @@ function buildGwebInfoBusQuery(
     queryPair("deviceId", deviceId),
     queryPair("TrackCode", trackCode),
     "",
-    queryPair("appId", resolveDirectGwebAppId(deviceId)),
+    queryPair("appId", resolveDirectGwebAppId(account)),
     queryPair("storeID", 2),
     queryPair("countryCode", 86),
     queryPair("clientVersion", runtime.appVersion),
     queryPair("isoCC", "CN"),
     queryPair("appVersion", runtime.appVersion),
-    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(deviceId, runtime.apkCertificateSign)),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
     queryPair("userId", account.dtUserId),
     queryPair("token", account.token)
   ].join("&");
 }
 
-function resolveDirectGwebAppId(deviceId: string) {
-  return isTalkUDeviceId(deviceId) ? "TU" : "DT";
+function resolveDirectGwebAppId(identity: string | DirectAccountIdentity) {
+  return isTalkUIdentity(identity) ? "TU" : "DT";
+}
+
+function buildPointSummaryQuery(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  trackCode: string,
+  appId: string | number = resolvePointProductId(account.appVariant)
+) {
+  const deviceId = accountDeviceId(account);
+  return [
+    queryPair("deviceId", deviceId),
+    queryPair("TrackCode", trackCode),
+    queryPair("appId", appId),
+    queryPair("appVersion", runtime.appVersion),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
+    queryPair("userId", account.dtUserId),
+    queryPair("token", account.token)
+  ].join("&");
+}
+
+function buildPointSummaryQueryAttempts(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  nextTrackCode: () => string
+) {
+  const pointAppId = resolvePointProductId(account.appVariant);
+  const gameAppId = account.appVariant === "dingdong" ? 66 : 67;
+  const webAppId = resolveDirectGwebAppId(account);
+  return uniqueStrings([
+    buildPointSummaryQuery(account, runtime, nextTrackCode(), pointAppId),
+    buildPointSummaryQuery(account, runtime, nextTrackCode(), gameAppId),
+    buildPointSummaryQuery(account, runtime, nextTrackCode(), webAppId),
+    buildPointSummaryQuery(account, runtime, nextTrackCode(), appIdForVariant(account.appVariant))
+  ]);
+}
+
+function buildPointGradeInfoQuery(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  trackCode: string,
+  uid: string
+) {
+  const deviceId = accountDeviceId(account);
+  return [
+    queryPair("deviceId", deviceId),
+    queryPair("TrackCode", trackCode),
+    queryPair("uid", uid),
+    queryPair("appVersion", runtime.appVersion),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
+    queryPair("userId", account.dtUserId),
+    queryPair("token", account.token)
+  ].join("&");
+}
+
+function buildBillingProductsQuery(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  trackCode: string,
+  options: { appId?: string; bid?: string; requireGP?: 0 | 1; includeClientInfo?: boolean } = {}
+) {
+  const deviceId = accountDeviceId(account);
+  const appId = options.appId ?? appIdForVariant(account.appVariant);
+  const bid = options.bid ?? appId;
+  const parts = [
+    queryPair("deviceId", deviceId),
+    queryPair("TrackCode", trackCode),
+    queryPair("appId", appId),
+    queryPair("bid", bid),
+    queryPair("storeType", 2),
+    queryPair("productTypes", "1,120"),
+    queryPair("isoCountryCode", "CN"),
+    queryPair("appVersion", runtime.appVersion),
+    queryPair("requireGP", options.requireGP ?? 1),
+    ...(options.includeClientInfo ? [queryPair("c", buildBillingClientInfo(account, runtime))] : []),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
+    queryPair("userId", account.dtUserId),
+    queryPair("token", account.token)
+  ];
+  return parts.join("&");
+}
+
+function buildBillingProductsQueryAttempts(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  nextTrackCode: () => string
+) {
+  return uniqueStrings([
+    buildBillingProductsQuery(account, runtime, nextTrackCode(), {
+      appId: "me.dingtone.im",
+      bid: "me.talktone.im",
+      requireGP: 0,
+      includeClientInfo: true
+    }),
+    buildBillingProductsQuery(account, runtime, nextTrackCode(), {
+      requireGP: 1
+    })
+  ]);
+}
+
+function buildBillingClientInfo(
+  account: { dtUserId: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig
+) {
+  return JSON.stringify({
+    os: "android",
+    appVersion: runtime.appVersion,
+    appId: appIdForVariant(account.appVariant),
+    deviceId: accountDeviceId(account),
+    userId: account.dtUserId
+  });
+}
+
+function resolvePointProductId(appVariant?: "dingtone" | "dingdong") {
+  return appVariant === "dingdong" ? 0 : 3;
 }
 
 function buildRequestPrivateNumberQueryAttempts(
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
   runtime: DirectRuntimeConfig,
   requestConfig: PrivatePhoneRequestConfig,
-  trackCode: string,
+  nextTrackCode: () => string,
   requestedAreaCode?: number | null
 ) {
   const areaCodes = resolvePreviewAreaCodeAttempts(requestConfig, requestedAreaCode);
@@ -2786,7 +3956,7 @@ function buildRequestPrivateNumberQueryAttempts(
   const seen = new Set<string>();
   for (const areaCode of areaCodes) {
     for (const variant of variants) {
-      const query = buildRequestPrivateNumberQuery(account, runtime, requestConfig, trackCode, {
+      const query = buildRequestPrivateNumberQuery(account, runtime, requestConfig, nextTrackCode(), {
         ...variant,
         areaCode
       });
@@ -3337,7 +4507,7 @@ function resolveIsoCountryCode(countryCode: number) {
 
 function buildRecoverPasswordQuery(kind: "email" | "phone", target: string, countryCode = 1, noCode = 0) {
   return [
-    queryPair("json", buildAccessCodeJson(kind, target, countryCode)),
+    queryPair("json", buildRecoverPasswordJson(kind, target, countryCode)),
     queryPair("type", kind === "email" ? 1 : 2),
     queryPair("noCode", noCode)
   ].join("&");
@@ -3349,6 +4519,515 @@ function buildVerifyAccessCodeQuery(kind: "email" | "phone", target: string, cou
     queryPair("type", kind === "email" ? 1 : 2),
     queryPair("accessCode", String(accessCode).trim())
   ].join("&");
+}
+
+function buildCheckActivatedUserQueries(kind: "email" | "phone", target: string, countryCode = 1, trackCode: string) {
+  const normalizedTarget = kind === "email" ? target.trim() : stripPhonePrefix(target);
+  const condition =
+    kind === "email"
+      ? {
+          Type: 1,
+          SearchWord: nativeActivationEmailMd5(normalizedTarget.toLowerCase()),
+          RawEmailMD5: nativeActivationEmailMd5(normalizedTarget)
+        }
+      : {
+          Type: 2,
+          SearchWord: md5Hex(normalizedTarget),
+          word: normalizedTarget
+        };
+  const json = JSON.stringify({ Condition: [condition] });
+  const commonRestEncoderQuery = [
+    queryPair("json", json),
+    queryPair("TrackCode", trackCode)
+  ].join("&");
+  const nativeRestShapeQuery = [
+    queryPair("jsonCondition", JSON.stringify({ Condition: [condition] })),
+    queryPair("countryCode", kind === "phone" ? countryCode : 0),
+    queryPair("areaCode", 0),
+    queryPair("TrackCode", trackCode)
+  ].join("&");
+  return [
+    commonRestEncoderQuery,
+    `&${commonRestEncoderQuery}`,
+    nativeRestShapeQuery
+  ];
+}
+
+export async function callDirectActivationApi(runtime: DirectRuntimeConfig, identity: DirectActivationIdentity, label: string, apiName: string, query: string) {
+  const apiRuntime = directActivationRuntimeForApi(runtime, apiName, identity);
+  let lastError: unknown;
+  for (const host of directActivationHostCandidates(apiRuntime, identity)) {
+    const session = new DirectSession(apiRuntime, host);
+    try {
+      await session.openActivation(identity);
+      if (apiName === "checkActivatedUser") {
+        return await session.callCommonRestJson(label, "checkActivatedUser", query);
+      }
+      if (apiName === "registerEmail") {
+        return await session.callConfiguredRegisterEmailTemplate(
+          label,
+          activationDeviceId(identity),
+          buildRegisterEmailTemplateParams(query),
+          activationTemplateSettingKeys("registerEmail", identity)
+        );
+      }
+      const isDingtoneEmailActivation = apiName === "activateEmail" && typeof identity !== "string" && identity.appVariant === "dingtone";
+      return await session.callConfiguredActivationTemplate(
+        activationTemplateSettingKeys(apiName, identity),
+        label,
+        activationDeviceId(identity),
+        isDingtoneEmailActivation
+          ? buildActivationTemplateParamsPreservingCapturedEmailProof(query)
+          : buildActivationTemplateParams(query),
+        isDingtoneEmailActivation ? query : undefined
+      );
+    } catch (error) {
+      logger.warn("Direct activation API call failed", {
+        label,
+        apiName,
+        host,
+        port: apiRuntime.port,
+        useTls: apiRuntime.useTls,
+        error: error instanceof Error ? error.message : String(error),
+        trace: session.getTrace().slice(-6).map((frame) => ({
+          frameType: frame.frameType,
+          status: frame.status,
+          routeHex: frame.routeHex,
+          bodyLength: frame.bodyLength,
+          bodyHexPreview: frame.bodyHexPreview.slice(0, 160),
+          jsonPayload: summarizeJsonPayload(frame.jsonPayload)
+        }))
+      });
+      lastError = error;
+      if (isFatalDirectSessionError(error)) {
+        throw error;
+      }
+    } finally {
+      await session.close().catch(() => undefined);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new AppError(`Direct ${label} failed`, 502, 502);
+}
+
+async function callDirectRegisterEmail(runtime: DirectRuntimeConfig, input: DingtoneLoginInput, email: string) {
+  let lastPayload: ApiResult | null = null;
+  let lastError: unknown;
+  for (const [index, query] of buildRegisterEmailQueryAttempts(input, runtime, email).entries()) {
+    try {
+      const payload = await callDirectActivationApi(
+        runtime,
+        { appVariant: input.appVariant, deviceId: input.deviceId },
+        index === 0 ? "registerEmail" : `registerEmail#${index + 1}`,
+        "registerEmail",
+        query
+      );
+      lastPayload = payload;
+      assertDirectActivationOk(payload, "registerEmail");
+      return payload;
+    } catch (error) {
+      lastError = error;
+      logger.warn(`Direct registerEmail attempt ${index + 1} failed; trying next app identity if available`, {
+        error: error instanceof Error ? error.message : String(error),
+        payload: lastPayload ? redactSensitiveText(safeJsonStringify(lastPayload)) : null
+      });
+    }
+  }
+  if (lastError instanceof Error && /REST call failed/i.test(lastError.message)) {
+    const appName = input.appVariant === "dingdong" ? "Dingdong" : "TalkU";
+    const otherAppName = input.appVariant === "dingdong" ? "TalkU" : "Dingdong";
+    throw new AppError(lastError.message + "; current local account type is " + appName + "; if this email belongs to " + otherAppName + ", switch/recreate the account with the correct app type and send a fresh code.", 400, 400);
+  }
+  throw lastError instanceof Error ? lastError : new AppError("Direct registerEmail failed", 400, 400);
+}
+
+function directActivationRuntimeForApi(
+  runtime: DirectRuntimeConfig,
+  apiName: string,
+  identity: DirectActivationIdentity
+): DirectRuntimeConfig {
+  if (apiName !== "registerEmail") {
+    return runtime;
+  }
+  return {
+    ...runtime,
+    port: runtime.registerEmailPort,
+    useTls: runtime.registerEmailUseTls
+  };
+}
+
+function directActivationHostCandidates(runtime: DirectRuntimeConfig, identity: DirectActivationIdentity) {
+  if (typeof identity !== "string" && identity.appVariant === "dingtone") {
+    return uniqueStrings([runtime.backupHost, runtime.primaryHost]);
+  }
+  return uniqueStrings([runtime.primaryHost, runtime.backupHost]);
+}
+
+function activationDeviceId(identity: DirectActivationIdentity) {
+  if (typeof identity === "string") {
+    return identity;
+  }
+  return identity.deviceId ?? "";
+}
+
+function activationRestDeviceId(value: string, appVariant?: "dingtone" | "dingdong" | string | null) {
+  return normalizeActivationDeviceIdForVariant(value, appVariant);
+}
+
+function activationTemplateSettingKeys(apiName: string, identity?: DirectActivationIdentity): DirectActivationTemplateSettingKey[] {
+  const baseKey = activationTemplateBaseSettingKey(apiName);
+  const variantKey = activationTemplateVariantSettingKey(baseKey, identity);
+  if (variantKey && (apiName === "registerEmail" || apiName === "activateEmail")) {
+    return [variantKey];
+  }
+  return variantKey ? [variantKey, baseKey] : [baseKey];
+}
+
+function activationTemplateBaseSettingKey(apiName: string): DirectActivationTemplateSettingKey {
+  if (apiName === "checkActivatedUser") {
+    return "dt_direct_template_check_activated_user";
+  }
+  if (apiName === "activateEmail") {
+    return "dt_direct_template_activate_email";
+  }
+  return "dt_direct_template_register_email";
+}
+
+function activationTemplateVariantSettingKey(
+  baseKey: DirectActivationTemplateSettingKey,
+  identity?: DirectActivationIdentity
+): DirectActivationTemplateSettingKey | null {
+  if (typeof identity === "string" || !identity?.appVariant) {
+    return null;
+  }
+  const suffix = identity.appVariant === "dingdong" ? "dingdong" : "talku";
+  return `${baseKey}_${suffix}` as DirectActivationTemplateSettingKey;
+}
+
+function buildActivationTemplateParams(query: string): DirectTemplateParams {
+  return queryToDirectTemplateParams(query);
+}
+
+function buildActivationTemplateParamsPreservingCapturedEmailProof(query: string): DirectTemplateParams {
+  return {
+    ...queryToDirectTemplateParams(query),
+    __preserveCapturedEnvelope: true
+  };
+}
+
+function buildRegisterEmailTemplateParams(query: string): DirectTemplateParams {
+  return {
+    ...queryToDirectTemplateParams(query),
+    __appendQueryKeys: "appType,appId"
+  };
+}
+
+function queryToDirectTemplateParams(query: string): DirectTemplateParams {
+  const params: DirectTemplateParams = {};
+  const normalizedQuery = query.startsWith("&") ? query.slice(1) : query;
+  for (const [key, value] of new URLSearchParams(normalizedQuery).entries()) {
+    params[key] = value;
+    if (key === "deviceId") {
+      params.deviceID = value;
+    }
+  }
+  return params;
+}
+
+function isPreserveCapturedEnvelope(params: DirectTemplateParams) {
+  return params.__preserveCapturedEnvelope === true || params.__preserveCapturedEnvelope === "true";
+}
+
+function normalizeTemplateString(value: unknown) {
+  const normalized = stringifyPrimitive(value);
+  return normalized && normalized.trim() ? normalized : undefined;
+}
+
+export function buildRegisterEmailTemplateParamsForTest(query: string): DirectTemplateParams {
+  return buildRegisterEmailTemplateParams(query);
+}
+
+export function patchQueryForTest(templateQuery: string, params: DirectTemplateParams) {
+  return patchQuery(templateQuery, params);
+}
+function buildRegisterEmailQueryAttempts(input: DingtoneLoginInput, runtime: DirectRuntimeConfig, email: string) {
+  return registerEmailIdentityAttemptsForVariant(input.appVariant).map((options) => buildRegisterEmailQuery(input, runtime, email, options));
+}
+
+export function registerEmailIdentityAttemptsForVariant(appVariant?: 'dingtone' | 'dingdong') {
+  if (appVariant === 'dingdong') {
+    return [
+      { appType: 3, appId: DINGTONE_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
+      { appType: 3, appId: DINGTONE_BUSINESS_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
+      { appType: 2, appId: DINGTONE_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
+      { appType: 2, appId: DINGTONE_BUSINESS_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
+      { appType: undefined, appId: DINGTONE_APP_ID, clientInfoAppId: DINGTONE_APP_ID, includeTopLevelAppId: false },
+      { appType: undefined, appId: DINGTONE_BUSINESS_APP_ID, clientInfoAppId: DINGTONE_APP_ID, includeTopLevelAppId: false }
+    ];
+  }
+  return [
+    { appType: 2, appId: TALKU_APP_ID, clientInfoAppId: TALKU_APP_ID },
+    { appType: 3, appId: TALKU_APP_ID, clientInfoAppId: TALKU_APP_ID },
+    { appType: 3, appId: DINGTONE_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
+    { appType: 3, appId: DINGTONE_BUSINESS_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
+    { appType: undefined, appId: TALKU_APP_ID, clientInfoAppId: TALKU_APP_ID, includeTopLevelAppId: false }
+  ];
+}
+
+function buildRegisterEmailQuery(
+  input: DingtoneLoginInput,
+  runtime: DirectRuntimeConfig,
+  email: string,
+  options: { appType?: number; appId: string; clientInfoAppId: string; includeTopLevelAppId?: boolean }
+) {
+  const deviceId = activationRestDeviceId(input.deviceId, input.appVariant);
+  return compactQueryPairs([
+    queryPair("deviceId", deviceId),
+    options.appType === undefined ? undefined : queryPair("appType", options.appType),
+    options.includeTopLevelAppId === false ? undefined : queryPair("appId", options.appId),
+    queryPair("apiVersion", 2),
+    queryPair("countryCode", 86),
+    queryPair("osType", 2),
+    queryPair("deviceModel", "PCRT00"),
+    queryPair("deviceName", "OPPO"),
+    queryPair("activeLanguageId", 1),
+    queryPair("reaskActiveCode", 0),
+    queryPair("deviceOSVer", "9"),
+    queryPair("showAccessCode", 1),
+    queryPair("simCC", "CN"),
+    queryPair("isRooted", 1),
+    queryPair("isSimulator", "false"),
+    queryPair("TrackCode", input.trackCode),
+    queryPair("json", buildRegisterEmailJson(email)),
+    queryPair("clientInfo", buildActivationClientInfo(input, runtime, { appId: options.clientInfoAppId }))
+  ]);
+}
+
+function buildCheckActivatedEmailQuery(email: string, trackCode: string) {
+  const condition = {
+    Type: 1,
+    SearchWord: nativeActivationEmailMd5(email.toLowerCase()),
+    RawEmailMD5: nativeActivationEmailMd5(email)
+  };
+  const json = JSON.stringify({ Condition: [condition] });
+  return [
+    queryPair("json", json),
+    queryPair("jsonCondition", json),
+    queryPair("countryCode", 0),
+    queryPair("areaCode", 0),
+    queryPair("TrackCode", trackCode)
+  ].join("&");
+}
+
+function buildActivateEmailQuery(input: DingtoneLoginInput, runtime: DirectRuntimeConfig, email: string, code: string) {
+  const deviceId = activationRestDeviceId(input.deviceId, input.appVariant);
+  const query = [
+    queryPair("deviceId", deviceId),
+    queryPair("confirmCode", code),
+    queryPair("osType", 2),
+    queryPair("osVersion", "9"),
+    queryPair("deviceName", "OPPO"),
+    queryPair("deviceModel", "PCRT00"),
+    queryPair("devicepassword", ""),
+    queryPair("tokenVersion", 50331648),
+    queryPair("TrackCode", input.trackCode),
+    queryPair("apiVersion", 1),
+    queryPair("pushMessageToken", "FCM."),
+    queryPair("LC", "zh"),
+    queryPair("simCC", "CN"),
+    queryPair("simu", 0),
+    queryPair("rooted", 1)
+  ];
+  query.push(
+    queryPair("json", buildActivationEmailJson(email)),
+    queryPair("clientInfo", buildActivationClientInfo(input, runtime))
+  );
+  return query.join("&");
+}
+
+function buildActivationEmailJson(email: string) {
+  const lowerEmail = email.toLowerCase();
+  return JSON.stringify({
+    Email: email,
+    EmailMd5: nativeActivationEmailMd5(lowerEmail),
+    EmailEncrypt: encryptActivationTarget(lowerEmail),
+    RawEmailMD5: nativeActivationEmailMd5(email),
+    ClientVersion: DIRECT_ACTIVATE_EMAIL_CLIENT_VERSION,
+    type: 1
+  });
+}
+
+function buildRegisterEmailJson(email: string) {
+  const lowerEmail = email.toLowerCase();
+  return JSON.stringify({
+    Email: email,
+    EmailMd5: nativeActivationEmailMd5(lowerEmail),
+    EmailEncrypt: encryptActivationTarget(lowerEmail, { extraPaddingBlock: true }),
+    RawEmailMD5: nativeActivationEmailMd5(email),
+    ClientVersion: -1610218751,
+    Language: 1,
+    ShowAccessCode: 1,
+    type: 1
+  });
+}
+
+function buildActivationClientInfo(input: DingtoneLoginInput, runtime: DirectRuntimeConfig, options?: { appId?: string }) {
+  const deviceId = activationRestDeviceId(input.deviceId, input.appVariant);
+  const clientDeviceId = input.appVariant === "dingtone" ? normalizeActivationDeviceIdForVariant(input.deviceId, input.appVariant) : deviceId;
+  const appVersion = resolveDirectAppVersion(input, runtime);
+  return JSON.stringify({
+    deviceOriginalId: "69d4b9d8007bbc7e",
+    advertisingId: "00000000-0000-0000-0000-000000000000",
+    appVersion,
+    timezone: "Asia/Shanghai",
+    tzOffset: "GMT+08:00",
+    simCC: "cn",
+    mac: "F4:51:9B:93:E7:95",
+    imei: "865166026274985",
+    mobileNum: "13200000054",
+    wifiSSid: "frigfb1063",
+    language: "zh",
+    serialNumber: "772499999948",
+    pingTime: "100000;100000",
+    mobileNetworkCarrier: {
+      mcc: 460,
+      mnc: 0,
+      carrierNmae: "China Mobile GSM"
+    },
+    isoCountryCode: "CN",
+    isSimulator: 0,
+    rooted: 1,
+    connectedV: 0,
+    hasV: 0,
+    appId: options?.appId ?? appIdForVariant(input.appVariant),
+    deviceId: clientDeviceId,
+    platform: "Android",
+    manufacture: "OPPO",
+    osVersion: "9",
+    deviceOSVer: "9",
+    deviceOSVersion: "9",
+    deviceModel: "PCRT00",
+    clientTime: Date.now(),
+    ipv4: "192.168.232.2",
+    signMd5: appVariantSign(input.appVariant, clientDeviceId, runtime.apkCertificateSign)
+  });
+}
+
+function nativeActivationEmailMd5(value: string) {
+  return crypto.createHash("md5")
+    .update(Buffer.from(value, "utf8"))
+    .update(DIRECT_ACTIVATION_EMAIL_CRYPTO_IV)
+    .digest("hex");
+}
+
+function encryptActivationTarget(value: string, options?: { extraPaddingBlock?: boolean }) {
+  const md5 = nativeActivationEmailMd5(value);
+  const key = Buffer.from(md5.slice(0, 16), "utf8").map((byte) => (~byte) & 0xff);
+  const input = Buffer.from(value, "utf8");
+  const aligned = Math.ceil(input.length / 16) * 16;
+  const padLength = options?.extraPaddingBlock ? aligned - input.length + 16 : (16 - (input.length % 16) || 16);
+  const plain = Buffer.concat([input, Buffer.alloc(padLength, padLength & 0xff)]);
+  const cipher = crypto.createCipheriv("aes-128-cbc", key, DIRECT_ACTIVATION_EMAIL_CRYPTO_IV);
+  cipher.setAutoPadding(false);
+  const encrypted = Buffer.concat([cipher.update(plain), cipher.final()]);
+  return Buffer.concat([Buffer.from("v1.", "utf8"), encrypted]).toString("base64");
+}
+
+function normalizeEmailLoginTarget(value: string | null | undefined) {
+  const email = value?.trim();
+  if (!email) {
+    throw new AppError("Email is required for direct email verification login.", 400, 400);
+  }
+  return email;
+}
+
+function normalizeActivationCode(value: string | null | undefined) {
+  const code = value?.trim();
+  if (!code || !/^\d+$/.test(code)) {
+    throw new AppError("Numeric verificationCode is required for direct email verification login.", 400, 400);
+  }
+  return code;
+}
+
+export function normalizeActivationDeviceIdForVariant(value: string, appVariant?: "dingtone" | "dingdong" | string | null) {
+  const trimmed = value.trim();
+  if (appVariant === "dingdong") {
+    return trimmed.replace(/\.dttalk$/i, "");
+  }
+  if (/^And\.[0-9a-f]{32}$/i.test(trimmed)) {
+    return `${trimmed}.dttalk`;
+  }
+  return trimmed;
+}
+
+export function isActivationDeviceIdAcceptedForVariant(value: string, appVariant?: "dingtone" | "dingdong" | string | null) {
+  const trimmed = value.trim();
+  if (appVariant === "dingdong") {
+    return /^And\.[0-9a-f]{32}(?:\.dttalk)?$/i.test(trimmed);
+  }
+  return /^And\.[0-9a-f]{32}\.dttalk$/i.test(trimmed);
+}
+
+function assertActivationDeviceId(value: string, appVariant?: "dingtone" | "dingdong" | string | null) {
+  if (!isActivationDeviceIdAcceptedForVariant(value, appVariant)) {
+    throw new AppError("This verification request uses a stale deviceId. Send a new verification code first so direct mode can bind a fresh random deviceId.", 400, 400);
+  }
+}
+
+function assertDirectActivationOk(payload: ApiResult, action: string) {
+  const result = payload.Result ?? payload.result;
+  const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode;
+  if (result === 0 || (errCode !== undefined && Number(errCode) !== 0)) {
+    const reason = stringifyPrimitive(payload.Reason ?? payload.reason ?? payload.message ?? payload.error);
+    const translated = translateDirectActivationError(errCode);
+    logger.warn("Direct activation API returned an error payload", {
+      action,
+      errCode,
+      result,
+      reason: reason ? redactSensitiveText(reason) : null,
+      payload: redactSensitiveText(safeJsonStringify(payload))
+    });
+    throw new AppError(
+      `Direct ${action} failed: ${reason ? redactSensitiveText(reason) : translated ?? `server returned ${String(errCode ?? result)}`}`,
+      400,
+      400
+    );
+  }
+}
+
+function isDirectActivationErrorCode(payload: ApiResult, expected: number) {
+  const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode;
+  return Number(errCode) === expected;
+}
+
+function translateDirectActivationError(errCode: unknown) {
+  const code = Number(errCode);
+  if (code === 60095) {
+    return "verification email was requested too frequently; wait for the server cooldown, then send a fresh code";
+  }
+  return null;
+}
+
+function md5Hex(value: string) {
+  return crypto.createHash("md5").update(value, "utf8").digest("hex");
+}
+
+function appIdForVariant(appVariant?: "dingtone" | "dingdong") {
+  return appVariant === "dingdong" ? DINGTONE_APP_ID : TALKU_APP_ID;
+}
+
+function activationBusinessAppIdForVariant(appVariant?: "dingtone" | "dingdong") {
+  return appVariant === "dingdong" ? DINGTONE_BUSINESS_APP_ID : TALKU_APP_ID;
+}
+
+function resolveDirectAppVersion(identity: { appVariant?: "dingtone" | "dingdong" } | undefined, runtime: DirectRuntimeConfig) {
+  return identity?.appVariant === "dingdong" ? runtime.dingdongAppVersion : runtime.appVersion;
+}
+
+function appVariantSign(appVariant: "dingtone" | "dingdong" | undefined, deviceId: string, fallback: string) {
+  if (appVariant === "dingdong") {
+    return fallback;
+  }
+  return resolveDirectAccountApkCertificateSign({ appVariant, deviceId }, fallback);
 }
 
 export function inferAccessCodeCountryCode(target: string) {
@@ -3424,6 +5103,17 @@ function buildAccessCodeJson(kind: "email" | "phone", target: string, countryCod
   );
 }
 
+function buildRecoverPasswordJson(kind: "email" | "phone", target: string, countryCode = 1) {
+  return JSON.stringify(
+    kind === "email"
+      ? { countryCode, email: target }
+      : {
+          countryCode,
+          phoneNumber: stripPhonePrefix(target)
+        }
+  );
+}
+
 function parseQueryParams(query: string) {
   const params: Record<string, string> = {};
   for (const [key, value] of new URLSearchParams(query)) {
@@ -3442,6 +5132,10 @@ function redactAccessCodeTarget(kind: "email" | "phone", target: string) {
 
 function queryPair(key: string, value: string | number | boolean) {
   return `${key}=${encodeURIComponent(String(value)).replace(/%2C/gi, ",")}`;
+}
+
+function compactQueryPairs(pairs: Array<string | undefined>) {
+  return pairs.filter((pair): pair is string => Boolean(pair)).join("&");
 }
 
 function replaceRouteBytes(prefix: Buffer, route?: Buffer) {
@@ -3674,49 +5368,49 @@ function findZlibOffsets(buffer: Buffer) {
 }
 
 const APP_PHONE_COUNTRY_LABELS: Record<string, string> = {
-  US: "美国 +1",
-  CA: "加拿大 +1",
-  GB: "英国 +44",
-  BE: "比利时 +32",
-  NL: "荷兰 +31",
-  RU: "俄罗斯 +7",
-  ES: "西班牙 +34",
-  CN: "中国 +86",
-  AU: "澳大利亚 +61",
-  AT: "奥地利 +43",
-  FR: "法国 +33",
-  SE: "瑞典 +46",
-  MU: "毛里求斯 +230",
-  PL: "波兰 +48",
-  ID: "印度尼西亚 +62",
-  PR: "波多黎各 +1787",
-  CZ: "捷克 +420",
-  MY: "马来西亚 +60",
-  DK: "丹麦 +45",
-  RO: "罗马尼亚 +40"
+  US: "缂囧骸娴?+1",
+  CA: "閸旂姵瀣佹径?+1",
+  GB: "閼诲崬娴?+44",
+  BE: "濮ｆ柨鍩勯弮?+32",
+  NL: "閼藉嘲鍙?+31",
+  RU: "娣囧嫮缍忛弬?+7",
+  ES: "鐟楄法褰悧?+34",
+  CN: "娑擃厼娴?+86",
+  AU: "濠㈠啿銇囬崚鈺€绨?+61",
+  AT: "婵傘儱婀撮崚?+43",
+  FR: "濞夋洖娴?+33",
+  SE: "閻熺偛鍚€ +46",
+  MU: "濮ｆ盯鍣峰Ч鍌涙焿 +230",
+  PL: "濞夈垹鍙?+48",
+  ID: "閸楁澘瀹崇亸鑹般偪娴?+62",
+  PR: "濞夈垹顦挎搴℃倗 +1787",
+  CZ: "閹瑰嘲鍘?+420",
+  MY: "妞诡剚娼电憲澶哥肮 +60",
+  DK: "娑撳綊瀹?+45",
+  RO: "缂冩鈹堢亸闂寸肮 +40"
 };
 
 const APP_PHONE_COUNTRY_DISPLAY_NAMES: Record<string, string> = {
-  US: "美国",
-  CA: "加拿大",
-  GB: "英国",
-  BE: "比利时",
-  NL: "荷兰",
-  RU: "俄罗斯",
-  ES: "西班牙",
-  CN: "中国",
-  AU: "澳大利亚",
-  AT: "奥地利",
-  FR: "法国",
-  SE: "瑞典",
-  MU: "毛里求斯",
-  PL: "波兰",
-  ID: "印度尼西亚",
-  PR: "波多黎各",
-  CZ: "捷克",
-  MY: "马来西亚",
-  DK: "丹麦",
-  RO: "罗马尼亚"
+  US: 'US',
+  CA: 'CA',
+  GB: 'GB',
+  BE: 'BE',
+  NL: 'NL',
+  RU: 'RU',
+  ES: 'ES',
+  CN: 'CN',
+  AU: 'AU',
+  AT: 'AT',
+  FR: 'FR',
+  SE: 'SE',
+  MU: 'MU',
+  PL: 'PL',
+  ID: 'ID',
+  PR: 'PR',
+  CZ: 'CZ',
+  MY: 'MY',
+  DK: 'DK',
+  RO: 'RO'
 };
 
 function staticPhoneCountryOptions(): DingtonePhoneCountryOption[] {
@@ -4471,8 +6165,8 @@ function normalizePhoneNumbers(value: unknown): DingtonePhoneNumber[] {
 function normalizePhoneNumber(value: unknown): DingtonePhoneNumber {
   const record = isRecord(value) ? value : {};
   return {
-    phoneNumber: pickString(record, ["phoneNumber", "phone_number", "number"]) ?? "",
-    countryCode: pickNumber(record, ["countryCode", "country_code"]),
+    phoneNumber: pickString(record, ["phoneNumber", "phone_number", "number", "privateNumber", "private_number", "userNumber", "user_number"]) ?? "",
+    countryCode: pickNumber(record, ["countryCode", "country_code", "cc"]),
     providerId: pickNumber(record, ["providerId", "provider_id"]),
     displayName: pickString(record, ["displayName", "display_name"]) ?? undefined,
     status: normalizePhoneStatus(record),
@@ -4527,24 +6221,122 @@ function normalizePhoneStatus(record: Record<string, unknown>): DingtonePhoneNum
   return "active";
 }
 
+async function collectDirectProfileSnapshot(
+  session: DirectSession,
+  _runtime: DirectRuntimeConfig,
+  _account: { dtUserId: string; token: string; deviceId?: string | null },
+  _shared: DirectTemplateParams,
+  _nextTrackCode: () => string
+) {
+  const profile: Record<string, unknown> = {};
+  profile.bootstrap = session.getBootstrapPayloads();
+  return profile;
+}
+
+async function collectDirectPointSnapshot(
+  session: DirectSession,
+  runtime: DirectRuntimeConfig,
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  nextTrackCode: () => string
+) {
+  const summaryQuery = buildPointSummaryQuery(account, runtime, nextTrackCode(), resolvePointProductId(account.appVariant));
+  const summary = await session.callCommonRestJson("pointSummary", "/point/summary", summaryQuery, DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS).catch((error: unknown) => ({
+    refreshError: error instanceof Error ? error.message : String(error ?? "unknown direct point summary error")
+  }));
+  const summaryRecords = collectNestedRecords(summary);
+  const uid = pickStringFromRecords(summaryRecords, ["uid", "pointUid", "point_uid"]);
+  const gradeInfo = uid
+    ? await session
+        .callCommonRestJson(
+          "pointGradeInfo",
+          "/point/gradeinfo",
+          buildPointGradeInfoQuery(account, runtime, nextTrackCode(), uid),
+          DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS
+        )
+        .catch((error: unknown) => ({
+          refreshError: error instanceof Error ? error.message : String(error ?? "unknown direct point gradeinfo error")
+        }))
+    : null;
+  return { summary, gradeInfo, uid };
+}
+
+async function callFirstCommonRestJson(
+  session: DirectSession,
+  label: string,
+  apiName: string,
+  queries: string[]
+) {
+  let lastError: unknown;
+  for (const [index, query] of queries.entries()) {
+    try {
+      return await session.callCommonRestJson(index === 0 ? label : `${label}#${index + 1}`, apiName, query, DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  return {
+    refreshError: lastError instanceof Error ? lastError.message : String(lastError ?? "unknown direct point request error")
+  };
+}
+
+async function callBestBalanceCommonRestJson(
+  session: DirectSession,
+  label: string,
+  apiName: string,
+  queries: string[]
+) {
+  let firstBalancePayload: ApiResult | null = null;
+  let lastError: unknown;
+
+  for (const [index, query] of queries.entries()) {
+    try {
+      const payload = await session.callCommonRestJson(
+        index === 0 ? label : `${label}#${index + 1}`,
+        apiName,
+        query,
+        DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS
+      );
+      if (hasPositiveBalancePayload(payload)) {
+        return payload;
+      }
+      if (!firstBalancePayload && isBalancePayload(payload)) {
+        firstBalancePayload = payload;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  return (
+    firstBalancePayload ?? {
+      refreshError: lastError instanceof Error ? lastError.message : String(lastError ?? "unknown direct balance request error")
+    }
+  );
+}
+
 function buildSnapshot(input: {
   account: { dtUserId: string; token: string; email?: string | null; phone?: string | null };
   balance: ApiResult;
   userSetting: ApiResult;
   profile: ApiResult;
+  point: ApiResult;
 }): DingtoneSnapshot {
   const balance = collectRecords(input.balance);
   const settings = collectRecords(input.userSetting);
-  const profile = collectRecords(input.profile);
-  const primaryBalance = pickNumberFromRecords(balance, ["primaryBalance", "balance", "primary_balance"]);
+  const profile = collectNestedRecords(input.profile);
+  const point = collectNestedRecords(input.point);
+  const primaryBalance = normalizeDirectPrimaryBalance(balance);
   const raw = {
     balance: input.balance,
     userSetting: input.userSetting,
-    profile: input.profile
+    profile: input.profile,
+    point: input.point
   };
   return {
-    dtDingtoneId: pickStringFromRecords(profile, ["dingtoneId", "dtDingtoneId", "userId"]),
-    fullName: pickStringFromRecords(profile, ["fullName", "full_name", "nickname", "name"]),
+    dtDingtoneId: pickStringFromRecords(profile, ["dingtoneId", "dtDingtoneId", "DingtoneId", "DingtoneID", "publicUserId"]),
+    fullName:
+      pickStringFromRecords(profile, ["fullName", "full_name", "displayName", "DisplayName", "nickname", "nickName"]) ??
+      pickStringFromRecords(point, ["userName", "nickName", "nickname"]),
     avatarUrl: pickStringFromRecords(profile, ["avatarUrl", "avatar_url", "photoUrl"]),
     gender: pickNumberFromRecords(profile, ["gender", "sex"]),
     birthday: pickStringFromRecords(profile, ["birthday", "birthDay"]),
@@ -4554,14 +6346,14 @@ function buildSnapshot(input: {
     feeling: pickStringFromRecords(profile, ["feeling", "mood"]),
     company: pickStringFromRecords(profile, ["company"]),
     school: pickStringFromRecords(profile, ["school"]),
-    country: pickStringFromRecords(profile, ["country", "countryName"]),
-    state: pickStringFromRecords(profile, ["state", "province"]),
-    city: pickStringFromRecords(profile, ["city"]),
+    country: pickStringFromRecords(profile, ["country", "countryName", "IpISOCountryCode", "ipIsoCountryCode", "IpCountryCode"]),
+    state: pickStringFromRecords(profile, ["state", "province", "IpCountryRegion", "ipCountryRegion"]),
+    city: pickStringFromRecords(profile, ["city", "IpCity", "ipCity"]),
     primaryBalance,
-    userGrade: pickNumberFromRecords(balance, ["userGrade", "user_grade", "grade"]),
-    validPoint: pickNumberFromRecords(balance, ["validPoint", "valid_point", "progressPoint"]),
-    progressPoint: pickNumberFromRecords(balance, ["progressPoint", "progress_point"]),
-    progressPointTotal: pickNumberFromRecords(balance, [
+    userGrade: normalizeDirectUserGrade(pickNumberFromRecords([...point, ...balance], ["userGrade", "user_grade", "grade"])),
+    validPoint: normalizeMemberPoint(pickNumberFromRecords([...point, ...balance], ["validPoint", "valid_point"])),
+    progressPoint: normalizeMemberPoint(pickNumberFromRecords([...point, ...balance], ["progessPoint", "progressPoint", "progress_point", "historyPoint"])),
+    progressPointTotal: pickNumberFromRecords([...point, ...balance], [
       "progressPointTotal",
       "progress_point_total",
       "totalProgressPoint",
@@ -4586,6 +6378,90 @@ function buildSnapshot(input: {
     profileVerCode: pickStringFromRecords(settings, ["userSettingVerId", "profileVerCode", "profile_ver_code"]),
     rawJson: safeJsonStringify(raw)
   };
+}
+
+function extractActivatedEmailUser(payload: ApiResult) {
+  const records = collectNestedRecords(payload);
+  const dtUserId = pickStringFromRecords(records, ["UserId", "userId", "UserID", "uid", "dtUserId", "dt_user_id"]);
+  const dingtoneId = pickStringFromRecords(records, ["DingtoneId", "DingtoneID", "dingtoneId", "dtDingtoneId"]);
+  if (!dtUserId && !dingtoneId) {
+    return null;
+  }
+  return { dtUserId, dingtoneId };
+}
+
+function extractActivationDeviceId(payload: ApiResult) {
+  const records = collectNestedRecords(payload);
+  const direct = pickStringFromRecords(records, ["deviceId", "deviceID", "DeviceId", "DeviceID"]);
+  if (direct) {
+    return direct;
+  }
+  for (const record of records) {
+    const raw = pickString(record, ["CreditInterceptionKey", "creditInterceptionKey", "credit_interception_key"]);
+    if (!raw) {
+      continue;
+    }
+    const parsed = parseJsonRecord(raw);
+    const deviceId = parsed ? pickString(parsed, ["deviceId", "deviceID", "DeviceId", "DeviceID"]) : null;
+    if (deviceId) {
+      return deviceId;
+    }
+  }
+  return null;
+}
+
+async function extractConfiguredActivationTemplateDeviceId(
+  settingKey: DirectActivationTemplateSettingKey | DirectActivationTemplateSettingKey[],
+  confirmCode: string
+) {
+  const configured = await getConfiguredDirectTemplateFromKeys(settingKey);
+  const template = configured?.template ?? null;
+  if (!template) {
+    return null;
+  }
+  const templateBuffer = Buffer.from(template.hex.replace(/\s+/g, ""), "hex");
+  if (templateQueryParam(templateBuffer, "confirmCode") !== confirmCode) {
+    return null;
+  }
+  const direct = templateQueryParam(templateBuffer, "deviceId") ?? templateQueryParam(templateBuffer, "deviceID");
+  if (direct) {
+    return direct;
+  }
+  for (const key of ["clientInfo", "json"]) {
+    const raw = templateQueryParam(templateBuffer, key);
+    const parsed = raw ? parseJsonRecord(raw) : null;
+    const deviceId = parsed ? pickString(parsed, ["deviceId", "deviceID", "DeviceId", "DeviceID", "LDid"]) : null;
+    if (deviceId) {
+      return deviceId;
+    }
+  }
+  return null;
+}
+
+function normalizeDirectPrimaryBalance(records: Record<string, unknown>[]) {
+  const value = pickNumberFromRecords(records, [
+    "primaryBalance",
+    "primary_balance",
+    "balance",
+    "balanceAmount",
+    "balance_amount",
+    "availableBalance",
+    "available_balance",
+    "walletBalance",
+    "wallet_balance",
+    "coinBalance",
+    "coin_balance",
+    "creditBalance",
+    "credit_balance"
+  ]);
+  if (value === undefined) {
+    return undefined;
+  }
+  const ratio = pickPositiveNumberFromRecords(records, ["creditExchangeRatio", "credit_exchange_ratio"]);
+  if (value < 1000 && ratio && ratio > 0) {
+    return Math.round((value / ratio) * 100) / 100;
+  }
+  return value;
 }
 
 function collectRecords(value: unknown) {
@@ -4670,6 +6546,30 @@ function pickNumberFromRecords(records: Record<string, unknown>[], keys: string[
     }
   }
   return undefined;
+}
+
+function pickPositiveNumberFromRecords(records: Record<string, unknown>[], keys: string[]) {
+  for (const record of records) {
+    const value = pickNumber(record, keys);
+    if (value !== undefined && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function normalizeDirectUserGrade(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value)) {
+    return undefined;
+  }
+  return value + 1;
+}
+
+function normalizeMemberPoint(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value) || value <= 0 || value > 10_000) {
+    return undefined;
+  }
+  return value;
 }
 
 function pickDateFromRecords(records: Record<string, unknown>[], keys: string[]) {
@@ -4805,24 +6705,37 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function accountDeviceId(account: { dtUserId: string; deviceId?: string | null }) {
+function accountDeviceId(account: { dtUserId: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" }) {
   const existing = account.deviceId;
   if (existing && existing.trim()) {
     return existing.trim();
   }
-  return `Android.${hashLike(account.dtUserId)}.dttalk`;
+  return `And.${hashLike(account.dtUserId)}.dttalk`;
 }
 
-function resolveDirectAccountAppId(deviceId: string) {
-  return isTalkUDeviceId(deviceId) ? TALKU_APP_ID : DINGTONE_APP_ID;
+function resolveDirectAccountAppId(identity: string | DirectAccountIdentity) {
+  return isTalkUIdentity(identity) ? TALKU_APP_ID : DINGTONE_APP_ID;
 }
 
-function resolveDirectAccountApkCertificateSign(deviceId: string, fallback: string) {
-  return isTalkUDeviceId(deviceId) ? TALKU_APK_CERTIFICATE_SIGN : fallback;
+function resolveDirectAccountApkCertificateSign(identity: string | DirectAccountIdentity, fallback: string) {
+  return "cf093a0e6b07dce3c8e05f7d4a9c261c";
 }
 
-function resolveDirectApiApkCertificateSign(deviceId: string, fallback: string) {
-  return isTalkUDeviceId(deviceId) ? TALKU_DIRECT_API_CERTIFICATE_SIGN : fallback;
+function resolveDirectApiApkCertificateSign(identity: string | DirectAccountIdentity, fallback: string) {
+  return isTalkUIdentity(identity) ? TALKU_DIRECT_API_CERTIFICATE_SIGN : fallback;
+}
+
+function isTalkUIdentity(identity: string | DirectAccountIdentity) {
+  if (typeof identity !== "string") {
+    if (identity.appVariant === "dingdong") {
+      return false;
+    }
+    if (identity.appVariant === "dingtone") {
+      return true;
+    }
+    return isTalkUDeviceId(identity.deviceId ?? "");
+  }
+  return isTalkUDeviceId(identity);
 }
 
 function isTalkUDeviceId(deviceId: string) {
@@ -4899,24 +6812,55 @@ function createDirectTrackCodeGenerator(seed: string) {
   };
 }
 
-async function getDirectRuntimeConfig(): Promise<DirectRuntimeConfig> {
+export async function getDirectRuntimeConfig(): Promise<DirectRuntimeConfig> {
   const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
   return {
     primaryHost: settings.dt_server_ip || config.DT_SERVER_IP,
     backupHost: settings.dt_backup_ip || config.DT_BACKUP_IP,
     port: Number(settings.dt_server_port || config.DT_SERVER_PORT) || config.DT_SERVER_PORT,
+    registerEmailPort: parsePositiveIntSetting(settings.dt_direct_register_email_port, 465, 1, 65535),
     connectTimeoutMs: 10_000,
     ioTimeoutMs: 15_000,
     useTls: parseBooleanSetting(settings.dt_direct_use_tls, config.DT_DIRECT_USE_TLS),
+    registerEmailUseTls: parseBooleanSetting(settings.dt_direct_register_email_use_tls, true),
     appVersion: config.DT_APP_VERSION,
+    dingdongAppVersion: settings.dt_dingdong_app_version || config.DT_DINGDONG_APP_VERSION,
     apkCertificateSign: config.DT_APK_CERTIFICATE_SIGN,
-    listenHostConcurrency: parsePositiveIntSetting(settings.dt_direct_listener_host_concurrency, 2, 1, 8)
+    listenHostConcurrency: parsePositiveIntSetting(settings.dt_direct_listener_host_concurrency, 2, 1, 8),
+    proxyUrl: (settings.dt_proxy_url || config.DT_PROXY_URL || "").trim()
   };
 }
 
 async function getConfiguredDirectTemplate(key: DirectTemplateSettingKey): Promise<DirectActionTemplate | null> {
   const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
   return parseDirectActionTemplate(key, settings[key]);
+}
+
+async function getConfiguredDirectTemplateFromKeys(
+  keys: DirectTemplateSettingKey | DirectTemplateSettingKey[]
+): Promise<{ key: DirectTemplateSettingKey; template: DirectActionTemplate } | null> {
+  const keyList = Array.isArray(keys) ? keys : [keys];
+  const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
+  const baseKey = keyList.length > 1 ? keyList[keyList.length - 1] : null;
+  for (const [index, key] of keyList.entries()) {
+    const rawValue = settings[key];
+    if (String(rawValue ?? "").trim()) {
+      const template = parseDirectActionTemplate(key, rawValue);
+      return template ? { key, template } : null;
+    }
+  }
+  return null;
+}
+
+function hasConfiguredActivationVariantTemplate(settings: Record<string, string>, baseKey: DirectTemplateSettingKey) {
+  return Boolean(
+    String(settings[`${baseKey}_talku`] ?? "").trim() ||
+      String(settings[`${baseKey}_dingdong`] ?? "").trim()
+  );
+}
+
+function formatDirectTemplateKeys(keys: DirectTemplateSettingKey | DirectTemplateSettingKey[]) {
+  return Array.isArray(keys) ? keys.join(" or ") : keys;
 }
 
 function getBuiltInDirectTemplate(key: DirectTemplateSettingKey): DirectActionTemplate | null {
@@ -4932,6 +6876,130 @@ function getBuiltInDirectTemplate(key: DirectTemplateSettingKey): DirectActionTe
       token: "$token"
     }
   };
+}
+
+async function connectSocketViaHttpProxy(input: {
+  proxyUrl: string;
+  host: string;
+  port: number;
+  useTls: boolean;
+  timeoutMs: number;
+}) {
+  let proxy: URL;
+  try {
+    proxy = new URL(input.proxyUrl);
+  } catch {
+    throw new AppError("DT_PROXY_URL must be a valid http:// or https:// proxy URL for direct mode.", 400, 400);
+  }
+  if (proxy.protocol !== "http:" && proxy.protocol !== "https:") {
+    throw new AppError("Direct mode currently supports HTTP CONNECT proxies only. Use http:// or https:// in DT_PROXY_URL.", 400, 400);
+  }
+
+  const proxyHost = proxy.hostname;
+  const proxyPort = Number(proxy.port || (proxy.protocol === "https:" ? 443 : 80));
+  const socket = proxy.protocol === "https:"
+    ? tls.connect({ host: proxyHost, port: proxyPort, servername: proxyHost, rejectUnauthorized: false })
+    : net.connect({ host: proxyHost, port: proxyPort });
+
+  await waitForSocketConnect(socket, input.timeoutMs, `Direct proxy connection timed out: ${proxyHost}:${proxyPort}`);
+  const connected = await performHttpConnect(socket, proxy, input.host, input.port, input.timeoutMs);
+
+  if (!input.useTls) {
+    return connected;
+  }
+
+  const tlsSocket = tls.connect({
+    socket: connected,
+    servername: input.host,
+    rejectUnauthorized: false
+  });
+  await waitForSocketConnect(tlsSocket, input.timeoutMs, `Direct TLS connection timed out through proxy: ${input.host}:${input.port}`);
+  return tlsSocket;
+}
+
+function waitForSocketConnect(socket: net.Socket, timeoutMs: number, timeoutMessage: string) {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new AppError(timeoutMessage, 504, 504));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("connect", onConnect);
+      socket.off("secureConnect", onConnect);
+      socket.off("error", onError);
+    };
+    const onConnect = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    socket.once("connect", onConnect);
+    socket.once("secureConnect", onConnect);
+    socket.once("error", onError);
+  });
+}
+
+function performHttpConnect(socket: net.Socket, proxy: URL, host: string, port: number, timeoutMs: number) {
+  return new Promise<net.Socket>((resolve, reject) => {
+    let buffer = Buffer.alloc(0);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new AppError(`Direct proxy CONNECT timed out: ${host}:${port}`, 504, 504));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new AppError("Direct proxy CONNECT socket closed before tunnel was established.", 502, 502));
+    };
+    const onData = (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      const headerEnd = buffer.indexOf("\r\n\r\n");
+      if (headerEnd < 0) {
+        return;
+      }
+      const header = buffer.subarray(0, headerEnd).toString("latin1");
+      const status = Number(header.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/i)?.[1]);
+      cleanup();
+      if (status < 200 || status >= 300) {
+        socket.destroy();
+        reject(new AppError(`Direct proxy CONNECT failed with HTTP ${Number.isFinite(status) ? status : "unknown"}.`, 502, 502));
+        return;
+      }
+      resolve(socket);
+    };
+
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+    socket.write(buildHttpConnectRequest(proxy, host, port));
+  });
+}
+
+function buildHttpConnectRequest(proxy: URL, host: string, port: number) {
+  const target = `${host}:${port}`;
+  const lines = [
+    `CONNECT ${target} HTTP/1.1`,
+    `Host: ${target}`,
+    "Proxy-Connection: Keep-Alive",
+    "Connection: Keep-Alive"
+  ];
+  if (proxy.username || proxy.password) {
+    lines.push(`Proxy-Authorization: Basic ${Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64")}`);
+  }
+  return `${lines.join("\r\n")}\r\n\r\n`;
 }
 
 function flattenTemplateObject(value: unknown, prefix: string): DirectTemplateParams {

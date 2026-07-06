@@ -16,6 +16,8 @@ import frida
 
 DEFAULT_PACKAGE = "me.talkyou.app.im"
 SETTING_KEYS = {
+    "register_email": "dt_direct_template_register_email",
+    "activate_email": "dt_direct_template_activate_email",
     "request": "dt_direct_template_request_phone",
     "purchase": "dt_direct_template_purchase_phone",
     "renew": "dt_direct_template_renew_phone",
@@ -45,6 +47,12 @@ def main() -> None:
           frame = enrich_frame(payload, len(frames) + 1)
           frames.append(frame)
           print_frame(frame)
+          write_output(output_path, frames)
+          return
+      if payload.get("type") == "direct-fragment":
+          frame = enrich_fragment(payload, len(frames) + 1)
+          frames.append(frame)
+          print_fragment(frame)
           write_output(output_path, frames)
           return
       if payload.get("type") == "java-call":
@@ -204,6 +212,21 @@ def enrich_java_call(payload: dict[str, Any], index: int) -> dict[str, Any]:
     }
 
 
+def enrich_fragment(payload: dict[str, Any], index: int) -> dict[str, Any]:
+    stack = str(payload.get("stack") or "")
+    hex_value = str(payload.get("hex") or "")
+    return {
+        "index": index,
+        "capturedAt": payload.get("capturedAt"),
+        "source": payload.get("source"),
+        "fragment": True,
+        "availableLength": payload.get("availableLength"),
+        "declaredLength": payload.get("declaredLength"),
+        "hex": hex_value,
+        "stackPreview": stack_preview(stack),
+    }
+
+
 def print_frame(frame: dict[str, Any]) -> None:
     hint = frame.get("settingHint") or "unclassified"
     route = frame.get("route") or "-"
@@ -217,6 +240,14 @@ def print_java_call(frame: dict[str, Any]) -> None:
     data = frame.get("data") or {}
     print(f"[java #{frame['index']}] hint={hint} name={name}")
     print(f"  data: {json.dumps(data, ensure_ascii=False)[:360]}")
+
+
+def print_fragment(frame: dict[str, Any]) -> None:
+    print(
+        f"[fragment #{frame['index']}] source={frame.get('source') or '-'} "
+        f"available={frame.get('availableLength')} declared={frame.get('declaredLength')}"
+    )
+    print(f"  hex: {str(frame.get('hex') or '')[:240]}")
 
 
 def write_output(path: Path, frames: list[dict[str, Any]]) -> None:
@@ -265,6 +296,10 @@ def inflate_query(body: bytes) -> str:
 
 def infer_setting_hint(route: str | None, query: str, stack: str) -> str | None:
     text = " ".join([route or "", query, stack]).lower()
+    if "registeremail" in text or "register_email" in text or "register email" in text:
+        return SETTING_KEYS["register_email"]
+    if "activateemail" in text or "activate_email" in text or "activate email" in text:
+        return SETTING_KEYS["activate_email"]
     if "deleteprivatenumber" in text or "delete_private_number" in text:
         return SETTING_KEYS["cancel"]
     if "privatenumbersetting" in text or "private_number_setting" in text:
@@ -317,6 +352,10 @@ def suggest_params(query: str) -> dict[str, str]:
         "suspendflag": "$suspendFlag",
         "suspend_flag": "$suspendFlag",
         "action": "$action",
+        "email": "$email",
+        "confirmcode": "$confirmCode",
+        "clientinfo": "$clientInfo",
+        "pushmsgtoken": "$pushMsgToken",
     }
     for key in keys:
         normalized = re.sub(r"[^a-z0-9_]", "", key.lower())

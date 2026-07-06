@@ -1,4 +1,4 @@
-﻿import { AccountStatus, AppVariant, LoginType, MessageDirection, MessageType, PhoneStatus, Prisma, type PhoneNumber as StoredPhoneNumber } from "@prisma/client";
+import { AccountStatus, AppVariant, LoginType, MessageDirection, MessageType, PhoneStatus, Prisma, type PhoneNumber as StoredPhoneNumber } from "@prisma/client";
 import { Router } from "express";
 import { MonitorStatus } from "@prisma/client";
 import { z } from "zod";
@@ -19,6 +19,8 @@ import { dingtoneGateway } from "../services/dingtone/index.js";
 import { RealDingtoneGateway } from "../services/dingtone/real-gateway.js";
 import { dumpHelperSmsMessages, executeHelperAction, executeHelperActionWithRetry, getCachedPrivateNumberEvent } from "../services/helper-bridge.js";
 import { refreshAccountRuntimeData } from "../services/account-runtime.js";
+import { getAccountPoint } from "../services/point.js";
+import { getAccountPointStore, orderAccountPointStoreProduct } from "../services/point-store.js";
 import { dumpSmsMessagesFromAdb, listPhoneNumbersFromAdb } from "../services/adb-database.js";
 import { exportSessionFromAdbConfig } from "../services/adb-session.js";
 import { previewPhoneNumbersFromAdb } from "../services/adb-phone-preview.js";
@@ -32,7 +34,8 @@ import type {
   DingtonePhonePurchaseCandidate,
   DingtonePhonePurchasePreview,
   DingtoneSessionExport,
-  DingtoneSnapshot
+  DingtoneSnapshot,
+  VerificationRequestResult
 } from "../services/dingtone/types.js";
 import { eventBus } from "../services/event-bus.js";
 import { getGatewayMode, getSettingsMap } from "../services/settings.service.js";
@@ -97,6 +100,11 @@ const phoneActionConfirmSchema = z.object({
   confirm: z.boolean().optional().default(false)
 });
 
+const pointStoreOrderSchema = z.object({
+  product_id: z.string().trim().min(1),
+  confirm: z.boolean().optional().default(false)
+});
+
 const validateSessionSchema = z.object({
   dt_user_id: z.string().trim().min(1).optional(),
   token: z.string().trim().min(1).optional(),
@@ -154,11 +162,39 @@ const messagesQuerySchema = z.object({
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(20),
   keyword: z.string().optional(),
+  msg_type: z.nativeEnum(MessageType).optional(),
+  exclude_system: z
+    .union([z.literal("true"), z.literal("false"), z.boolean()])
+    .optional()
+    .transform((value) => (value === undefined ? undefined : value === true || value === "true")),
   is_read: z
     .union([z.literal("true"), z.literal("false")])
     .optional()
     .transform((value) => (value === undefined ? undefined : value === "true"))
 });
+
+type MessagesQuery = z.infer<typeof messagesQuerySchema>;
+
+function buildMessagesWhere(accountId: number, query: MessagesQuery): Prisma.MessageWhereInput {
+  return {
+    accountId,
+    ...(query.msg_type ? { msgType: query.msg_type } : query.exclude_system ? { msgType: { not: MessageType.system } } : {}),
+    ...(query.keyword
+      ? {
+          OR: [
+            { content: { contains: query.keyword } },
+            { fromNumber: { contains: query.keyword } },
+            { toNumber: { contains: query.keyword } }
+          ]
+        }
+      : {}),
+    ...(query.is_read === undefined ? {} : { isRead: query.is_read })
+  };
+}
+
+export function buildMessagesWhereForTest(accountId: number, query: MessagesQuery) {
+  return buildMessagesWhere(accountId, query);
+}
 
 const syncHelperMessagesSchema = z.object({
   limit: z.coerce.number().int().positive().max(100).default(20),
@@ -283,6 +319,8 @@ accountsRouter.get("/", async (req, res, next) => {
     const keyword = req.query.keyword ? String(req.query.keyword) : undefined;
 
     const where: Prisma.DtAccountWhereInput = {
+      adminId: req.auth!.userId,
+      ...accountListVisibleWhere(),
       ...(status ? { status: status as never } : {}),
       ...(keyword
         ? {
@@ -350,7 +388,7 @@ accountsRouter.post("/", async (req, res, next) => {
     const adminId = req.auth!.userId;
     const existing = await findExistingAccount(adminId, body.app_variant, body.email ?? null, body.phone ?? null);
     const nickname = normalizeOptionalString(body.nickname);
-    const deviceId = existing?.dtDeviceId ?? createDeviceId();
+    const deviceId = normalizeVerificationDeviceId(existing?.dtDeviceId ?? createDeviceId(), body.app_variant, body.login_type);
     const trackCode = existing?.dtTrackCode ?? createTrackCode();
 
     if (body.login_type === "manual_session") {
@@ -430,21 +468,41 @@ accountsRouter.post("/", async (req, res, next) => {
         }
       });
 
-      const verifyResult = await dingtoneGateway.sendVerificationCode({
-        loginType: body.login_type,
-        appVariant: body.app_variant,
-        email: body.email,
-        phone: body.phone,
-        deviceId,
-        trackCode
-      });
+      let sendResult: VerificationSendResult;
+      try {
+        sendResult = await sendVerificationCodeWithVariantFallback({
+          loginType: body.login_type,
+          appVariant: body.app_variant,
+          email: body.email,
+          phone: body.phone,
+          deviceId,
+          trackCode
+        });
+        await prisma.dtAccount.update({
+          where: { id: account.id },
+          data: {
+            appVariant: sendResult.appVariant,
+            dtDeviceId: sendResult.deviceId,
+            dtTrackCode: sendResult.trackCode,
+            lastError: null
+          }
+        });
+      } catch (error) {
+        if (!account.dtUserId) {
+          await prisma.dtAccount.deleteMany({ where: { id: account.id, adminId } }).catch(() => null);
+        } else {
+          await prisma.dtAccount.update({ where: { id: account.id }, data: { lastError: error instanceof Error ? error.message : String(error) } }).catch(() => null);
+        }
+        throw error;
+      }
 
       return ok(res, {
         id: account.id,
-        message: verifyResult.message,
+        app_variant: sendResult.appVariant,
+        message: sendResult.result.message,
         requires_verification: true,
-        mock: verifyResult.mock ?? false,
-        verification_code: verifyResult.verificationCode ?? null
+        mock: sendResult.result.mock ?? false,
+        verification_code: sendResult.result.verificationCode ?? null
       });
     }
 
@@ -812,7 +870,10 @@ accountsRouter.delete("/:id", async (req, res, next) => {
     }
     const accountId = Number(req.params.id);
     await accountMonitorService.stop(accountId).catch(() => undefined);
-    await prisma.dtAccount.delete({ where: { id: accountId } });
+    const deleted = await prisma.dtAccount.deleteMany({ where: { id: accountId, adminId: req.auth!.userId } });
+    if (deleted.count === 0) {
+      return ok(res, null, "account already deleted");
+    }
     ok(res, null, "account deleted");
   } catch (error) {
     next(error);
@@ -825,25 +886,39 @@ accountsRouter.post("/:id/send-verification-code", async (req, res, next) => {
     if (account.loginType !== "email_code" && account.loginType !== "phone_code") {
       throw new AppError("Only email or phone verification-code login can send a verification code.", 400, 400);
     }
-    const result = await dingtoneGateway.sendVerificationCode({
-      loginType: account.loginType,
-      appVariant: account.appVariant,
-      email: account.email,
-      phone: account.phone,
-      deviceId: account.dtDeviceId,
-      trackCode: account.dtTrackCode
-    });
+    let sendResult: VerificationSendResult;
+    try {
+      sendResult = await sendVerificationCodeWithVariantFallback({
+        loginType: account.loginType,
+        appVariant: account.appVariant,
+        email: account.email,
+        phone: account.phone,
+        deviceId: normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType),
+        trackCode: account.dtTrackCode
+      });
+    } catch (error) {
+      if (!account.dtUserId) {
+        await prisma.dtAccount.deleteMany({ where: { id: account.id, adminId: req.auth!.userId } }).catch(() => null);
+      } else {
+        await prisma.dtAccount.update({ where: { id: account.id }, data: { lastError: error instanceof Error ? error.message : String(error) } }).catch(() => null);
+      }
+      throw error;
+    }
     await prisma.dtAccount.update({
       where: { id: account.id },
       data: {
+        appVariant: sendResult.appVariant,
+        dtDeviceId: sendResult.deviceId,
+        dtTrackCode: sendResult.trackCode,
         status: account.dtUserId ? account.status : AccountStatus.pending,
         lastError: null
       }
     });
     ok(res, {
-      message: result.message,
-      mock: result.mock ?? false,
-      verification_code: result.verificationCode ?? null
+      app_variant: sendResult.appVariant,
+      message: sendResult.result.message,
+      mock: sendResult.result.mock ?? false,
+      verification_code: sendResult.result.verificationCode ?? null
     });
   } catch (error) {
     next(error);
@@ -863,7 +938,7 @@ accountsRouter.post("/:id/verify-code", async (req, res, next) => {
       email: account.email,
       phone: account.phone,
       verificationCode: body.code,
-      deviceId: account.dtDeviceId,
+      deviceId: normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType),
       trackCode: account.dtTrackCode
     });
 
@@ -912,7 +987,7 @@ accountsRouter.post("/:id/probe-access-code", async (req, res, next) => {
       account: {
         dtUserId,
         token,
-        deviceId: account.dtDeviceId,
+        deviceId: normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType),
         email: account.email,
         phone: account.phone
       },
@@ -978,7 +1053,7 @@ accountsRouter.post("/:id/re-login", async (req, res, next) => {
       email: account.email,
       phone: account.phone,
       password,
-      deviceId: account.dtDeviceId,
+      deviceId: normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType),
       trackCode: createTrackCode()
     });
 
@@ -1093,24 +1168,48 @@ accountsRouter.post("/:id/refresh", async (req, res, next) => {
   }
 });
 
+accountsRouter.get("/:id/point", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+    const data = await getAccountPoint(accountId);
+    ok(res, serializePointData(data));
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.get("/:id/pointstore", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+    const data = await getAccountPointStore(accountId);
+    ok(res, serializePointStore(data));
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.post("/:id/pointstore/order", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+    const body = pointStoreOrderSchema.parse(req.body ?? {});
+    if (!body.confirm) {
+      throw new AppError("Point store order requires confirmation.", 400, 400);
+    }
+    const data = await orderAccountPointStoreProduct(accountId, body.product_id);
+    ok(res, serializePointStoreOrder(data));
+  } catch (error) {
+    next(error);
+  }
+});
 accountsRouter.get("/:id/messages", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);
     await assertAccount(accountId);
     const query = messagesQuerySchema.parse(req.query);
-    const where: Prisma.MessageWhereInput = {
-      accountId,
-      ...(query.keyword
-        ? {
-            OR: [
-              { content: { contains: query.keyword } },
-              { fromNumber: { contains: query.keyword } },
-              { toNumber: { contains: query.keyword } }
-            ]
-          }
-        : {}),
-      ...(query.is_read === undefined ? {} : { isRead: query.is_read })
-    };
+    const where = buildMessagesWhere(accountId, query);
 
     const [total, list] = await Promise.all([
       prisma.message.count({ where }),
@@ -2348,7 +2447,7 @@ async function previewPhoneNumbers(accountId: number, payload: unknown) {
         {
           dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
           token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-          deviceId: account.dtDeviceId,
+          deviceId: normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType),
           appVariant: account.appVariant
         },
         { countryCode: body.country_code, isoCountryCode: body.iso_country_code, countryKey: body.country_key, areaCode: body.area_code }
@@ -3135,7 +3234,7 @@ async function refreshMessagesFromRemote(accountId: number, limit: number, direc
       account: {
         dtUserId: account.dtUserId,
         token: decryptText(account.dtToken) ?? "",
-        deviceId: account.dtDeviceId,
+        deviceId: normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType),
         email: account.email,
         phone: account.phone
       },
@@ -3547,6 +3646,108 @@ function chooseMergedAccountStatus(current: AccountStatus, duplicate: AccountSta
   return order.indexOf(duplicate) < order.indexOf(current) ? duplicate : current;
 }
 
+function accountListVisibleWhere(): Prisma.DtAccountWhereInput {
+  return {
+    NOT: {
+      AND: [
+        { status: AccountStatus.pending },
+        { dtUserId: null },
+        { loginType: { in: [LoginType.email_code, LoginType.phone_code] } }
+      ]
+    }
+  };
+}
+
+export function shouldShowAccountInList(input: {
+  status: AccountStatus;
+  loginType: LoginType | "email_code" | "phone_code" | string;
+  dtUserId: string | null;
+  dtToken: string | null;
+}) {
+  return !(
+    input.status === AccountStatus.pending &&
+    !input.dtUserId &&
+    (input.loginType === LoginType.email_code || input.loginType === LoginType.phone_code)
+  );
+}
+
+
+type VerificationSendInput = {
+  loginType: LoginType;
+  appVariant: AppVariant;
+  email?: string | null;
+  phone?: string | null;
+  deviceId: string;
+  trackCode: string;
+};
+
+type VerificationSendResult = {
+  result: VerificationRequestResult;
+  appVariant: AppVariant;
+  deviceId: string;
+  trackCode: string;
+  switched: boolean;
+};
+
+async function sendVerificationCodeWithVariantFallback(input: VerificationSendInput): Promise<VerificationSendResult> {
+  try {
+    const result = await dingtoneGateway.sendVerificationCode(input);
+    return { result, appVariant: input.appVariant, deviceId: input.deviceId, trackCode: input.trackCode, switched: false };
+  } catch (firstError) {
+    if (!shouldRetryVerificationWithOtherVariant(firstError)) {
+      throw firstError;
+    }
+
+    const fallbackVariant = otherVerificationAppVariant(input.appVariant);
+    const fallbackDeviceId = normalizeVerificationDeviceId(createDeviceId(), fallbackVariant, input.loginType);
+    const fallbackTrackCode = createTrackCode();
+    try {
+      const result = await dingtoneGateway.sendVerificationCode({
+        ...input,
+        appVariant: fallbackVariant,
+        deviceId: fallbackDeviceId,
+        trackCode: fallbackTrackCode
+      });
+      logger.info("Verification-code send succeeded after switching app variant", {
+        from: input.appVariant,
+        to: fallbackVariant,
+        loginType: input.loginType
+      });
+      return { result, appVariant: fallbackVariant, deviceId: fallbackDeviceId, trackCode: fallbackTrackCode, switched: true };
+    } catch (fallbackError) {
+      throw new AppError(
+        `邮箱验证码自动识别 App 失败：${formatAppVariantName(input.appVariant)} 返回：${formatVerificationSendError(firstError)}；${formatAppVariantName(fallbackVariant)} 返回：${formatVerificationSendError(fallbackError)}`,
+        400,
+        400
+      );
+    }
+  }
+}
+
+export function otherVerificationAppVariant(appVariant: AppVariant | "dingtone" | "dingdong") {
+  return String(appVariant) === "dingdong" ? AppVariant.dingtone : AppVariant.dingdong;
+}
+
+export function shouldRetryVerificationWithOtherVariant(error: unknown) {
+  const message = formatVerificationSendError(error);
+  return /user exist in other app|Direct registerEmail failed: REST call failed|current local account type/i.test(message);
+}
+
+function formatVerificationSendError(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function formatAppVariantName(appVariant: AppVariant | "dingtone" | "dingdong") {
+  return String(appVariant) === "dingdong" ? "Dingdong" : "TalkU";
+}
+function normalizeVerificationDeviceId(deviceId: string, appVariant?: string | null, loginType?: string | null) {
+  const trimmed = deviceId.trim();
+  if (loginType === "email_code" && appVariant === "dingdong") {
+    return trimmed.replace(/\.dttalk$/i, "");
+  }
+  return trimmed;
+}
+
 function normalizeOptionalString(value: unknown) {
   const trimmed = typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
   return trimmed ? trimmed : null;
@@ -3724,6 +3925,66 @@ function parseJsonRecord(value: string | null | undefined) {
   }
 }
 
+function serializePointData(data: Awaited<ReturnType<typeof getAccountPoint>>) {
+  return {
+    point_uid: data.pointUid,
+    user_id: data.userId,
+    game_uid: data.gameUid,
+    app_type: data.appType,
+    game_app_id: data.gameAppId,
+    user_name: data.userName,
+    user_grade: data.userGrade,
+    valid_point: data.validPoint,
+    history_point: data.historyPoint,
+    expire_point: data.expirePoint,
+    expire_time: data.expireTime,
+    game_benefits: data.gameBenefits.map((item) => ({
+      code: item.code,
+      name: item.name,
+      price: item.price,
+      stock: item.stock
+    })),
+    snapshot: data.snapshot,
+    raw: data.raw
+  };
+}
+
+function serializePointStore(data: Awaited<ReturnType<typeof getAccountPointStore>>) {
+  return {
+    point_uid: data.pointUid,
+    email: data.email,
+    user_name: data.userName,
+    user_grade: data.userGrade,
+    valid_point: data.validPoint,
+    history_point: data.historyPoint,
+    expire_point: data.expirePoint,
+    expire_time: data.expireTime,
+    products: data.products.map(serializePointStoreProduct),
+    snapshot: data.snapshot,
+    raw: data.raw
+  };
+}
+
+function serializePointStoreProduct(product: Awaited<ReturnType<typeof getAccountPointStore>>["products"][number]) {
+  return {
+    product_id: product.productId,
+    name: product.name,
+    stock: product.stock,
+    price: product.price,
+    raw_json: product.rawJson
+  };
+}
+
+function serializePointStoreOrder(data: Awaited<ReturnType<typeof orderAccountPointStoreProduct>>) {
+  return {
+    product: serializePointStoreProduct(data.product),
+    email: data.email,
+    order_id: data.orderId,
+    order: data.order,
+    order_info: data.orderInfo,
+    point_store: serializePointStore(data.pointStore)
+  };
+}
 function serializePhonePurchasePreview(preview: DingtonePhonePurchasePreview) {
   return {
     free_chance: preview.freeChance ?? null,

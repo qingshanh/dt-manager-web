@@ -88,13 +88,32 @@ function parsePlaintextSmsPush(payload: Buffer): ParsedSmsPush | null {
 }
 
 function extractTargetNumberFromPushMetadata(json: { info?: string; k3?: string }, fromNumber: string | null) {
+  const senderDigits = normalizePhoneDigits(fromNumber);
   const candidates = [json.info, json.k3]
     .flatMap((value) => extractDigitRunsFromBase64(value))
-    .filter((value) => value !== fromNumber);
-  const best = candidates
     .filter((value) => value.length >= 7)
-    .sort((left, right) => right.length - left.length || left.localeCompare(right))[0];
+    .filter((value) => !samePhoneDigits(value, senderDigits));
+  const best = candidates.sort((left, right) => right.length - left.length || left.localeCompare(right))[0];
   return best ?? null;
+}
+
+function samePhoneDigits(candidate: string, normalizedSender: string) {
+  const digits = normalizePhoneDigits(candidate);
+  if (!digits || !normalizedSender) {
+    return false;
+  }
+  if (digits === normalizedSender) {
+    return true;
+  }
+  return stripUsCountryCode(digits) === stripUsCountryCode(normalizedSender);
+}
+
+function stripUsCountryCode(value: string) {
+  return value.length === 11 && value.startsWith("1") ? value.slice(1) : value;
+}
+
+function normalizePhoneDigits(value: string | null | undefined) {
+  return value?.replace(/\D/g, "") ?? "";
 }
 
 function extractDigitRunsFromBase64(value?: string) {
@@ -194,6 +213,9 @@ function extractPlaintextContentBytes(payload: Buffer, afterJsonOffset: number) 
 }
 
 function readLengthPrefixedText(payload: Buffer, cursor: number) {
+  if (isLikelyTextLeadByte(payload[cursor])) {
+    return null;
+  }
   for (const width of [1, 2, 4]) {
     if (cursor + width >= payload.length) {
       continue;
@@ -212,10 +234,13 @@ function readLengthPrefixedText(payload: Buffer, cursor: number) {
   return null;
 }
 
+function isLikelyTextLeadByte(byte: number | undefined) {
+  return byte !== undefined && (byte === 0x5b || byte === 0x28 || (byte >= 0x30 && byte <= 0x7a) || byte >= 0xe0);
+}
 function findLikelyTextStart(payload: Buffer, cursor: number) {
   for (let index = cursor; index < payload.length; index += 1) {
     const byte = payload[index];
-    if (byte !== undefined && (byte === 0x5b || (byte >= 0x30 && byte <= 0x7a) || byte >= 0xe0)) {
+    if (isLikelyTextLeadByte(byte)) {
       return index;
     }
   }
@@ -257,7 +282,24 @@ function decodeSmsContent(bytes: Buffer, utf8Fallback: string) {
 }
 
 function normalizeSmsContent(value: string) {
-  return value.replace(/\0+$/g, "").trim();
+  return stripPushMetadata(value.replace(/\0+$/g, "")).trim();
+}
+
+function stripPushMetadata(value: string) {
+  const patterns = [
+    /[\u0000-\u001f\u007f-\u009f]+\s*(?:dtId|who|devfilter|orgsrc|statusOff)\b/i,
+    /\s+(?:dtId|who|devfilter|orgsrc)\b/i,
+    /\s+devfilter\d*\s*\{"only":"And\.[^"\s]+"\}/i,
+    /\s+\{"statusOff":"\d+"\}/i
+  ];
+  let end = value.length;
+  for (const pattern of patterns) {
+    const match = pattern.exec(value);
+    if (match?.index !== undefined && match.index >= 0) {
+      end = Math.min(end, match.index);
+    }
+  }
+  return value.slice(0, end);
 }
 
 function scoreDecodedText(value: string) {

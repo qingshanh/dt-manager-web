@@ -30,12 +30,23 @@ async function resolveGateway(): Promise<DingtoneGateway> {
   return realGateway;
 }
 
+async function resolveActivationGateway(): Promise<DingtoneGateway> {
+  const mode = await getGatewayMode();
+  if (mode === "direct") {
+    return directGateway;
+  }
+  if (mode === "mock") {
+    return mockGateway;
+  }
+  return realGateway;
+}
+
 export const dingtoneGateway: DingtoneGateway = {
   async sendVerificationCode(input: DingtoneLoginInput): Promise<VerificationRequestResult> {
-    return (await resolveGateway()).sendVerificationCode(input);
+    return (await resolveActivationGateway()).sendVerificationCode(input);
   },
   async login(input: DingtoneLoginInput): Promise<DingtoneLoginResult> {
-    return (await resolveGateway()).login(input);
+    return (await resolveActivationGateway()).login(input);
   },
   async exportSession(input: DingtoneSessionExportInput): Promise<DingtoneSessionExport> {
     return (await resolveGateway()).exportSession(input);

@@ -31,17 +31,22 @@ type PhoneNotificationInput = {
 };
 
 export async function sendSmsTelegramNotification(input: SmsNotificationInput) {
-  return sendAccountTelegramNotification(input.account, "短信", [
-    ["通知类型", "短信"],
-    ["面板账户ID", input.account.id],
-    ["说道用户ID", input.account.dtUserId],
-    ["说道号", input.toNumber ?? input.account.phone],
-    ["账户绑定手机", input.account.phone],
-    ["邮箱", input.account.email],
-    ["消息来源号码", input.fromNumber],
-    ["消息内容", input.content],
-    ["接收时间", formatTelegramTime(input.receivedAt)]
-  ]);
+  const code = extractVerificationCode(input.content);
+  return sendAccountTelegramNotification(
+    input.account,
+    code ? "验证码短信" : "新短信",
+    [
+      ["账号", deriveAccountName(input.account)],
+      ["面板账号ID", input.account.id],
+      ["说道用户ID", input.account.dtUserId],
+      ["接收号码", input.toNumber ?? input.account.phone],
+      ["发送方", input.fromNumber],
+      ["验证码", code],
+      ["短信内容", input.content],
+      ["接收时间", formatTelegramTime(input.receivedAt)]
+    ],
+    code ? buildCopyCodeReplyMarkup(code) : undefined
+  );
 }
 
 export async function sendPhoneTelegramNotification(input: PhoneNotificationInput) {
@@ -58,9 +63,9 @@ function buildPhoneTelegramNotificationFields(input: PhoneNotificationInput): Ar
   const title = phoneActionTitle(action);
   return [
     ["通知类型", title],
-    ["面板账户ID", input.account.id],
+    ["面板账号ID", input.account.id],
     ["说道用户ID", input.account.dtUserId],
-    ["说道号", input.account.phone],
+    ["绑定手机", input.account.phone],
     ["邮箱", input.account.email],
     [action === "purchase" ? "新手机号" : "手机号", input.phone.phoneNumber],
     ["号码状态", input.phone.status],
@@ -75,7 +80,8 @@ function buildPhoneTelegramNotificationFields(input: PhoneNotificationInput): Ar
 export async function sendAccountTelegramNotification(
   account: NotifyAccount,
   type: string,
-  fields: Array<[string, string | number | null | undefined]>
+  fields: Array<[string, string | number | null | undefined]>,
+  replyMarkup?: unknown
 ) {
   if (!account.telegramNotify) {
     return "";
@@ -85,12 +91,21 @@ export async function sendAccountTelegramNotification(
     return "";
   }
 
-  return telegramService.sendMessage({
+  const payload = {
     botToken: settings.telegram_bot_token,
     chatId: settings.telegram_chat_id,
     text: formatAccountNotification(account, type, fields),
-    apiBaseUrl: settings.telegram_api_base_url
-  });
+    apiBaseUrl: settings.telegram_api_base_url,
+    replyMarkup
+  };
+  try {
+    return await telegramService.sendMessage(payload);
+  } catch (error) {
+    if (replyMarkup) {
+      return telegramService.sendMessage({ ...payload, replyMarkup: undefined });
+    }
+    throw error;
+  }
 }
 
 export async function findNotifyAccount(db: TelegramDb, accountId: number) {
@@ -116,13 +131,13 @@ function formatAccountNotification(
   const lines = [`【${title}】`, ""];
   for (const [label, value] of fields) {
     const normalized = value === null || value === undefined || value === "" ? "-" : String(value);
-    lines.push(`${label}：${normalized}`);
+    lines.push(`${label}: ${normalized}`);
   }
   return lines.join("\n");
 }
 
 function deriveAccountName(input: { nickname?: string | null; email?: string | null; phone?: string | null; dtUserId?: string | null }) {
-  return input.nickname?.trim() || input.email?.trim() || input.phone?.trim() || input.dtUserId?.trim() || "未命名账户";
+  return input.nickname?.trim() || input.email?.trim() || input.phone?.trim() || input.dtUserId?.trim() || "未命名账号";
 }
 
 function phoneActionTitle(action: "purchase" | "renew" | "cancel" | "pause" | "resume") {
@@ -172,6 +187,23 @@ function formatValidPeriod(value: number) {
     return `${months} 个月`;
   }
   return `${value} 天`;
+}
+
+function extractVerificationCode(content: string) {
+  return content.match(/\b\d{4,8}\b/)?.[0] ?? null;
+}
+
+function buildCopyCodeReplyMarkup(code: string) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: `复制验证码 ${code}`,
+          copy_text: { text: code }
+        }
+      ]
+    ]
+  };
 }
 
 function safeParseJson(value: string) {

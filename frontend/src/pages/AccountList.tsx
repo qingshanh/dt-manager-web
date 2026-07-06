@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { App, Button, Card, Checkbox, Input, Popconfirm, Space, Switch, Table, Tag, Typography } from 'antd';
-import { DownloadOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, UploadOutlined } from '@ant-design/icons';
+import { App, Button, Card, Checkbox, Input, Popconfirm, Space, Switch, Table, Tag, Tooltip, Typography } from 'antd';
+import { CheckOutlined, CopyOutlined, DownloadOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, UploadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
 import { useNavigate } from 'react-router-dom';
@@ -29,6 +29,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+type CopyableCellProps = {
+  value: string | null | undefined;
+  copied: boolean;
+  onCopy: (value: string) => void;
+  fallback?: string;
+  maxWidth?: number;
+};
+
+function CopyableCell({ value, copied, onCopy, fallback = '-', maxWidth = 220 }: CopyableCellProps) {
+  const text = value?.trim();
+  if (!text) {
+    return <span style={{ color: '#999' }}>{fallback}</span>;
+  }
+  return (
+    <Tooltip title="Click to copy">
+      <Space
+        size={6}
+        onClick={(event) => {
+          event.stopPropagation();
+          onCopy(text);
+        }}
+        style={{ cursor: 'pointer', maxWidth, minHeight: 24 }}
+      >
+        <Typography.Text ellipsis style={{ maxWidth }}>
+          {text}
+        </Typography.Text>
+        {copied ? (
+          <Typography.Text type="success" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+            <CheckOutlined /> copied
+          </Typography.Text>
+        ) : (
+          <CopyOutlined style={{ color: '#999', fontSize: 12 }} />
+        )}
+      </Space>
+    </Tooltip>
+  );
+}
 function downloadJson(payload: unknown, filename: string) {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -47,6 +84,7 @@ export default function AccountList() {
   const [keyword, setKeyword] = useState('');
   const [actionLoading, setActionLoading] = useState<number | null>(null);
   const [validateImportedSessions, setValidateImportedSessions] = useState(false);
+  const [copiedCell, setCopiedCell] = useState<string | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const navigate = useNavigate();
   const { message, modal } = App.useApp();
@@ -71,6 +109,27 @@ export default function AccountList() {
     fetch();
   }, [fetch]);
 
+  const copyCellValue = async (key: string, value: string) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = value;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+      }
+      setCopiedCell(key);
+      window.setTimeout(() => setCopiedCell((current) => (current === key ? null : current)), 1400);
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : 'Copy failed');
+    }
+  };
   const handleToggleMonitor = async (id: number, enabled: boolean) => {
     setActionLoading(id);
     try {
@@ -93,12 +152,17 @@ export default function AccountList() {
     try {
       await deleteAccount(id);
       message.success('账户已删除');
-      await fetch();
     } catch (err) {
       message.error(err instanceof Error ? err.message : '删除失败');
+      return;
+    }
+
+    try {
+      await fetch();
+    } catch (err) {
+      message.warning(err instanceof Error ? `账户已删除，但列表刷新失败：${err.message}` : '账户已删除，但列表刷新失败');
     }
   };
-
   const handleUpdateNickname = async (record: DtAccountListItem, value: string) => {
     const nickname = value.trim().slice(0, 100);
     setActionLoading(record.id);
@@ -201,7 +265,12 @@ export default function AccountList() {
             onChange: (value) => void handleUpdateNickname(record, value),
           }}
         >
-          <a onClick={() => navigate(`/accounts/${record.id}`)}>{text || '未命名账户'}</a>
+          <CopyableCell
+            value={text || 'Unnamed account'}
+            copied={copiedCell === `nickname:${record.id}`}
+            onCopy={(value) => void copyCellValue(`nickname:${record.id}`, value)}
+            maxWidth={180}
+          />
         </Typography.Text>
       ),
     },
@@ -211,21 +280,46 @@ export default function AccountList() {
       width: 90,
       render: (value) => <Tag color={value === 'dingdong' ? 'blue' : 'gold'}>{value === 'dingdong' ? '叮咚' : '说道'}</Tag>,
     },
-    { title: '邮箱', dataIndex: 'email', ellipsis: true, render: (value) => value || '-' },
+    {
+      title: '邮箱',
+      dataIndex: 'email',
+      ellipsis: true,
+      render: (value, record) => (
+        <CopyableCell
+          value={value}
+          copied={copiedCell === `email:${record.id}`}
+          onCopy={(copyValue) => void copyCellValue(`email:${record.id}`, copyValue)}
+          maxWidth={220}
+        />
+      ),
+    },
     {
       title: '手机号',
       dataIndex: 'phone',
       width: 140,
       render: (value) => (value ? <Tag color="green">{value}</Tag> : <Tag color="default">未绑定</Tag>),
     },
-    { title: '用户 ID', dataIndex: 'dt_user_id', width: 150, render: (value) => value || '-' },
+    {
+      title: '用户 ID',
+      dataIndex: 'dt_user_id',
+      width: 170,
+      render: (value, record) => (
+        <CopyableCell
+          value={value}
+          copied={copiedCell === `user:${record.id}`}
+          onCopy={(copyValue) => void copyCellValue(`user:${record.id}`, copyValue)}
+          maxWidth={150}
+        />
+      ),
+    },
     {
       title: '状态',
       dataIndex: 'status',
       width: 90,
-      render: (value: string) => {
+      render: (value: string, record) => {
         const item = statusMap[value] || { color: 'default', label: value };
-        return <Tag color={item.color}>{item.label}</Tag>;
+        const tag = <Tag color={item.color}>{item.label}</Tag>;
+        return record.last_error ? <Tooltip title={record.last_error}>{tag}</Tooltip> : tag;
       },
     },
     {

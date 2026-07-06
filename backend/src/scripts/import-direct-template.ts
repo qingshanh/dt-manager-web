@@ -183,7 +183,7 @@ function collectRawCaptures(input: unknown) {
     }
 
     const record = value as Record<string, unknown>;
-    const hasHex = ["preview", "hex", "templateHex", "rawHexPreview"].some((key) => typeof record[key] === "string");
+    const hasHex = ["preview", "hex", "templateHex", "frameHex", "rawHex", "rawHexPreview"].some((key) => typeof record[key] === "string");
     if (hasHex) {
       captures.push({ ...record, path: pathName });
     }
@@ -203,7 +203,7 @@ function normalizeCapture(value: unknown, index: number, settingKey: string): Ca
   if (!isRecord(value)) {
     return null;
   }
-  const hex = trimCompleteDirectFrame(normalizeHex(String(value.preview ?? value.hex ?? value.templateHex ?? value.rawHexPreview ?? "")));
+  const hex = trimCompleteDirectFrame(normalizeHex(String(value.preview ?? value.hex ?? value.templateHex ?? value.frameHex ?? value.rawHex ?? value.rawHexPreview ?? "")));
   if (!hex) {
     return null;
   }
@@ -324,6 +324,9 @@ function looksInteresting(value: string) {
 function findApiHints(text: string) {
   const normalized = text.toLowerCase();
   return [
+    "checkActivatedUser",
+    "registerEmail",
+    "activateEmail",
     "requestAllOfflineMessage",
     "getWebOfflineMessage",
     "recoverPassword",
@@ -337,7 +340,13 @@ function findApiHints(text: string) {
 }
 
 function expectedHintsFor(settingKey: string) {
-  switch (settingKey) {
+  switch (baseTemplateSettingKey(settingKey)) {
+    case "dt_direct_template_check_activated_user":
+      return ["checkactivateduser", "check_activated_user"];
+    case "dt_direct_template_register_email":
+      return ["registeremail", "register_email"];
+    case "dt_direct_template_activate_email":
+      return ["activateemail", "activate_email", "activatecommon", "confirmcode"];
     case "dt_direct_template_request_phone":
       return ["getprivatenumber", "/pstn/share/getprivatenumber"];
     case "dt_direct_template_purchase_phone":
@@ -379,6 +388,39 @@ function trimCompleteDirectFrame(hex: string) {
 }
 
 export function defaultParamsFor(settingKey: string) {
+  const baseKey = baseTemplateSettingKey(settingKey);
+  if (baseKey === "dt_direct_template_check_activated_user") {
+    return {
+      deviceId: "$deviceId",
+      deviceID: "$deviceId",
+      json: "$jsonCondition",
+      jsonCondition: "$jsonCondition",
+      countryCode: "$countryCode",
+      areaCode: "$areaCode",
+      trackCode: "$TrackCode"
+    };
+  }
+  if (baseKey === "dt_direct_template_register_email") {
+    return {
+      deviceId: "$deviceId",
+      deviceID: "$deviceId",
+      email: "$email",
+      Email: "$json.Email",
+      json_Email: "$json.Email",
+      clientInfo: "$clientInfo"
+    };
+  }
+  if (baseKey === "dt_direct_template_activate_email") {
+    return {
+      deviceId: "$deviceId",
+      deviceID: "$deviceId",
+      confirmCode: "$confirmCode",
+      json: "$json",
+      Email: "$json.Email",
+      json_Email: "$json.Email",
+      clientInfo: "$clientInfo"
+    };
+  }
   if (settingKey === "dt_direct_template_offline_messages") {
     return {
       deviceId: "$deviceId",
@@ -394,6 +436,10 @@ export function defaultParamsFor(settingKey: string) {
     token: "$token",
     trackCode: "$trackCode"
   };
+}
+
+function baseTemplateSettingKey(settingKey: string) {
+  return settingKey.replace(/_(talku|dingdong)$/i, "");
 }
 
 function parseArgs(args: string[]) {

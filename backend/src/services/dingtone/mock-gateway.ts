@@ -82,7 +82,7 @@ export class MockDingtoneGateway implements DingtoneGateway {
     return {
       dtUserId,
       token: stableToken(tokenSeed),
-      deviceId: normalizeOptionalString(input.account?.deviceId) ?? `Android.${stableHash(deviceSeed).slice(0, 32)}.dttalk`,
+      deviceId: normalizeOptionalString(input.account?.deviceId) ?? `And.${stableHash(deviceSeed).slice(0, 32)}.dttalk`,
       dingtoneId: `mock-${stableHash(`${seed}:dingtone`).slice(0, 8)}`
     };
   }

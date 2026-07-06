@@ -14,6 +14,9 @@ import type {
   PhoneActionResult,
   PhoneCountryOption,
   PhonePurchasePreview,
+  PointData,
+  PointStoreData,
+  PointStoreOrderResult,
   PurchasePhoneNumberBody,
   PurchasePhoneNumberResult,
   RefreshMessagesResult,
@@ -29,7 +32,7 @@ import type {
   ValidateSessionResult,
 } from '../types';
 
-// ── 认证 ──
+// 鈹€鈹€ 璁よ瘉 鈹€鈹€
 
 export async function login(data: LoginRequest) {
   const res = await api.post<ApiResponse<LoginResult>>('/auth/login', data);
@@ -50,7 +53,7 @@ export async function changePassword(old_password: string, new_password: string)
   return res.data;
 }
 
-// ── 仪表盘 ──
+// 鈹€鈹€ 浠〃鐩?鈹€鈹€
 
 export async function getDashboardStats() {
   const res = await api.get<ApiResponse<DashboardStats>>('/dashboard/stats');
@@ -64,7 +67,7 @@ export async function getRecentMessages(limit = 20) {
   return res.data.data;
 }
 
-// ── 账户管理 ──
+// 鈹€鈹€ 璐︽埛绠＄悊 鈹€鈹€
 
 export async function getAccounts(params?: {
   page?: number;
@@ -80,6 +83,7 @@ export async function createAccount(data: CreateAccountRequest) {
   const res = await api.post<
     ApiResponse<{
       id: number;
+      account_id?: number;
       message?: string;
       dt_user_id?: string;
       status?: string;
@@ -87,17 +91,20 @@ export async function createAccount(data: CreateAccountRequest) {
       requires_session_import?: boolean;
       mock?: boolean;
       verification_code?: string | null;
+      verification_flow?: 'recover' | 'register' | null;
       reused?: boolean;
+      send_pending?: boolean;
     }>
   >(
     '/accounts',
     data,
+    { timeout: 120_000 },
   );
   return res.data.data;
 }
 
 export async function getAccount(id: number) {
-  const res = await api.get<ApiResponse<DtAccountDetail>>(`/accounts/${id}`);
+  const res = await api.get<ApiResponse<DtAccountDetail>>(`/accounts/${id}`, { timeout: 10_000 });
   return res.data.data;
 }
 
@@ -113,17 +120,20 @@ export async function deleteAccount(id: number) {
   return res.data;
 }
 
-export async function sendVerificationCode(id: number) {
-  const res = await api.post<ApiResponse<{ message: string; mock?: boolean; verification_code?: string | null }>>(
+export async function sendVerificationCode(id: number, options?: { fresh_device?: boolean }) {
+  const res = await api.post<ApiResponse<{ account_id?: number; message: string; mock?: boolean; verification_code?: string | null; verification_flow?: 'recover' | 'register' | null; send_pending?: boolean }>>(
     `/accounts/${id}/send-verification-code`,
+    options ?? undefined,
+    { timeout: 90_000 },
   );
   return res.data.data;
 }
 
 export async function verifyCode(id: number, code: string) {
-  const res = await api.post<ApiResponse<{ dt_user_id: string; dt_token: string; status: string }>>(
+  const res = await api.post<ApiResponse<{ dt_user_id: string; dt_token: string; status: string; snapshot?: DtAccountDetail['snapshot']; refresh_error?: string | null }>>(
     `/accounts/${id}/verify-code`,
     { code },
+    { timeout: 120_000 },
   );
   return res.data.data;
 }
@@ -156,7 +166,11 @@ export async function reLogin(id: number) {
 }
 
 export async function refreshAccount(id: number) {
-  const res = await api.post<ApiResponse<{ snapshot: DtAccountDetail['snapshot'] }>>(`/accounts/${id}/refresh`);
+  const res = await api.post<ApiResponse<{ snapshot: DtAccountDetail['snapshot']; refresh_error: string | null; cached: boolean }>>(
+    `/accounts/${id}/refresh`,
+    undefined,
+    { timeout: 12_000 },
+  );
   return res.data.data;
 }
 
@@ -170,7 +184,7 @@ export async function validateSession(id: number, data: ValidateSessionRequest) 
   return res.data.data;
 }
 
-// ── 消息 ──
+// 鈹€鈹€ 娑堟伅 鈹€鈹€
 
 export async function getAccountMessages(
   accountId: number,
@@ -178,12 +192,16 @@ export async function getAccountMessages(
     page?: number;
     pageSize?: number;
     keyword?: string;
+    msg_type?: Message['msg_type'];
+    exclude_system?: boolean;
     is_read?: boolean;
   },
 ) {
   const isReadParam = params?.is_read === undefined ? undefined : String(params.is_read);
+  const excludeSystemParam = params?.exclude_system === undefined ? undefined : String(params.exclude_system);
   const res = await api.get<ApiResponse<PagedData<Message>>>(`/accounts/${accountId}/messages`, {
-    params: { ...params, is_read: isReadParam },
+    params: { ...params, is_read: isReadParam, exclude_system: excludeSystemParam },
+    timeout: 10_000,
   });
   return res.data.data;
 }
@@ -266,15 +284,19 @@ export async function importFullBackup(data: { settings?: unknown[]; accounts?: 
   return res.data.data;
 }
 
-// ── 手机号 ──
+// 鈹€鈹€ 鎵嬫満鍙?鈹€鈹€
 
 export async function getPhoneNumbers(accountId: number) {
-  const res = await api.get<ApiResponse<PhoneNumber[]>>(`/accounts/${accountId}/phone-numbers`);
+  const res = await api.get<ApiResponse<PhoneNumber[]>>(`/accounts/${accountId}/phone-numbers`, { timeout: 10_000 });
   return res.data.data;
 }
 
 export async function syncPhoneNumbers(accountId: number) {
-  const res = await api.post<ApiResponse<PhoneNumber[]>>(`/accounts/${accountId}/phone-numbers/sync`);
+  const res = await api.post<ApiResponse<{ phone_numbers: PhoneNumber[]; refresh_error: string | null; cached: boolean }>>(
+    `/accounts/${accountId}/phone-numbers/sync`,
+    undefined,
+    { timeout: 12_000 },
+  );
   return res.data.data;
 }
 
@@ -297,6 +319,29 @@ export async function purchasePhoneNumber(accountId: number, data: PurchasePhone
   const res = await api.post<ApiResponse<PurchasePhoneNumberResult>>(`/accounts/${accountId}/phone-numbers/purchase`, data, {
     timeout: 180_000,
   });
+  return res.data.data;
+}
+
+export async function getAccountPoint(accountId: number) {
+  const res = await api.get<ApiResponse<PointData>>(`/accounts/${accountId}/point`, {
+    timeout: 10_000,
+  });
+  return res.data.data;
+}
+
+export async function getAccountPointStore(accountId: number) {
+  const res = await api.get<ApiResponse<PointStoreData>>(`/accounts/${accountId}/pointstore`, {
+    timeout: 10_000,
+  });
+  return res.data.data;
+}
+
+export async function orderPointStoreProduct(accountId: number, productId: string) {
+  const res = await api.post<ApiResponse<PointStoreOrderResult>>(
+    `/accounts/${accountId}/pointstore/order`,
+    { product_id: productId, confirm: true },
+    { timeout: 90_000 },
+  );
   return res.data.data;
 }
 
@@ -340,7 +385,7 @@ export async function deletePhoneNumber(accountId: number, phoneId: number) {
   return res.data;
 }
 
-// ── 设置 ──
+// 鈹€鈹€ 璁剧疆 鈹€鈹€
 
 export async function getSettings() {
   const res = await api.get<ApiResponse<SettingItem[]>>('/settings');

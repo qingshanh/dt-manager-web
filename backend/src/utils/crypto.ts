@@ -44,7 +44,7 @@ function decryptTextWithKey(value: string, candidateKey: Buffer) {
 }
 
 export function createDeviceId() {
-  return `Android.${crypto.randomBytes(16).toString("hex")}.dttalk`;
+  return `And.${crypto.randomBytes(16).toString("hex")}.dttalk`;
 }
 
 export function createTrackCode() {

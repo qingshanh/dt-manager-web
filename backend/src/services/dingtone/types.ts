@@ -129,6 +129,9 @@ export type VerificationRequestResult = {
   message: string;
   mock?: boolean;
   verificationCode?: string;
+  verificationFlow?: "recover" | "register";
+  expectedDtUserId?: string;
+  expectedDingtoneId?: string;
 };
 
 export type DingtoneGateway = {

@@ -9,6 +9,15 @@ export type DirectActionTemplate = {
 };
 
 export const DIRECT_TEMPLATE_SETTING_KEYS = [
+  "dt_direct_template_check_activated_user",
+  "dt_direct_template_check_activated_user_talku",
+  "dt_direct_template_check_activated_user_dingdong",
+  "dt_direct_template_register_email",
+  "dt_direct_template_register_email_talku",
+  "dt_direct_template_register_email_dingdong",
+  "dt_direct_template_activate_email",
+  "dt_direct_template_activate_email_talku",
+  "dt_direct_template_activate_email_dingdong",
   "dt_direct_template_request_phone",
   "dt_direct_template_purchase_phone",
   "dt_direct_template_renew_phone",
@@ -22,6 +31,29 @@ export const DIRECT_TEMPLATE_SETTING_KEYS = [
 export type DirectTemplateSettingKey = (typeof DIRECT_TEMPLATE_SETTING_KEYS)[number];
 
 export const DIRECT_TEMPLATE_SETTING_KEY_SET = new Set<string>(DIRECT_TEMPLATE_SETTING_KEYS);
+export type DirectEmailActivationAppVariant = "dingtone" | "dingdong" | string | null | undefined;
+
+export function directEmailActivationVariantKey(baseKey: string, appVariant: DirectEmailActivationAppVariant) {
+  if (appVariant === "dingtone") {
+    return `${baseKey}_talku`;
+  }
+  if (appVariant === "dingdong") {
+    return `${baseKey}_dingdong`;
+  }
+  return null;
+}
+
+export function hasDirectEmailActivationTemplateForVariant(
+  settings: Record<string, string>,
+  baseKey: string,
+  appVariant: DirectEmailActivationAppVariant,
+) {
+  const variantKey = directEmailActivationVariantKey(baseKey, appVariant);
+  if (variantKey) {
+    return Boolean(String(settings[variantKey] ?? "").trim());
+  }
+  return Boolean(String(settings[baseKey] ?? "").trim());
+}
 
 export function parseDirectActionTemplate(key: string, rawValue: string | undefined): DirectActionTemplate | null {
   const trimmed = rawValue?.trim();

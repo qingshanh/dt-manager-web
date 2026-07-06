@@ -5,20 +5,33 @@ import { execAdb, resolveAdbApp, resolveAdbSerial } from "./adb-app.js";
 type JsonRecord = Record<string, unknown>;
 
 const WALLET_MMKV_PATH = "files/mmkv/local_info_for_wallet";
+const LOCAL_INFO_MMKV_PATH = "files/mmkv/local_info";
+const DEFAULT_CREDIT_EXCHANGE_RATIO = 0.02;
 
-export async function readPointSnapshotFromAdb(variant: AppVariant): Promise<DingtoneSnapshot | null> {
+export async function readPointSnapshotFromAdb(variant: AppVariant, expectedDtUserId?: string | null): Promise<DingtoneSnapshot | null> {
   const app = resolveAdbApp(variant);
   const serial = await resolveAdbSerial();
-  const remotePath = `/data/user/0/${app.packageName}/${WALLET_MMKV_PATH}`;
-  const { stdout } = await execAdb(["-s", serial, "shell", "su", "0", "strings", remotePath]);
-  const pointGradeInfo = parseLastJsonAfterMarker(stdout, "pointGradeInfo<;");
-  const pointUid = findPointUidCandidate(stdout);
-  if (!pointGradeInfo && !pointUid) {
+  const walletRemotePath = `/data/user/0/${app.packageName}/${WALLET_MMKV_PATH}`;
+  const localInfoRemotePath = `/data/user/0/${app.packageName}/${LOCAL_INFO_MMKV_PATH}`;
+  const [walletStrings, localInfoBuffer] = await Promise.all([
+    execAdb(["-s", serial, "shell", "su", "0", "strings", walletRemotePath])
+      .then(({ stdout }) => stdout)
+      .catch(() => ""),
+    readRemoteFile(serial, localInfoRemotePath).catch(() => null)
+  ]);
+  const localInfo = localInfoBuffer ? parseLocalInfoMmkv(localInfoBuffer) : null;
+  if (expectedDtUserId && localInfo?.dtUserId && localInfo.dtUserId !== expectedDtUserId) {
+    return null;
+  }
+  const pointGradeInfo = parseLastJsonAfterMarker(walletStrings, "pointGradeInfo<;");
+  const pointUid = findPointUidCandidate(walletStrings);
+  if (!pointGradeInfo && !pointUid && !localInfo?.displayBalance) {
     return null;
   }
 
   const rawJson = {
     source: "adb-mmkv",
+    localInfo,
     point: {
       uid: pointUid,
       pointGradeInfo
@@ -31,6 +44,7 @@ export async function readPointSnapshotFromAdb(variant: AppVariant): Promise<Din
       validPoint: pickNumber(pointGradeInfo, ["validPoint"]),
       membershipLevelLabel: buildMembershipLevelLabel(incrementGradeLevel(pickNumber(pointGradeInfo, ["userGrade"]))),
       membershipBenefits: buildBenefitPlaceholders(pointGradeInfo),
+      balanceDisplay: localInfo?.displayBalance ?? null,
       fetchedAt: new Date().toISOString()
     }
   };
@@ -40,8 +54,61 @@ export async function readPointSnapshotFromAdb(variant: AppVariant): Promise<Din
     userGrade: userGrade ?? undefined,
     validPoint: pickNumber(pointGradeInfo, ["validPoint"]) ?? undefined,
     membershipLevelLabel: buildMembershipLevelLabel(userGrade) ?? undefined,
+    primaryBalance: localInfo?.displayBalance ?? undefined,
     rawJson: JSON.stringify(rawJson)
   };
+}
+
+async function readRemoteFile(serial: string, remotePath: string) {
+  const { stdout } = await execAdb(["-s", serial, "shell", "su", "0", "base64", remotePath]);
+  const compact = stdout.replace(/\s+/g, "");
+  return compact ? Buffer.from(compact, "base64") : null;
+}
+
+function parseLocalInfoMmkv(buffer: Buffer) {
+  const dtUserId = parseStringAfterKey(buffer, "UserID");
+  const rawBalance = parseFloatAfterKey(buffer, "MyBalanceKey");
+  const giftBalance = parseFloatAfterKey(buffer, "MyGiftBalanceKey");
+  const adEarnBalance = parseFloatAfterKey(buffer, "MyAdEarnBalanceKey");
+  const creditExchangeRatio = parseFloatAfterKey(buffer, "MyCreditExchangeRatioKey") ?? DEFAULT_CREDIT_EXCHANGE_RATIO;
+  const displayBalance = rawBalance !== null && creditExchangeRatio > 0 ? roundTo(rawBalance / creditExchangeRatio, 2) : null;
+  return {
+    dtUserId,
+    rawBalance,
+    giftBalance,
+    adEarnBalance,
+    creditExchangeRatio,
+    displayBalance
+  };
+}
+
+function parseFloatAfterKey(buffer: Buffer, key: string) {
+  let offset = -1;
+  let parsed: number | null = null;
+  while ((offset = buffer.indexOf(key, offset + 1, "utf8")) >= 0) {
+    const valueOffset = offset + Buffer.byteLength(key, "utf8");
+    if (buffer[valueOffset] !== 4 || valueOffset + 5 > buffer.length) {
+      continue;
+    }
+    const value = buffer.readFloatLE(valueOffset + 1);
+    if (Number.isFinite(value)) {
+      parsed = value;
+    }
+  }
+  return parsed;
+}
+
+function parseStringAfterKey(buffer: Buffer, key: string) {
+  let offset = -1;
+  let parsed: string | null = null;
+  while ((offset = buffer.indexOf(key, offset + 1, "utf8")) >= 0) {
+    const after = buffer.subarray(offset + Buffer.byteLength(key, "utf8"), Math.min(buffer.length, offset + Buffer.byteLength(key, "utf8") + 48));
+    const match = after.toString("latin1").match(/\d{12,21}/);
+    if (match?.[0]) {
+      parsed = match[0];
+    }
+  }
+  return parsed;
 }
 
 function parseLastJsonAfterMarker(value: string, marker: string) {
@@ -114,6 +181,11 @@ function pickNumber(record: JsonRecord | null, keys: string[]) {
     }
   }
   return null;
+}
+
+function roundTo(value: number, digits: number) {
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
 }
 
 function isRecord(value: unknown): value is JsonRecord {

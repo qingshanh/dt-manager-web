@@ -120,7 +120,19 @@ function emitFrameAt(source, bytes, offset) {
     ((bytes[offset + 3] & 0xff) << 16) |
     ((bytes[offset + 4] & 0xff) << 8) |
     (bytes[offset + 5] & 0xff);
-  if (declaredLength <= 0 || declaredLength > bytes.length - offset) {
+  if (declaredLength <= 0) {
+    return 0;
+  }
+  if (declaredLength > bytes.length - offset) {
+    send({
+      type: "direct-fragment",
+      source: source,
+      capturedAt: new Date().toISOString(),
+      availableLength: bytes.length - offset,
+      declaredLength: declaredLength,
+      hex: toHex(bytes.slice(offset)),
+      stack: captureStack()
+    });
     return 0;
   }
 
@@ -324,6 +336,14 @@ function hookJavaMethod(className, methodName, wrapper) {
 }
 
 function hookPrivatePhoneJavaCalls() {
+  hookJavaMethod("me.dingtone.app.im.tp.TpClient", "registerEmail", (overload) => function (cmd) {
+    emitJavaCall("TpClient.registerEmail", { cmd: dumpJavaObject(cmd) });
+    return overload.call(this, cmd);
+  });
+  hookJavaMethod("me.dingtone.app.im.tp.TpClient", "activateEmail", (overload) => function (cmd) {
+    emitJavaCall("TpClient.activateEmail", { cmd: dumpJavaObject(cmd) });
+    return overload.call(this, cmd);
+  });
   hookJavaMethod("me.dingtone.app.im.tp.TpClient", "privateNumberSetting", (overload) => function (cmd) {
     emitJavaCall("TpClient.privateNumberSetting", { cmd: dumpJavaObject(cmd) });
     return overload.call(this, cmd);
@@ -338,7 +358,7 @@ function hookPrivatePhoneJavaCalls() {
   });
   hookJavaMethod("me.tzim.app.im.tp.TpClientForJNI", "nativeRestCall", (overload) => function (ptr, type, obj) {
     const typeValue = typeof type === "number" ? type : Number(type);
-    if ([2050, 2052, 2132].indexOf(typeValue) >= 0) {
+    if ([543, 773, 774, 2050, 2052, 2132].indexOf(typeValue) >= 0) {
       emitJavaCall("TpClientForJNI.nativeRestCall", {
         type: typeValue,
         obj: dumpJavaObject(obj)

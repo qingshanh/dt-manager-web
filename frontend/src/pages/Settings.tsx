@@ -60,6 +60,7 @@ function toMap(items: SettingItem[]): Record<string, string> {
 function toFormMap(items: SettingItem[]) {
   const map: Record<string, string | boolean> = toMap(items);
   map.telegram_bot_enabled = map.telegram_bot_enabled === 'true';
+  map.collect_team_messages = map.collect_team_messages !== 'false';
   return map;
 }
 
@@ -375,6 +376,14 @@ export default function Settings() {
                   layout="vertical"
                   onFinish={(values) => handleSave(values as Record<string, string | number | boolean>)}
                 >
+                  <Form.Item
+                    label="获取团队/系统消息"
+                    name="collect_team_messages"
+                    valuePropName="checked"
+                    extra="开启后保存说道/叮咚团队通知，只显示在团队消息区，不发 Telegram 通知。"
+                  >
+                    <Switch checkedChildren="获取" unCheckedChildren="忽略" />
+                  </Form.Item>
                   <Form.Item label="消息轮询间隔（秒）" name="message_poll_interval">
                     <InputNumber min={10} max={600} style={{ width: '100%' }} />
                   </Form.Item>
