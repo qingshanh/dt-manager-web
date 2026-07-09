@@ -401,6 +401,8 @@ export interface PhoneActionResult {
 
 export interface RefreshMessagesResult {
   imported: number;
+  background?: boolean;
+  background_started?: boolean;
   scanned?: number;
   matched?: number;
   diagnostics?: Array<{
@@ -414,6 +416,7 @@ export interface RefreshMessagesResult {
     offlineTemplate?: {
       attempted: boolean;
       sent: boolean;
+      sendCount: number;
       status: 'sent' | 'attempted-not-sent' | 'not-attempted';
       listenStatus?: 'completed' | 'preempted';
       error?: string | null;

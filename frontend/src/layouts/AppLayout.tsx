@@ -11,10 +11,11 @@ import {
   UserOutlined,
 } from '@ant-design/icons';
 import { useAuthStore } from '../stores/auth';
-import { getRecentMessages } from '../services/endpoints';
+import { getRecentMessages, invalidateCachedData } from '../services/endpoints';
 import type { RecentMessage, SSENewMessageEvent } from '../types';
 
 const { Header, Sider, Content } = Layout;
+const RECENT_MESSAGE_FALLBACK_POLL_MS = 30_000;
 
 type MenuItem = Required<MenuProps>['items'][number];
 
@@ -104,6 +105,11 @@ export default function AppLayout() {
 
   const handleIncomingMessage = useCallback(
     (data: SSENewMessageEvent) => {
+      invalidateCachedData('dashboard:');
+      invalidateCachedData('accounts:');
+      if (data.accountId) {
+        invalidateCachedData(`account:${data.accountId}:`);
+      }
       dispatchIncomingMessage(data);
       notifyIncomingMessage(data);
     },
@@ -174,7 +180,7 @@ export default function AppLayout() {
         return;
       }
       try {
-        const items = await getRecentMessages(10);
+        const items = await getRecentMessages(10, { force: recentBaselineReadyRef.current });
         if (!recentBaselineReadyRef.current) {
           rememberRecentMessages(items);
           recentBaselineReadyRef.current = true;
@@ -205,7 +211,7 @@ export default function AppLayout() {
       if (!stopped) {
         void pollRecentMessages();
       }
-    }, 5000);
+    }, RECENT_MESSAGE_FALLBACK_POLL_MS);
 
     return () => {
       stopped = true;

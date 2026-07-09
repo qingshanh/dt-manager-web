@@ -49,8 +49,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -WithHelper -HelperDeviceMo
 默认地址：
 
 - 前端：`http://localhost:5173`
-- 后端：`http://localhost:3000`
-- helper：`http://127.0.0.1:19091`
+- 后端：`http://localhost:5174`
+- helper：`http://127.0.0.1:5175`
 
 ## Docker Compose 部署
 
@@ -74,7 +74,7 @@ JWT_SECRET=换成至少32位随机字符串
 ENCRYPTION_KEY=换成至少32位随机字符串
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=换成强密码
-CORS_ORIGIN=http://localhost:8080,http://127.0.0.1:8080
+CORS_ORIGIN=http://localhost:5173,http://127.0.0.1:5173
 ```
 
 Docker Compose 会把后端数据库固定到容器内的 `file:/app/data/dingtone.db`，数据保存在 `backend-data` volume 中；通常不用手动改 `DATABASE_URL`。
@@ -89,7 +89,7 @@ docker compose ps
 5. 打开：
 
 ```text
-http://localhost:8080
+http://localhost:5173
 ```
 
 6. 如果需要 helper + Frida：
@@ -124,7 +124,7 @@ JWT_SECRET=replace-with-a-long-random-secret
 ENCRYPTION_KEY=replace-with-a-long-random-secret
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=replace-with-a-strong-password
-CORS_ORIGIN=http://localhost:8080,http://127.0.0.1:8080
+CORS_ORIGIN=http://localhost:5173,http://127.0.0.1:5173
 ```
 
 4. 启动：
@@ -137,7 +137,7 @@ docker compose logs -f backend
 5. 打开：
 
 ```text
-http://服务器IP:8080
+http://服务器IP:5173
 ```
 
 如果前面有 Nginx、Caddy 或反向代理，请把 `CORS_ORIGIN` 改成真实访问域名，例如：
@@ -203,14 +203,14 @@ docker compose up -d
 
 常用前端和部署变量：
 
-- `PORT`：本地后端进程端口，默认 `3000`
-- `BACKEND_PORT`：Docker 暴露到宿主机的后端端口，默认 `3000`
-- `BACKEND_INTERNAL_PORT`：Docker 后端容器内部端口，默认 `3000`
-- `FRONTEND_PORT`：Docker 暴露到宿主机的前端端口，默认 `8080`
+- `PORT`：本地后端进程端口，默认 `5174`
+- `BACKEND_PORT`：Docker 暴露到宿主机的后端端口，默认 `5174`
+- `BACKEND_INTERNAL_PORT`：Docker 后端容器内部端口，默认 `5174`
+- `FRONTEND_PORT`：Docker 暴露到宿主机的前端端口，默认 `5173`
 - `VITE_DEV_HOST`、`VITE_DEV_PORT`：本地 Vite 开发服务地址，默认 `127.0.0.1:5173`
 - `VITE_BACKEND_URL`：本地 Vite 代理到的后端地址
 - `VITE_APP_VERSION`：前端显示的版本号；为空时可跟随 `APP_VERSION`
-- `HELPER_PORT`：宿主机 helper 端口，默认 `19091`
+- `HELPER_PORT`：宿主机 helper 端口，默认 `5175`
 - `DT_HELPER_REMOTE_HOST`：helper 连接 Frida 的地址
 
 ## 直连会话使用

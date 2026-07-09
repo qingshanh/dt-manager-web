@@ -203,6 +203,8 @@ const syncHelperMessagesSchema = z.object({
   direct_only: z.boolean().optional().default(false)
 });
 
+const activeMessageRefreshes = new Set<number>();
+
 const updatePhoneLabelSchema = z.object({
   display_name: z.string().trim().max(100)
 });
@@ -301,6 +303,7 @@ type RefreshMessagesDiagnostics = {
 type DirectMessageOfflineTemplateStatus = {
   attempted: boolean;
   sent: boolean;
+  sendCount: number;
   status: "sent" | "attempted-not-sent" | "not-attempted";
   listenStatus: "completed" | "preempted";
   error?: string | null;
@@ -355,30 +358,39 @@ accountsRouter.get("/", async (req, res, next) => {
       })
     ]);
 
-    const list = await Promise.all(
-      accounts.map(async (item) => {
-        const [unreadCount, activePhoneCount] = await Promise.all([
-          prisma.message.count({ where: { accountId: item.id, isRead: false } }),
-          prisma.phoneNumber.count({ where: { accountId: item.id, status: PhoneStatus.active } })
-        ]);
+    const accountIds = accounts.map((item) => item.id);
+    const [unreadRows, activePhoneRows] = accountIds.length > 0
+      ? await Promise.all([
+          prisma.message.groupBy({
+            by: ["accountId"],
+            where: { accountId: { in: accountIds }, isRead: false },
+            _count: { _all: true }
+          }),
+          prisma.phoneNumber.groupBy({
+            by: ["accountId"],
+            where: { accountId: { in: accountIds }, status: PhoneStatus.active },
+            _count: { _all: true }
+          })
+        ])
+      : [[], []];
+    const unreadCountByAccountId = new Map(unreadRows.map((row) => [row.accountId, row._count._all]));
+    const activePhoneCountByAccountId = new Map(activePhoneRows.map((row) => [row.accountId, row._count._all]));
 
-        return {
-          id: item.id,
-          nickname: resolveAccountName(item),
-          app_variant: item.appVariant,
-          email: item.email,
-          phone: item.phone,
-          dt_user_id: item.dtUserId,
-          status: item.status,
-          monitor_enabled: item.monitorEnabled,
-          telegram_notify: item.telegramNotify,
-          unread_count: unreadCount,
-          active_phone_count: activePhoneCount,
-          last_login_at: item.lastLoginAt,
-          created_at: item.createdAt
-        };
-      })
-    );
+    const list = accounts.map((item) => ({
+      id: item.id,
+      nickname: resolveAccountName(item),
+      app_variant: item.appVariant,
+      email: item.email,
+      phone: item.phone,
+      dt_user_id: item.dtUserId,
+      status: item.status,
+      monitor_enabled: item.monitorEnabled,
+      telegram_notify: item.telegramNotify,
+      unread_count: unreadCountByAccountId.get(item.id) ?? 0,
+      active_phone_count: activePhoneCountByAccountId.get(item.id) ?? 0,
+      last_login_at: item.lastLoginAt,
+      created_at: item.createdAt
+    }));
 
     paged(res, { list, total, page, pageSize });
   } catch (error) {
@@ -471,42 +483,48 @@ accountsRouter.post("/", async (req, res, next) => {
           status: AccountStatus.pending
         }
       });
-
-      let sendResult: VerificationSendResult;
+      let fastAck: VerificationSendFastAckResult;
       try {
-        sendResult = await sendVerificationCodeWithVariantFallback({
-          loginType: body.login_type,
-          appVariant: body.app_variant,
-          email: body.email,
-          phone: body.phone,
-          deviceId,
-          trackCode
-        });
-        await prisma.dtAccount.update({
-          where: { id: account.id },
-          data: {
-            appVariant: sendResult.appVariant,
-            dtDeviceId: sendResult.deviceId,
-            dtTrackCode: sendResult.trackCode,
-            lastError: null
-          }
+        fastAck = await sendVerificationCodeWithFastAck({
+          accountId: account.id,
+          adminId,
+          sendInput: {
+            loginType: body.login_type,
+            appVariant: body.app_variant,
+            email: body.email,
+            phone: body.phone,
+            deviceId,
+            trackCode
+          },
+          statusOnSuccess: nextStatus
         });
       } catch (error) {
         if (!account.dtUserId) {
           await prisma.dtAccount.deleteMany({ where: { id: account.id, adminId } }).catch(() => null);
         } else {
-          await prisma.dtAccount.update({ where: { id: account.id }, data: { lastError: error instanceof Error ? error.message : String(error) } }).catch(() => null);
+          await prisma.dtAccount.update({ where: { id: account.id }, data: { lastError: formatLastError(error) } }).catch(() => null);
         }
         throw error;
       }
 
+      if (fastAck.pending) {
+        return ok(res, {
+          id: account.id,
+          account_id: account.id,
+          app_variant: body.app_variant,
+          message: "Verification code request submitted. If you receive the code, enter it to continue login.",
+          requires_verification: true,
+          send_pending: true
+        });
+      }
+
       return ok(res, {
         id: account.id,
-        app_variant: sendResult.appVariant,
-        message: sendResult.result.message,
+        app_variant: fastAck.result.appVariant,
+        message: fastAck.result.result.message,
         requires_verification: true,
-        mock: sendResult.result.mock ?? false,
-        verification_code: sendResult.result.verificationCode ?? null
+        mock: fastAck.result.result.mock ?? false,
+        verification_code: fastAck.result.result.verificationCode ?? null
       });
     }
 
@@ -840,39 +858,55 @@ accountsRouter.post("/:id/send-verification-code", async (req, res, next) => {
     if (account.loginType !== "email_code" && account.loginType !== "phone_code") {
       throw new AppError("Only email or phone verification-code login can send a verification code.", 400, 400);
     }
-    let sendResult: VerificationSendResult;
+    const deviceId = createDeviceId();
+    const trackCode = createTrackCode();
+    await prisma.dtAccount.update({
+      where: { id: account.id },
+      data: {
+        dtDeviceId: deviceId,
+        dtTrackCode: trackCode,
+        lastError: null
+      }
+    });
+
+    let fastAck: VerificationSendFastAckResult;
     try {
-      sendResult = await sendVerificationCodeWithVariantFallback({
-        loginType: account.loginType,
-        appVariant: account.appVariant,
-        email: account.email,
-        phone: account.phone,
-        deviceId: normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType),
-        trackCode: account.dtTrackCode
+      fastAck = await sendVerificationCodeWithFastAck({
+        accountId: account.id,
+        adminId: req.auth!.userId,
+        sendInput: {
+          loginType: account.loginType,
+          appVariant: account.appVariant,
+          email: account.email,
+          phone: account.phone,
+          deviceId: normalizeVerificationDeviceId(deviceId, account.appVariant, account.loginType),
+          trackCode
+        },
+        statusOnSuccess: account.dtUserId ? account.status : AccountStatus.pending
       });
     } catch (error) {
       if (!account.dtUserId) {
         await prisma.dtAccount.deleteMany({ where: { id: account.id, adminId: req.auth!.userId } }).catch(() => null);
       } else {
-        await prisma.dtAccount.update({ where: { id: account.id }, data: { lastError: error instanceof Error ? error.message : String(error) } }).catch(() => null);
+        await prisma.dtAccount.update({ where: { id: account.id }, data: { lastError: formatLastError(error) } }).catch(() => null);
       }
       throw error;
     }
-    await prisma.dtAccount.update({
-      where: { id: account.id },
-      data: {
-        appVariant: sendResult.appVariant,
-        dtDeviceId: sendResult.deviceId,
-        dtTrackCode: sendResult.trackCode,
-        status: account.dtUserId ? account.status : AccountStatus.pending,
-        lastError: null
-      }
-    });
+
+    if (fastAck.pending) {
+      return ok(res, {
+        account_id: account.id,
+        app_variant: account.appVariant,
+        message: "Verification code request submitted. If you receive the code, enter it to continue login.",
+        send_pending: true
+      });
+    }
+
     ok(res, {
-      app_variant: sendResult.appVariant,
-      message: sendResult.result.message,
-      mock: sendResult.result.mock ?? false,
-      verification_code: sendResult.result.verificationCode ?? null
+      app_variant: fastAck.result.appVariant,
+      message: fastAck.result.result.message,
+      mock: fastAck.result.result.mock ?? false,
+      verification_code: fastAck.result.result.verificationCode ?? null
     });
   } catch (error) {
     next(error);
@@ -1214,6 +1248,34 @@ accountsRouter.post("/:id/messages/refresh", async (req, res, next) => {
   try {
     const account = await assertAccount(Number(req.params.id));
     const body = syncHelperMessagesSchema.parse(req.body ?? {});
+    const shouldRunInBackground = !body.direct_only && (await shouldUseDirectAccountFlow(account)) && Boolean(account.dtUserId && account.dtToken);
+    if (shouldRunInBackground) {
+      const backgroundStarted = startBackgroundMessageRefresh(account.id, body.limit, body.direct_only);
+      const latest = await prisma.message.findMany({
+        where: { accountId: account.id },
+        orderBy: [{ receivedAt: "desc" }, { id: "desc" }],
+        take: 10
+      });
+      return ok(res, {
+        imported: 0,
+        background: true,
+        background_started: backgroundStarted,
+        diagnostics: [
+          {
+            source: "background-direct",
+            scanned: 0,
+            imported: 0,
+            sampleSender: null,
+            sampleContent: backgroundStarted
+              ? "Background direct SMS refresh started; local messages will update after import."
+              : "Background direct SMS refresh is already running; this request did not start another one.",
+            sampleReceivedAt: new Date().toISOString()
+          }
+        ],
+        messages: latest.map(serializeMessage)
+      });
+    }
+
     const result = await refreshMessagesFromRemote(account.id, body.limit, body.direct_only);
     const latest = await prisma.message.findMany({
       where: { accountId: account.id },
@@ -1695,7 +1757,7 @@ async function refreshAccountData(
   if (phoneNumbers.length > 0) {
     await syncPhoneNumbers(accountId, phoneNumbers);
   } else {
-    logger.warn("鍒锋柊璐︽埛鍙风爜鍒楄〃杩斿洖绌烘暟鎹紝淇濈暀鏈湴宸叉湁鍙风爜", {
+    logger.warn("Account refresh returned no phone numbers from gateway", {
       accountId,
       dtUserId
     });
@@ -1734,7 +1796,7 @@ async function finalizeSuccessfulLogin(input: {
       where: { id: accountId },
       data: {
         status: AccountStatus.error,
-        lastError: error instanceof Error ? error.message : "鍒锋柊璐︽埛淇℃伅澶辫触"
+        lastError: error instanceof Error ? error.message : "Failed to refresh account data after login"
       }
     });
   }
@@ -2049,7 +2111,7 @@ async function assertCapturedSessionIsNotOwnedByAnotherAccount(
 }
 
 function describeAccountVariant(variant: AppVariant) {
-  return variant === AppVariant.dingdong ? "叮咚" : "说道/TalkU";
+  return variant === AppVariant.dingdong ? "Dingdong" : "TalkU";
 }
 
 function delayResult<T>(ms: number, value: T): Promise<T> {
@@ -3449,7 +3511,34 @@ function normalizeImportedSnapshot(value: unknown): DingtoneSnapshot {
   };
 }
 
-async function refreshMessagesFromRemote(accountId: number, limit: number, directOnly = false) {
+function startBackgroundMessageRefresh(accountId: number, limit: number, requestedDirectOnly: boolean) {
+  if (activeMessageRefreshes.has(accountId)) {
+    return false;
+  }
+  activeMessageRefreshes.add(accountId);
+  void (async () => {
+    try {
+      const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
+      const directWaitSeconds = parsePositiveIntSetting(settings.direct_message_listen_seconds, 45);
+      const result = await refreshMessagesFromRemote(accountId, limit, true, { directWaitSeconds });
+      logger.info("Background direct message refresh completed", {
+        accountId,
+        requestedDirectOnly,
+        imported: result.imported,
+        diagnostics: result.diagnostics.map((item) => ({ source: item.source, scanned: item.scanned, imported: item.imported }))
+      });
+    } catch (error) {
+      logger.warn("Background direct message refresh failed", {
+        accountId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } finally {
+      activeMessageRefreshes.delete(accountId);
+    }
+  })();
+  return true;
+}
+async function refreshMessagesFromRemote(accountId: number, limit: number, directOnly = false, options?: { directWaitSeconds?: number }) {
   const diagnostics: RefreshMessagesDiagnostics[] = [];
   const account = await assertAccount(accountId);
   const useDirectFlow = await shouldUseDirectAccountFlow(account);
@@ -3462,7 +3551,7 @@ async function refreshMessagesFromRemote(accountId: number, limit: number, direc
         scanned: 0,
         imported: 0,
         sampleSender: null,
-        sampleContent: "后台 direct 监听正在运行；本次手动刷新未新开 direct 连接，避免抢占实时短信监听。",
+        sampleContent: "Background direct monitor is already running; manual refresh skipped opening another direct connection.",
         sampleReceivedAt: new Date().toISOString()
       });
       return { imported: 0, diagnostics };
@@ -3474,7 +3563,7 @@ async function refreshMessagesFromRemote(accountId: number, limit: number, direc
   try {
     if (useDirectFlow && account.dtUserId && account.dtToken) {
     const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
-    const directWaitSeconds = parsePositiveIntSetting(settings.direct_message_refresh_wait_seconds, 12);
+    const directWaitSeconds = options?.directWaitSeconds ?? parsePositiveIntSetting(settings.direct_message_refresh_wait_seconds, 8);
     const pushes = await listenDirectSessionPushes({
       account: {
         dtUserId: account.dtUserId,
@@ -3483,7 +3572,7 @@ async function refreshMessagesFromRemote(accountId: number, limit: number, direc
         email: account.email,
         phone: account.phone
       },
-      listenSeconds: Math.max(5, Math.min(20, directWaitSeconds)),
+      listenSeconds: Math.max(15, Math.min(120, directWaitSeconds)),
       maxPushFrames: Math.max(12, Math.min(50, limit))
     }).catch((error) => {
       diagnostics.push({
@@ -3591,6 +3680,10 @@ async function refreshMessagesFromRemote(accountId: number, limit: number, direc
 }
 
 async function buildActiveMonitorRefreshDiagnostics(accountId: number): Promise<RefreshMessagesDiagnostics | null> {
+  if (!accountMonitorService.isRunning(accountId)) {
+    return null;
+  }
+
   const session = await prisma.monitorSession.findFirst({
     where: {
       accountId,
@@ -3601,8 +3694,11 @@ async function buildActiveMonitorRefreshDiagnostics(accountId: number): Promise<
   if (!session) {
     return null;
   }
+  if (!session.routeAddress?.includes("listen=active")) {
+    return null;
+  }
 
-  const note = session.routeAddress ?? "后台 direct 监听已启动，正在等待推送帧。";
+  const note = session.routeAddress;
   return {
     source: "direct-monitor",
     scanned: pickDiagnosticNumber(note, "raw8107") ?? 0,
@@ -3720,6 +3816,7 @@ export function buildDirectMessageOfflineTemplateStatus(pushes: DirectProbeResul
   return {
     attempted,
     sent,
+    sendCount: pushes.offlineTemplateSendCount ?? (sent ? 1 : 0),
     status: sent ? "sent" : attempted ? "attempted-not-sent" : "not-attempted",
     listenStatus: pushes.preempted ? "preempted" : "completed",
     error: pushes.offlineTemplateError ?? null
@@ -3738,7 +3835,8 @@ export function buildDirectMessageRefreshNote(pushes: DirectProbeResult | null) 
     `raw8107=${traceSummary.rawPushFrames}`,
     `nonSms8107=${traceSummary.nonSmsPushFrames}`,
     `listen=${pushes.preempted ? "preempted" : "completed"}`,
-    offlineTemplateStatus
+    offlineTemplateStatus,
+    `offlineCatchupSends=${pushes.offlineTemplateSendCount ?? 0}`
   ];
   if (traceSummary.statusSummary) {
     parts.push(`status=${traceSummary.statusSummary}`);
@@ -3751,7 +3849,7 @@ export function buildDirectMessageRefreshNote(pushes: DirectProbeResult | null) 
 
 function formatOfflineTemplateStatus(pushes: DirectProbeResult) {
   if (pushes.offlineTemplateSent) {
-    return "offlineTemplate=sent; offlineCatchup=requested";
+    return `offlineTemplate=sent; offlineCatchup=requested`;
   }
   if (pushes.offlineTemplateAttempted) {
     const catchupStatus = pushes.offlineTemplateError?.includes("not configured") ? "template-missing" : "template-error";
@@ -3799,7 +3897,7 @@ function buildDirectMissedFrameSample(pushes: DirectProbeResult | null) {
     : null;
   const bodyPreview = suspicious.bodyHexPreview ? `${suspicious.bodyHexPreview.slice(0, 96)}...` : "empty";
   return [
-    "疑似短信状态帧未解析",
+    "Suspicious SMS status frame was not parsed",
     `status=0x0103`,
     `body=${suspicious.bodyLength}`,
     jsonName ? `json=${jsonName}` : null,
@@ -3934,6 +4032,56 @@ type VerificationSendResult = {
   switched: boolean;
 };
 
+type VerificationSendFastAckResult =
+  | { pending: false; result: VerificationSendResult }
+  | { pending: true; result?: undefined };
+
+const VERIFICATION_SEND_FAST_ACK_MS = 8_000;
+
+async function sendVerificationCodeWithFastAck(input: {
+  accountId: number;
+  adminId: number;
+  sendInput: VerificationSendInput;
+  statusOnSuccess: AccountStatus;
+  timeoutMs?: number;
+}): Promise<VerificationSendFastAckResult> {
+  const sendTask = sendVerificationCodeWithVariantFallback(input.sendInput)
+    .then(async (sendResult) => {
+      await prisma.dtAccount.updateMany({
+        where: { id: input.accountId, adminId: input.adminId },
+        data: {
+          appVariant: sendResult.appVariant,
+          dtDeviceId: sendResult.deviceId,
+          dtTrackCode: sendResult.trackCode,
+          status: input.statusOnSuccess,
+          lastError: null
+        }
+      });
+      return sendResult;
+    })
+    .catch(async (error) => {
+      await prisma.dtAccount.updateMany({
+        where: { id: input.accountId, adminId: input.adminId },
+        data: { lastError: formatLastError(error) }
+      }).catch(() => null);
+      throw error;
+    });
+
+  const first = await Promise.race([
+    sendTask,
+    delayResult<"pending">(input.timeoutMs ?? VERIFICATION_SEND_FAST_ACK_MS, "pending")
+  ]);
+  if (first === "pending") {
+    void sendTask.catch(() => undefined);
+    return { pending: true };
+  }
+  return { pending: false, result: first };
+}
+
+function formatLastError(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function sendVerificationCodeWithVariantFallback(input: VerificationSendInput): Promise<VerificationSendResult> {
   try {
     const result = await dingtoneGateway.sendVerificationCode(input);
@@ -3960,11 +4108,7 @@ async function sendVerificationCodeWithVariantFallback(input: VerificationSendIn
       });
       return { result, appVariant: fallbackVariant, deviceId: fallbackDeviceId, trackCode: fallbackTrackCode, switched: true };
     } catch (fallbackError) {
-      throw new AppError(
-        `邮箱验证码自动识别 App 失败：${formatAppVariantName(input.appVariant)} 返回：${formatVerificationSendError(firstError)}；${formatAppVariantName(fallbackVariant)} 返回：${formatVerificationSendError(fallbackError)}`,
-        400,
-        400
-      );
+      throw new AppError(`Email verification app auto-detection failed: ${formatAppVariantName(input.appVariant)} returned: ${formatVerificationSendError(firstError)}; ${formatAppVariantName(fallbackVariant)} returned: ${formatVerificationSendError(fallbackError)}`, 400, 400);
     }
   }
 }

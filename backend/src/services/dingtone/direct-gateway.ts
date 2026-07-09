@@ -163,6 +163,7 @@ export type DirectProbeResult = {
   trace?: DirectProbeFrameTrace[];
   offlineTemplateAttempted?: boolean;
   offlineTemplateSent?: boolean;
+  offlineTemplateSendCount?: number;
   offlineTemplateError?: string | null;
   preempted?: boolean;
 };
@@ -274,6 +275,14 @@ const DIRECT_ACTIVATION_CLIENT_VERSION = 1023;
 const DIRECT_ACTIVATE_EMAIL_CLIENT_VERSION = -1610218240;
 const DIRECT_ACTIVATION_EMAIL_CRYPTO_IV = Buffer.from("5875b9f15ed445239539cb455cdcbed7", "hex");
 const DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS = 4_000;
+const DIRECT_OFFLINE_CATCHUP_INTERVAL_MS = 5 * 60_000;
+const DIRECT_OFFLINE_CATCHUP_RETRY_MS = 30_000;
+const DIRECT_NOTIFY_ONLY_CATCHUP_THROTTLE_MS = 60_000;
+const DIRECT_PUSH_NON_SMS_FRAME_BATCH_LIMIT = 5;
+const DIRECT_PUSH_NON_SMS_FRAME_PAUSE_MS = 1_000;
+const DIRECT_IDLE_NON_SMS_FRAME_PAUSE_BATCH = 3;
+const DIRECT_IDLE_NON_SMS_FRAME_PAUSE_MS = 750;
+const DIRECT_SOCKET_FRAME_BUDGET_PER_TICK = 20;
 const CAPTURED_OFFLINE_FIELDS = {
   deviceId: "And.11111111111111111111111111111111.dttalk"
 } as const;
@@ -344,26 +353,26 @@ const TEMPLATES = {
 } as const;
 
 const APP_PHONE_COUNTRY_CONFIGS: PrivatePhoneRequestConfig[] = [
-  { countryKey: "US", label: "缂囧骸娴?+1", countryCode: 1, isoCountryCode: "US", providerIdList: ["2000", "2001"], packageServiceId: "DT01001", applyType: 1, randomAreaCodes: [213, 646, 312, 415, 305, 212, 323, 424, 469, 512, 628, 702, 786, 929, 971] },
-  { countryKey: "CA", label: "閸旂姵瀣佹径?+1", countryCode: 1, isoCountryCode: "CA", providerIdList: ["2000", "2001"], packageServiceId: "DT02002", applyType: 2, randomAreaCodes: [416, 647, 437, 604, 778, 236, 514, 438, 613, 343] },
-  { countryKey: "GB", label: "閼诲崬娴?+44", countryCode: 44, isoCountryCode: "GB", providerIdList: ["2001", "2007"], packageServiceId: "DT02001", applyType: 3 },
-  { countryKey: "BE", label: "濮ｆ柨鍩勯弮?+32", countryCode: 32, isoCountryCode: "BE", providerIdList: ["2002"], packageServiceId: "DT03001", applyType: 5 },
-  { countryKey: "NL", label: "閼藉嘲鍙?+31", countryCode: 31, isoCountryCode: "NL", providerIdList: ["2006"], packageServiceId: "DT03005", applyType: 9 },
-  { countryKey: "RU", label: "娣囧嫮缍忛弬?+7", countryCode: 7, isoCountryCode: "RU", providerIdList: ["2003"], packageServiceId: "DT03002", applyType: 6 },
-  { countryKey: "ES", label: "鐟楄法褰悧?+34", countryCode: 34, isoCountryCode: "ES", providerIdList: ["2004"], packageServiceId: "DT03003", applyType: 7 },
-  { countryKey: "CN", label: "娑擃厼娴?+86", countryCode: 86, isoCountryCode: "CN", providerIdList: ["2030"], packageServiceId: "DT04001", applyType: 11 },
-  { countryKey: "AU", label: "濠㈠啿銇囬崚鈺€绨?+61", countryCode: 61, isoCountryCode: "AU", providerIdList: ["2008"], packageServiceId: "DT03007", applyType: 13 },
-  { countryKey: "AT", label: "婵傘儱婀撮崚?+43", countryCode: 43, isoCountryCode: "AT", providerIdList: ["2100"], packageServiceId: "DT03008", applyType: 14 },
-  { countryKey: "FR", label: "濞夋洖娴?+33", countryCode: 33, isoCountryCode: "FR", providerIdList: ["2100"], packageServiceId: "DT03009", applyType: 15 },
-  { countryKey: "SE", label: "閻熺偛鍚€ +46", countryCode: 46, isoCountryCode: "SE", providerIdList: ["2100"], packageServiceId: "DT03010", applyType: 16 },
-  { countryKey: "MU", label: "濮ｆ盯鍣峰Ч鍌涙焿 +230", countryCode: 230, isoCountryCode: "MU", providerIdList: ["2100"], packageServiceId: "DT03011", applyType: 17 },
-  { countryKey: "PL", label: "濞夈垹鍙?+48", countryCode: 48, isoCountryCode: "PL", providerIdList: ["2300"], packageServiceId: "DT05003", applyType: 18 },
-  { countryKey: "ID", label: "閸楁澘瀹崇亸鑹般偪娴?+62", countryCode: 62, isoCountryCode: "ID", providerIdList: ["2300"], packageServiceId: "DT05004", applyType: 19 },
-  { countryKey: "PR", label: "濞夈垹顦挎搴℃倗 +1787", countryCode: 1787, isoCountryCode: "PR", providerIdList: ["2300"], packageServiceId: "DT05005", applyType: 20 },
-  { countryKey: "CZ", label: "閹瑰嘲鍘?+420", countryCode: 420, isoCountryCode: "CZ", providerIdList: ["2300"], packageServiceId: "DT05006", applyType: 21 },
-  { countryKey: "MY", label: "妞诡剚娼电憲澶哥肮 +60", countryCode: 60, isoCountryCode: "MY", providerIdList: ["2300"], packageServiceId: "DT05007", applyType: 22 },
-  { countryKey: "DK", label: "娑撳綊瀹?+45", countryCode: 45, isoCountryCode: "DK", providerIdList: ["2300"], packageServiceId: "DT05008", applyType: 23 },
-  { countryKey: "RO", label: "缂冩鈹堢亸闂寸肮 +40", countryCode: 40, isoCountryCode: "RO", providerIdList: ["2300"], packageServiceId: "DT05009", applyType: 24 }
+  { countryKey: "US", label: "缂傚洤楠稿ù?+1", countryCode: 1, isoCountryCode: "US", providerIdList: ["2000", "2001"], packageServiceId: "DT01001", applyType: 1, randomAreaCodes: [213, 646, 312, 415, 305, 212, 323, 424, 469, 512, 628, 702, 786, 929, 971] },
+  { countryKey: "CA", label: "闁告梻濮电€ｄ焦寰?+1", countryCode: 1, isoCountryCode: "CA", providerIdList: ["2000", "2001"], packageServiceId: "DT02002", applyType: 2, randomAreaCodes: [416, 647, 437, 604, 778, 236, 514, 438, 613, 343] },
+  { countryKey: "GB", label: "闁艰宕ù?+44", countryCode: 44, isoCountryCode: "GB", providerIdList: ["2001", "2007"], packageServiceId: "DT02001", applyType: 3 },
+  { countryKey: "BE", label: "婵絾鏌ㄩ崺鍕籍?+32", countryCode: 32, isoCountryCode: "BE", providerIdList: ["2002"], packageServiceId: "DT03001", applyType: 5 },
+  { countryKey: "NL", label: "闁艰棄鍢查崣?+31", countryCode: 31, isoCountryCode: "NL", providerIdList: ["2006"], packageServiceId: "DT03005", applyType: 9 },
+  { countryKey: "RU", label: "濞ｅ洤瀚紞蹇涘棘?+7", countryCode: 7, isoCountryCode: "RU", providerIdList: ["2003"], packageServiceId: "DT03002", applyType: 6 },
+  { countryKey: "ES", label: "閻熸娉曡ぐ顕€鎮?+34", countryCode: 34, isoCountryCode: "ES", providerIdList: ["2004"], packageServiceId: "DT03003", applyType: 7 },
+  { countryKey: "CN", label: "濞戞搩鍘煎ù?+86", countryCode: 86, isoCountryCode: "CN", providerIdList: ["2030"], packageServiceId: "DT04001", applyType: 11 },
+  { countryKey: "AU", label: "婵犮垹鍟块妵鍥礆閳衡偓缁?+61", countryCode: 61, isoCountryCode: "AU", providerIdList: ["2008"], packageServiceId: "DT03007", applyType: 13 },
+  { countryKey: "AT", label: "濠靛倶鍎卞﹢鎾礆?+43", countryCode: 43, isoCountryCode: "AT", providerIdList: ["2100"], packageServiceId: "DT03008", applyType: 14 },
+  { countryKey: "FR", label: "婵炲娲栧ù?+33", countryCode: 33, isoCountryCode: "FR", providerIdList: ["2100"], packageServiceId: "DT03009", applyType: 15 },
+  { countryKey: "SE", label: "闁荤喓鍋涢崥鈧?+46", countryCode: 46, isoCountryCode: "SE", providerIdList: ["2100"], packageServiceId: "DT03010", applyType: 16 },
+  { countryKey: "MU", label: "婵絾鐩崳宄靶ч崒娑欑効 +230", countryCode: 230, isoCountryCode: "MU", providerIdList: ["2100"], packageServiceId: "DT03011", applyType: 17 },
+  { countryKey: "PL", label: "婵炲鍨归崣?+48", countryCode: 48, isoCountryCode: "PL", providerIdList: ["2300"], packageServiceId: "DT05003", applyType: 18 },
+  { countryKey: "ID", label: "闁告婢樼€瑰磭浜搁懝鑸仾濞?+62", countryCode: 62, isoCountryCode: "ID", providerIdList: ["2300"], packageServiceId: "DT05004", applyType: 19 },
+  { countryKey: "PR", label: "婵炲鍨归ˇ鎸庮渶鎼粹剝鍊?+1787", countryCode: 1787, isoCountryCode: "PR", providerIdList: ["2300"], packageServiceId: "DT05005", applyType: 20 },
+  { countryKey: "CZ", label: "闁圭懓鍢查崢?+420", countryCode: 420, isoCountryCode: "CZ", providerIdList: ["2300"], packageServiceId: "DT05006", applyType: 21 },
+  { countryKey: "MY", label: "濡炶鍓氬鐢垫啿婢跺摜鑲?+60", countryCode: 60, isoCountryCode: "MY", providerIdList: ["2300"], packageServiceId: "DT05007", applyType: 22 },
+  { countryKey: "DK", label: "濞戞挸缍婄€?+45", countryCode: 45, isoCountryCode: "DK", providerIdList: ["2300"], packageServiceId: "DT05008", applyType: 23 },
+  { countryKey: "RO", label: "缂傚啯顨婇埞鍫焊闂傚鑲?+40", countryCode: 40, isoCountryCode: "RO", providerIdList: ["2300"], packageServiceId: "DT05009", applyType: 24 }
 ];
 
 export class DirectDingtoneGateway implements DingtoneGateway {
@@ -1111,11 +1120,20 @@ export async function listenDirectSessionPushes(input: {
     deviceId?: string | null;
     email?: string | null;
     phone?: string | null;
+    appVariant?: "dingtone" | "dingdong";
   };
   listenSeconds: number;
   maxPushFrames?: number;
   onPush?: (push: DirectProbePushResult) => Promise<void> | void;
   onFrame?: (push: DirectProbePushResult, host: string) => Promise<void> | void;
+  onOfflineCatchup?: (status: {
+    host: string;
+    reason: "startup" | "interval" | "notify-only";
+    attempted: boolean;
+    sent: boolean;
+    sendCount: number;
+    error: string | null;
+  }) => Promise<void> | void;
 }) {
   const runtime = await getDirectRuntimeConfig();
   const baseHosts = uniqueHosts([runtime.primaryHost, runtime.backupHost, ...APP_DIRECT_PUSH_HOSTS]);
@@ -1126,6 +1144,8 @@ export async function listenDirectSessionPushes(input: {
   let offlineTemplateSent = false;
   let offlineTemplateError: string | null = null;
   let offlineTemplateAttempted = false;
+  let offlineTemplateSendCount = 0;
+  let offlineCatchupInFlight: Promise<void> | null = null;
   const calls: DirectProbeCallResult[] = [];
   const listener: ActiveDirectPushListener = {
     key: directSessionAccountKey(input.account),
@@ -1135,27 +1155,81 @@ export async function listenDirectSessionPushes(input: {
   let lastError: unknown;
   let selectedHost = baseHosts[0] ?? runtime.primaryHost;
   let attempts = 0;
+  let nextOfflineCatchupAt = 0;
+  let nextNotifyOnlyCatchupAt = 0;
 
   preemptActiveDirectPushListener(input.account);
   activeDirectPushListeners.set(listener.key, listener);
 
-  try {
-    const discoveredHosts = await discoverDirectPushHosts(runtime, input.account, baseHosts, listener, calls, deadline);
-    const hosts = uniqueHosts([...baseHosts, ...discoveredHosts]);
-    if (discoveredHosts.length > 0) {
-      logger.info("Direct push listener added RTC hosts discovered from queryRtcServersEx", {
-        dtUserId: input.account.dtUserId,
-        hosts: discoveredHosts
-      });
+  const requestOfflineCatchup = async (session: DirectSession, host: string, reason: "startup" | "interval" | "notify-only") => {
+    if (offlineCatchupInFlight) {
+      await offlineCatchupInFlight;
+      return;
     }
-    const hostErrors: unknown[] = [];
+    offlineCatchupInFlight = (async () => {
+      offlineTemplateAttempted = true;
+      try {
+        const sent = await session.sendConfiguredTemplate("dt_direct_template_offline_messages", input.account, {
+          action: "requestAllOfflineMessage"
+        });
+        offlineTemplateSent = offlineTemplateSent || sent;
+        if (sent) {
+          offlineTemplateSendCount += 1;
+          offlineTemplateError = null;
+          logger.info("Direct offline message catch-up template sent", {
+            host,
+            reason,
+            sendCount: offlineTemplateSendCount
+          });
+        } else {
+          offlineTemplateError = offlineTemplateError ?? "dt_direct_template_offline_messages is not configured";
+        }
+      } catch (error) {
+        offlineTemplateError = error instanceof Error ? error.message : String(error);
+        logger.warn("Direct offline message template was not sent", {
+          host,
+          reason,
+          error: offlineTemplateError
+        });
+      } finally {
+        nextOfflineCatchupAt = Date.now() + (offlineTemplateError ? DIRECT_OFFLINE_CATCHUP_RETRY_MS : DIRECT_OFFLINE_CATCHUP_INTERVAL_MS);
+        try {
+          await input.onOfflineCatchup?.({
+            host,
+            reason,
+            attempted: offlineTemplateAttempted,
+            sent: offlineTemplateSent,
+            sendCount: offlineTemplateSendCount,
+            error: offlineTemplateError
+          });
+        } catch (error) {
+          logger.warn("Direct offline catch-up status callback failed", {
+            host,
+            reason,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        offlineCatchupInFlight = null;
+      }
+    })();
+    await offlineCatchupInFlight;
+  };
+
+  const hostErrors: unknown[] = [];
+
+  try {
+    const hosts = baseHosts;
     let hostCursor = 0;
     const nextListenHost = () => hosts[hostCursor++ % hosts.length] ?? runtime.primaryHost;
     const workerCount = Math.max(1, Math.min(runtime.listenHostConcurrency, hosts.length));
+    const assignedHosts = hosts.slice(0, workerCount);
+    hostCursor = assignedHosts.length;
     await Promise.all(
-      Array.from({ length: workerCount }, async () => {
+      assignedHosts.map(async (initialHost) => {
+        let preferredHost = initialHost;
         while (!listener.preempted && Date.now() < deadline && pushes.length < maxPushFrames) {
-          const host = nextListenHost();
+          const host = preferredHost;
+          preferredHost = nextListenHost();
           await waitForDirectSessionOperationIdle(input.account);
           if (listener.preempted || Date.now() >= deadline || pushes.length >= maxPushFrames) {
             break;
@@ -1167,35 +1241,43 @@ export async function listenDirectSessionPushes(input: {
           attempts += 1;
           selectedHost = host;
           try {
+            let tracedFrameCount = 0;
             await session.open(input.account);
             calls.push(...(await runPushListenPrimeCalls(session, runtime, input.account)));
-            if (!offlineTemplateAttempted) {
-              offlineTemplateAttempted = true;
-              try {
-                const sent = await session.sendConfiguredTemplate("dt_direct_template_offline_messages", input.account, {
-                  action: "requestAllOfflineMessage"
-                });
-                offlineTemplateSent = offlineTemplateSent || sent;
-                if (!sent) {
-                  offlineTemplateError = offlineTemplateError ?? "dt_direct_template_offline_messages is not configured";
+            if (!offlineTemplateAttempted || Date.now() >= nextOfflineCatchupAt) {
+              await requestOfflineCatchup(session, host, offlineTemplateAttempted ? "interval" : "startup");
+            }
+            while (!listener.preempted && Date.now() < deadline && pushes.length < maxPushFrames) {
+              const remainingFrames = Math.max(0, maxPushFrames - pushes.length);
+              if (remainingFrames <= 0) {
+                break;
+              }
+              const waitUntil = nextOfflineCatchupAt > 0 ? Math.min(deadline, nextOfflineCatchupAt) : deadline;
+              const waitMs = Math.max(250, Math.min(5_000, waitUntil - Date.now()));
+              const nextPushes = await session.waitForPushes(
+                waitMs,
+                remainingFrames,
+                input.onPush,
+                async (push, frameHost) => {
+                  if (isNotifyOnlyMessageIndexPush(push) && Date.now() >= nextNotifyOnlyCatchupAt) {
+                    nextNotifyOnlyCatchupAt = Date.now() + DIRECT_NOTIFY_ONLY_CATCHUP_THROTTLE_MS;
+                    await requestOfflineCatchup(session, host, "notify-only");
+                  }
+                  await input.onFrame?.(push, frameHost);
                 }
-              } catch (error) {
-                offlineTemplateError = error instanceof Error ? error.message : String(error);
-                logger.warn("Direct offline message template was not sent", {
-                  host,
-                  error: offlineTemplateError
-                });
+              );
+              pushes.push(...nextPushes);
+              const sessionTrace = session.getTrace();
+              trace.push(...sessionTrace.slice(tracedFrameCount));
+              tracedFrameCount = sessionTrace.length;
+              lastError = undefined;
+              if (listener.preempted || Date.now() >= deadline || pushes.length >= maxPushFrames) {
+                break;
+              }
+              if (Date.now() >= nextOfflineCatchupAt) {
+                await requestOfflineCatchup(session, host, "interval");
               }
             }
-            const remainingMs = Math.max(250, deadline - Date.now());
-            const remainingFrames = Math.max(0, maxPushFrames - pushes.length);
-            if (remainingFrames <= 0) {
-              break;
-            }
-            const nextPushes = await session.waitForPushes(remainingMs, remainingFrames, input.onPush, input.onFrame);
-            pushes.push(...nextPushes);
-            trace.push(...session.getTrace());
-            lastError = undefined;
             await session.close();
           } catch (error) {
             lastError = error;
@@ -1243,6 +1325,10 @@ export async function listenDirectSessionPushes(input: {
     }
   }
 
+  if (!listener.preempted && attempts > 0 && trace.length === 0 && pushes.length === 0 && !offlineTemplateAttempted && hostErrors.length > 0) {
+    throw normalizeDirectError(lastError ?? hostErrors[hostErrors.length - 1]);
+  }
+
   if (attempts === 0 && lastError) {
     throw normalizeDirectError(lastError);
   }
@@ -1257,6 +1343,7 @@ export async function listenDirectSessionPushes(input: {
     trace,
     offlineTemplateAttempted,
     offlineTemplateSent,
+    offlineTemplateSendCount,
     offlineTemplateError,
     preempted: listener.preempted
   };
@@ -1277,12 +1364,13 @@ async function discoverDirectPushHosts(
   calls: DirectProbeCallResult[],
   deadline: number
 ) {
+  const appVersion = resolveDirectAppVersion(account, runtime);
   const shared = {
     deviceId: accountDeviceId(account),
     userId: account.dtUserId,
     token: account.token,
-    clientVersion: runtime.appVersion,
-    appVersion: runtime.appVersion,
+    clientVersion: appVersion,
+    appVersion,
     apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
   };
   const discovered: string[] = [];
@@ -1355,55 +1443,35 @@ async function runPushListenPrimeCalls(
     deviceId?: string | null;
     email?: string | null;
     phone?: string | null;
+    appVariant?: "dingtone" | "dingdong";
   }
 ) {
+  const appVersion = resolveDirectAppVersion(account, runtime);
   const shared = {
     deviceId: accountDeviceId(account),
     userId: account.dtUserId,
     token: account.token,
-    clientVersion: runtime.appVersion,
-    appVersion: runtime.appVersion,
+    clientVersion: appVersion,
+    appVersion,
     apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
   };
   const nextTrackCode = () => session.nextTrackCode();
   const calls: DirectProbeCallResult[] = [];
 
-  // The Android app refreshes balance and private-number state immediately before
-  // inbound SMS pushes arrive. Server-only listeners need to mimic that path.
-  for (const item of [
-    { name: "listenPrime.followerListInfo" as const, templateName: "followerListInfo" as const },
-    { name: "listenPrime.getFriendList" as const, templateName: "getFriendList" as const },
-    { name: "listenPrime.infoBus" as const, templateName: "infoBus" as const },
-    {
-      name: "listenPrime.glbUserPropertites" as const,
-      apiName: "glb/userPropertites",
-      query: buildGlbUserPropertiesQuery(account, runtime, nextTrackCode())
-    },
-    {
-      name: "listenPrime.gwebInfoBus" as const,
-      apiName: "gwebsvr/infoBus",
-      query: buildGwebInfoBusQuery(account, runtime, nextTrackCode())
-    },
+  // Keep the push listener prime path short so sockets enter the read loop quickly.
+  const primeCalls: Array<{ name: string; templateName: keyof typeof TEMPLATES; params?: DirectTemplateParams }> = [
     { name: "listenPrime.queryRtcServersEx#flags9" as const, templateName: "queryRtcServersEx" as const, params: { flags: 9 } },
     { name: "listenPrime.queryRtcServersEx#flags5" as const, templateName: "queryRtcServersEx" as const, params: { flags: 5 } },
-    {
-      name: "listenPrime.getNumberCountries" as const,
-      apiName: "/pstn/getNumberCountries",
-      query: buildGetNumberCountriesQuery(account, runtime, nextTrackCode())
-    },
-    { name: "listenPrime.updateClientLink" as const, templateName: "updateClientLink" as const },
-    { name: "listenPrime.getUserSetting" as const, templateName: "getUserSetting" as const },
-    { name: "listenPrime.getBalance" as const, templateName: "getBalance" as const },
-    { name: "listenPrime.getPrivateNumber#1" as const, templateName: "getPrivateNumber" as const },
-    { name: "listenPrime.getPrivateNumber#2" as const, templateName: "getPrivateNumber" as const }
-  ]) {
+    { name: "listenPrime.updateClientLink" as const, templateName: "updateClientLink" as const }
+  ];
+  if (account.appVariant === "dingtone") {
+    primeCalls.unshift({ name: "listenPrime.getPrivateNumber" as const, templateName: "getPrivateNumber" as const, params: {} });
+  }
+
+  for (const item of primeCalls) {
     const startedAt = Date.now();
     try {
-      if ("apiName" in item && item.apiName && item.query) {
-        await session.sendCommonRestJson(item.name, item.apiName, item.query);
-      } else if ("templateName" in item && item.templateName) {
-        await session.sendJson(item.templateName, { ...shared, ...(item.params ?? {}), trackCode: nextTrackCode() });
-      }
+      await session.sendJson(item.templateName, { ...shared, ...(item.params ?? {}), trackCode: nextTrackCode() });
       calls.push({
         name: item.name,
         ok: true,
@@ -1448,7 +1516,7 @@ function isLikelyIpv4Host(value: string) {
   });
 }
 
-export function preemptDirectSessionPushListener(account: { dtUserId: string; deviceId?: string | null }) {
+export function preemptDirectSessionPushListener(account: { dtUserId: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" }) {
   return preemptActiveDirectPushListener(account);
 }
 
@@ -1782,7 +1850,7 @@ function expandTemplateParams(
     token: account.token,
     deviceId: accountDeviceId(account),
     trackCode: createDirectTrackCode(account.dtUserId),
-    appVersion: runtime.appVersion,
+    appVersion: resolveDirectAppVersion(account, runtime),
     apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign),
     ...extraVars
   };
@@ -1807,8 +1875,8 @@ function buildSharedTemplateParams(
     userId: account.dtUserId,
     token: account.token,
     trackCode: createDirectTrackCode(account.dtUserId),
-    clientVersion: runtime.appVersion,
-    appVersion: runtime.appVersion,
+    clientVersion: resolveDirectAppVersion(account, runtime),
+    appVersion: resolveDirectAppVersion(account, runtime),
     apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
   };
 }
@@ -1885,6 +1953,12 @@ class DirectSession {
   private jsonQueue: ApiResult[] = [];
   private jsonResolvers: Array<(value: ApiResult) => void> = [];
   private jsonRejectors: Array<(error: Error) => void> = [];
+  private jsonCaptureUntil = 0;
+  private skippedNonSmsLogCount = 0;
+  private idleDroppedNonSmsFrameCount = 0;
+  private idleSocketPaused = false;
+  private idleSocketPauseTimer: NodeJS.Timeout | null = null;
+  private bufferedConsumeScheduled = false;
   private pendingPushes: DirectProbePushResult[] = [];
   private accountPhoneCountryKeys?: Set<string>;
   private account?: DirectSessionAccount;
@@ -1999,6 +2073,7 @@ class DirectSession {
     });
 
     this.clearJsonQueue();
+    this.beginJsonCapture(timeoutMs);
     await this.write(request);
     return this.waitForJsonPayload(timeoutMs, `${label} JSON response`, (payload) => {
       const expected = isExpectedCommonRestJsonPayload(apiName, payload);
@@ -2041,7 +2116,7 @@ class DirectSession {
       label.toLowerCase().includes("activateemail") &&
       templateQueryParam(templateBuffer, "confirmCode") === stringifyPrimitive(params.confirmCode);
 
-    // 婵″倹鐏夋稉宥嗗姬鐡掑啿甯崠鍛村櫢閺€鍓ф畱閺夆€叉閿涘牆宓嗘稉宥嗘Ц闁藉牆顕弮褑澶勯幋宄版嫲閹舵挸瀵橀弮鍓佹畱閻楃懓鐣炬宀冪槈閻礁浠涢柌宥嗘杹閿涘绱濇稉鏃€鍨滄禒顑跨炊閸忋儰绨￠崢鐔奉潗閻?query閿?    // 閸掓瑦鍨滄禒顒€绻€妞よ濞囬悽銊︾梾閺堝绮℃潻鍥у灩闂勩倗鐗崸蹇曟畱閸樼喎顫愭０婵嗩樆閸欏倹鏆熼敍宀勫櫢閺傞绻氶悾娆戞埂鐎圭偟娈戦柇顔绢唸閻╃鍙ч崣鍌涙殶娴犮儱鍘戠拋?patch 閺囨寧宕叉稉鐑樻煀鐠愶箑褰?
+    // 濠碘€冲€归悘澶嬬▔瀹ュ棗濮悺鎺戝暱鐢偊宕犻崨鏉戞闁衡偓閸撗勭暠闁哄鈧弶顐介柨娑樼墕瀹撳棙绋夊鍡樞﹂梺钘夌墕椤曨噣寮婢跺嫰骞嬪畡鐗堝闁硅埖鎸哥€垫﹢寮崜浣圭暠闁绘鎳撻悾鐐殽瀹€鍐闁活喕绀佹禒娑㈡煂瀹ュ棙鏉归柨娑橆檧缁辨繃绋夐弮鈧崹婊勭椤戣法鐐婇柛蹇嬪劙缁繝宕㈤悢濂夋綏闁?query闁?    // 闁告帗鐟﹂崹婊勭椤掆偓缁烩偓濡炪倛顔婃繛鍥偨閵婏妇姊鹃柡鍫濐槺缁剝娼婚崶褍鐏╅梻鍕╁€楅悧顒勫锤韫囨洘鐣遍柛妯煎枎椤劖锛愬┑鍡╂▎闁告瑥鍊归弳鐔兼晬瀹€鍕闁哄倿顣︾换姘舵偩濞嗘垶鍩傞悗鍦仧濞堟垿鏌囬缁㈠敻闁烩晝顭堥崣褔宕ｉ崒娑欐濞寸姰鍎遍崢鎴犳媼?patch 闁哄洦瀵у畷鍙夌▔閻戞ɑ鐓€閻犳劧绠戣ぐ?
     if (!preserveRawPayload && proofFallbackQuery) {
       const fullExtraParams = buildActivationTemplateParams(proofFallbackQuery);
       params = expandTemplateParams(
@@ -2073,6 +2148,7 @@ class DirectSession {
     });
 
     this.clearJsonQueue();
+    this.beginJsonCapture(this.runtime.ioTimeoutMs);
     dumpDirectDebugFrame(label, frame);
     await this.write(frame);
     return this.waitForJsonPayload(this.runtime.ioTimeoutMs, `${label} native activation response`, (payload) => {
@@ -2120,6 +2196,7 @@ class DirectSession {
     });
 
     this.clearJsonQueue();
+    this.beginJsonCapture(this.runtime.ioTimeoutMs);
     this.queue = [];
     dumpDirectDebugFrame(label, frame);
     await this.write(frame);
@@ -2164,6 +2241,7 @@ class DirectSession {
     });
 
     this.clearJsonQueue();
+    this.beginJsonCapture(this.runtime.ioTimeoutMs);
     await this.write(request);
     return this.waitForJsonPayload(this.runtime.ioTimeoutMs, `${label} JSON response`, (payload) => {
       const expected = isExpectedTemplateJsonPayload(label, payload);
@@ -2227,11 +2305,29 @@ class DirectSession {
           Math.max(250, deadline - Date.now()),
           "direct push frame"
         );
+        if (frame.status !== 0x0103) {
+          nonSmsPushFrameCount += 1;
+          if (this.shouldLogSkippedNonSmsFrame()) {
+            logger.info("Direct push frame skipped because it did not contain an SMS payload", {
+              host: this.host,
+              status: frame.status,
+              bodyLength: frame.body.length,
+              hasJsonPayload: false,
+              jsonPayload: undefined
+            });
+          }
+          if (nonSmsPushFrameCount >= DIRECT_PUSH_NON_SMS_FRAME_BATCH_LIMIT) {
+            await delay(DIRECT_PUSH_NON_SMS_FRAME_PAUSE_MS);
+            return pushes;
+          }
+          await yieldToEventLoop();
+          continue;
+        }
         const push = frameToDirectPush(frame);
         await onFrame?.(push, this.host);
         if (!push.sms) {
           nonSmsPushFrameCount += 1;
-          if (nonSmsPushFrameCount <= 5) {
+          if (this.shouldLogSkippedNonSmsFrame()) {
             logger.info("Direct push frame skipped because it did not contain an SMS payload", {
               host: this.host,
               status: push.status,
@@ -2260,6 +2356,10 @@ class DirectSession {
 
   async close() {
     this.closed = true;
+    if (this.idleSocketPauseTimer) {
+      clearTimeout(this.idleSocketPauseTimer);
+      this.idleSocketPauseTimer = null;
+    }
     if (this.socket && !this.socket.destroyed) {
       this.socket.destroy();
     }
@@ -2312,6 +2412,11 @@ class DirectSession {
     this.socket.on("error", (error) => {
       this.failWaiters(error instanceof Error ? error : new Error(String(error)));
     });
+    this.socket.on("end", () => {
+      this.closed = true;
+      this.socket?.destroy();
+      this.failWaiters(new Error("Direct gateway socket ended"));
+    });
     this.socket.on("close", () => {
       this.closed = true;
       this.failWaiters(new Error("Direct gateway socket closed"));
@@ -2319,7 +2424,10 @@ class DirectSession {
   }
 
   private consume(chunk: Buffer) {
-    this.buffer = Buffer.concat([this.buffer, chunk]);
+    if (chunk.length > 0) {
+      this.buffer = Buffer.concat([this.buffer, chunk]);
+    }
+    let processedFrames = 0;
 
     while (this.buffer.length >= 6) {
       if (this.buffer[0] !== 0x01 || this.buffer[1] !== 0x07) {
@@ -2340,7 +2448,22 @@ class DirectSession {
       const frame = this.buffer.subarray(0, totalLen);
       this.buffer = this.buffer.subarray(totalLen);
       const parsed = parseFrame(frame);
-      const jsonPayload = extractJsonPayload(parsed.raw);
+      const shouldExtractJsonPayload = parsed.type === 0x8107 && parsed.status === 0x0102 && (this.jsonResolvers.length > 0 || Date.now() <= this.jsonCaptureUntil);
+      const jsonPayload = shouldExtractJsonPayload ? extractJsonPayload(parsed.raw) : null;
+      const shouldQueueRawFrame =
+        parsed.type !== 0x8107 ||
+        parsed.status === 0x0101 ||
+        parsed.status === 0x0103 ||
+        this.resolvers.length > 0;
+      const shouldTraceFrame = shouldQueueRawFrame || Boolean(jsonPayload) || Boolean(process.env.DT_DIRECT_DEBUG_DUMP_DIR);
+      if (!shouldTraceFrame) {
+        this.pauseIdleSocketAfterDroppedFrame(parsed);
+        processedFrames += 1;
+        if (this.shouldYieldBufferedConsume(processedFrames)) {
+          return;
+        }
+        continue;
+      }
 
       if (process.env.DT_DIRECT_DEBUG_DUMP_DIR) {
         console.log(`[Socket Read] Length: ${parsed.raw.length}, Type: 0x${parsed.type.toString(16)}, Status: ${parsed.status !== undefined ? `0x${parsed.status.toString(16)}` : "undefined"}, Hex: ${parsed.raw.toString("hex")}`);
@@ -2369,18 +2492,56 @@ class DirectSession {
       }
       const smsPush = parsed.type === 0x8107 && parsed.status === 0x0103 ? tryParseSmsPush(parsed.raw) ?? tryParseSmsPush(parsed.body) : null;
       if (parsed.type === 0x8107 && parsed.status === 0x0103) {
-        void this.acknowledgePushFrame(parsed, Boolean(smsPush)).catch((error) => {
+        void this.acknowledgePushFrame(parsed, true).catch((error) => {
           logger.warn("Direct push ACK failed", {
             host: this.host,
             error: error instanceof Error ? error.message : String(error)
           });
         });
       }
-      this.queue.push(frame);
-      this.flushWaiters();
+      if (shouldQueueRawFrame) {
+        this.queue.push(frame);
+        this.flushWaiters();
+      }
+      processedFrames += 1;
+      if (this.shouldYieldBufferedConsume(processedFrames)) {
+        return;
+      }
     }
   }
 
+  private shouldYieldBufferedConsume(processedFrames: number) {
+    if (processedFrames < DIRECT_SOCKET_FRAME_BUDGET_PER_TICK || this.buffer.length < 6) {
+      return false;
+    }
+    this.scheduleBufferedConsume();
+    return true;
+  }
+
+  private scheduleBufferedConsume() {
+    if (this.bufferedConsumeScheduled || this.closed) {
+      return;
+    }
+    this.bufferedConsumeScheduled = true;
+    this.socket?.pause();
+    setImmediate(() => {
+      this.bufferedConsumeScheduled = false;
+      if (this.closed) {
+        return;
+      }
+      this.socket?.resume();
+      if (this.buffer.length >= 6) {
+        this.consume(Buffer.alloc(0));
+      }
+    });
+  }
+  private shouldLogSkippedNonSmsFrame() {
+    if (this.skippedNonSmsLogCount >= 5) {
+      return false;
+    }
+    this.skippedNonSmsLogCount += 1;
+    return true;
+  }
   private async write(frame: Buffer) {
     if (!this.socket) {
       throw new Error("Direct gateway socket is not open");
@@ -2408,9 +2569,13 @@ class DirectSession {
     if (!shouldConfirmDelivery || !this.account) {
       return;
     }
-    const confirm = buildPushDeliveryConfirmFrame(frame, this.account, this.nextPushDeliveryConfirmSerial());
-    if (confirm) {
-      await this.write(confirm);
+    const notifyMessageIds = extractNotifyMessageIds(frame);
+    const deliveryMessageIds = notifyMessageIds.length > 0 ? notifyMessageIds : [undefined];
+    for (const messageId of deliveryMessageIds) {
+      const confirm = buildPushDeliveryConfirmFrame(frame, this.account, this.nextPushDeliveryConfirmSerial(), messageId);
+      if (confirm) {
+        await this.write(confirm);
+      }
     }
   }
 
@@ -2437,6 +2602,8 @@ class DirectSession {
       loginTrackCode: this.nextTrackCode(),
       configTrackCode: this.nextTrackCode()
     });
+    this.clearJsonQueue();
+    this.beginJsonCapture(3_000);
     await this.write(packet);
     await this.drainBootstrapFrames(3_000);
     this.bootstrapPayloads = [...this.jsonQueue];
@@ -2497,19 +2664,21 @@ class DirectSession {
   ): Promise<ParsedFrame> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const index = this.queue.findIndex((frame) => predicate(parseFrame(frame)));
-      if (index >= 0) {
-        const raw = this.queue.splice(index, 1)[0];
-        if (!raw) {
-          continue;
+      const queuedRaw = this.queue.shift();
+      if (queuedRaw) {
+        const parsed = parseFrame(queuedRaw);
+        if (predicate(parsed)) {
+          return parsed;
         }
-        return parseFrame(raw);
+        await yieldToEventLoop();
+        continue;
       }
 
       const remaining = Math.max(250, deadline - Date.now());
       const raw = await this.nextRawFrame(remaining, label);
-      if (predicate(parseFrame(raw))) {
-        return parseFrame(raw);
+      const parsed = parseFrame(raw);
+      if (predicate(parsed)) {
+        return parsed;
       }
     }
 
@@ -2624,6 +2793,26 @@ class DirectSession {
     }
   }
 
+
+  private pauseIdleSocketAfterDroppedFrame(parsed: ParsedFrame) {
+    if (parsed.type !== 0x8107 || parsed.status === 0x0101 || parsed.status === 0x0103 || this.resolvers.length > 0 || this.jsonResolvers.length > 0) {
+      this.idleDroppedNonSmsFrameCount = 0;
+      return;
+    }
+    this.idleDroppedNonSmsFrameCount += 1;
+    if (this.idleDroppedNonSmsFrameCount < DIRECT_IDLE_NON_SMS_FRAME_PAUSE_BATCH || this.idleSocketPaused || !this.socket || this.socket.destroyed) {
+      return;
+    }
+    this.idleDroppedNonSmsFrameCount = 0;
+    this.idleSocketPaused = true;
+    this.socket.pause();
+    this.idleSocketPauseTimer = setTimeout(() => {
+      this.idleSocketPaused = false;
+      this.idleSocketPauseTimer = null;
+      this.socket?.resume();
+    }, DIRECT_IDLE_NON_SMS_FRAME_PAUSE_MS);
+    this.idleSocketPauseTimer.unref?.();
+  }
   private failWaiters(error: Error) {
     while (this.rejectors.length > 0) {
       const rejector = this.rejectors.shift()!;
@@ -2665,8 +2854,13 @@ class DirectSession {
     }
   }
 
+  private beginJsonCapture(timeoutMs: number) {
+    this.jsonCaptureUntil = Math.max(this.jsonCaptureUntil, Date.now() + timeoutMs);
+  }
+
   private clearJsonQueue() {
     this.jsonQueue = [];
+    this.jsonCaptureUntil = 0;
   }
 }
 
@@ -3208,7 +3402,7 @@ function buildLoginInitPacket(input: {
   session: Buffer;
   route: Buffer;
   runtime: DirectRuntimeConfig;
-  account: { dtUserId: string; token: string; deviceId?: string | null; email?: string | null };
+  account: { dtUserId: string; token: string; deviceId?: string | null; email?: string | null; appVariant?: "dingtone" | "dingdong" };
   loginTrackCode: string;
   configTrackCode: string;
 }) {
@@ -3244,8 +3438,8 @@ function buildLoginInitPacket(input: {
       TrackCode: input.configTrackCode,
       appId: "",
       clientVersion: "",
-      appVersion: input.runtime.appVersion,
-      apkCertificateSign: input.runtime.apkCertificateSign
+      appVersion: resolveDirectAppVersion(input.account, input.runtime),
+      apkCertificateSign: resolveDirectApiApkCertificateSign(input.account, input.runtime.apkCertificateSign)
     }
   });
 
@@ -3405,7 +3599,7 @@ function buildPushAckFrame(frame: ParsedFrame) {
   return encodeFrame(frame.session, 0x0103, Buffer.concat([destinationRoute, sourceRoute, ackTail]));
 }
 
-function buildPushDeliveryConfirmFrame(frame: ParsedFrame, account: Pick<DirectSessionAccount, "dtUserId" | "deviceId">, serial: number) {
+function buildPushDeliveryConfirmFrame(frame: ParsedFrame, account: Pick<DirectSessionAccount, "dtUserId" | "deviceId">, serial: number, messageIdOverride?: string) {
   if (frame.type !== 0x8107 || frame.status !== 0x0103 || frame.body.length < 40) {
     return null;
   }
@@ -3414,7 +3608,7 @@ function buildPushDeliveryConfirmFrame(frame: ParsedFrame, account: Pick<DirectS
   const destinationRoute = frame.body.subarray(8, 16);
   const pushTail = frame.body.subarray(28, 32);
   const deviceId = accountDeviceId(account);
-  const messageId = frame.body.readBigUInt64BE(32).toString();
+  const messageId = messageIdOverride ?? frame.body.readBigUInt64BE(32).toString();
   const deviceBytes = Buffer.from(deviceId, "utf8");
   const messageIdBytes = Buffer.from(messageId, "utf8");
   if (deviceBytes.length > 0xff) {
@@ -3463,6 +3657,66 @@ function u24be(value: number) {
 
 function lengthPrefixedBuffer(value: Buffer) {
   return Buffer.concat([u32be(value.length), value]);
+}
+
+function extractNotifyMessageIds(frame: ParsedFrame) {
+  const payload = extractJsonPayload(frame.raw);
+  const notifyIds = new Set<string>();
+  if (isRecord(payload) && Array.isArray(payload.notifyInfoList)) {
+    for (const item of payload.notifyInfoList) {
+      const value = isRecord(item) ? stringifyPrimitive(item.msgId ?? item.msgid ?? item.messageId ?? item.message_id) : undefined;
+      if (value?.trim()) {
+        notifyIds.add(value.trim());
+      }
+    }
+  }
+  const legacyIds = extractLegacyNotifyMessageIds(frame)
+    .filter((value) => !notifyIds.has(value));
+  return [...notifyIds, ...legacyIds];
+}
+
+function extractLegacyNotifyMessageIds(frame: ParsedFrame) {
+  return extractLengthPrefixedAsciiFieldValues(frame.body, ["dtId", "msgId", "msgid", "messageId", "message_id"])
+    .filter((value) => /^\d{5,30}$/.test(value));
+}
+
+function extractLengthPrefixedAsciiFieldValues(payload: Buffer, keys: string[]) {
+  const output: string[] = [];
+  for (const key of keys) {
+    let cursor = 0;
+    const keyBytes = Buffer.from(key, "utf8");
+    while (cursor < payload.length) {
+      const keyOffset = payload.indexOf(keyBytes, cursor);
+      if (keyOffset < 0) {
+        break;
+      }
+      const value = readLengthPrefixedAsciiAfter(payload, keyOffset + keyBytes.length);
+      if (value && !output.includes(value)) {
+        output.push(value);
+      }
+      cursor = keyOffset + keyBytes.length;
+    }
+  }
+  return output;
+}
+
+function readLengthPrefixedAsciiAfter(payload: Buffer, offset: number) {
+  for (let cursor = offset; cursor < Math.min(payload.length, offset + 16); cursor += 1) {
+    for (const width of [1, 2, 4]) {
+      if (cursor + width >= payload.length) {
+        continue;
+      }
+      const length = width === 1 ? payload[cursor] : width === 2 ? payload.readUInt16BE(cursor) : payload.readUInt32BE(cursor);
+      if (!length || length > 64 || cursor + width + length > payload.length) {
+        continue;
+      }
+      const value = payload.subarray(cursor + width, cursor + width + length).toString("utf8").trim();
+      if (/^[\x20-\x7e]+$/.test(value)) {
+        return value;
+      }
+    }
+  }
+  return null;
 }
 
 function patchQuery(templateQuery: string, params: DirectTemplateParams) {
@@ -5224,11 +5478,20 @@ function frameToDirectPush(frame: ParsedFrame): DirectProbePushResult {
     bodyHex: frame.body.toString("hex"),
     rawHexPreview: frame.raw.subarray(0, 160).toString("hex"),
     bodyHexPreview: frame.body.subarray(0, 160).toString("hex"),
-    jsonPayload: extractJsonPayload(frame.raw),
+    jsonPayload: null,
     sms: tryParseSmsPush(frame.raw) ?? tryParseSmsPush(frame.body)
   };
 }
 
+function isNotifyOnlyMessageIndexPush(push: DirectProbePushResult) {
+  if (push.status !== 0x0103 || push.sms) {
+    return false;
+  }
+  const bodyText = push.bodyHex ? Buffer.from(push.bodyHex, "hex").toString("utf8") : "";
+  const rawText = push.rawHex ? Buffer.from(push.rawHex, "hex").toString("utf8") : "";
+  const text = `${bodyText}\n${rawText}`;
+  return /notifyInfoList|msgId|senderId/i.test(text);
+}
 function extractJsonPayload(raw: Buffer): ApiResult | null {
   const payload = raw.subarray(22);
   const seen = new Set<string>();
@@ -5368,26 +5631,26 @@ function findZlibOffsets(buffer: Buffer) {
 }
 
 const APP_PHONE_COUNTRY_LABELS: Record<string, string> = {
-  US: "缂囧骸娴?+1",
-  CA: "閸旂姵瀣佹径?+1",
-  GB: "閼诲崬娴?+44",
-  BE: "濮ｆ柨鍩勯弮?+32",
-  NL: "閼藉嘲鍙?+31",
-  RU: "娣囧嫮缍忛弬?+7",
-  ES: "鐟楄法褰悧?+34",
-  CN: "娑擃厼娴?+86",
-  AU: "濠㈠啿銇囬崚鈺€绨?+61",
-  AT: "婵傘儱婀撮崚?+43",
-  FR: "濞夋洖娴?+33",
-  SE: "閻熺偛鍚€ +46",
-  MU: "濮ｆ盯鍣峰Ч鍌涙焿 +230",
-  PL: "濞夈垹鍙?+48",
-  ID: "閸楁澘瀹崇亸鑹般偪娴?+62",
-  PR: "濞夈垹顦挎搴℃倗 +1787",
-  CZ: "閹瑰嘲鍘?+420",
-  MY: "妞诡剚娼电憲澶哥肮 +60",
-  DK: "娑撳綊瀹?+45",
-  RO: "缂冩鈹堢亸闂寸肮 +40"
+  US: "缂傚洤楠稿ù?+1",
+  CA: "闁告梻濮电€ｄ焦寰?+1",
+  GB: "闁艰宕ù?+44",
+  BE: "婵絾鏌ㄩ崺鍕籍?+32",
+  NL: "闁艰棄鍢查崣?+31",
+  RU: "濞ｅ洤瀚紞蹇涘棘?+7",
+  ES: "閻熸娉曡ぐ顕€鎮?+34",
+  CN: "濞戞搩鍘煎ù?+86",
+  AU: "婵犮垹鍟块妵鍥礆閳衡偓缁?+61",
+  AT: "濠靛倶鍎卞﹢鎾礆?+43",
+  FR: "婵炲娲栧ù?+33",
+  SE: "闁荤喓鍋涢崥鈧?+46",
+  MU: "婵絾鐩崳宄靶ч崒娑欑効 +230",
+  PL: "婵炲鍨归崣?+48",
+  ID: "闁告婢樼€瑰磭浜搁懝鑸仾濞?+62",
+  PR: "婵炲鍨归ˇ鎸庮渶鎼粹剝鍊?+1787",
+  CZ: "闁圭懓鍢查崢?+420",
+  MY: "濡炶鍓氬鐢垫啿婢跺摜鑲?+60",
+  DK: "濞戞挸缍婄€?+45",
+  RO: "缂傚啯顨婇埞鍫焊闂傚鑲?+40"
 };
 
 const APP_PHONE_COUNTRY_DISPLAY_NAMES: Record<string, string> = {
@@ -6784,6 +7047,9 @@ async function waitForDirectSessionOperationIdle(account: { dtUserId: string; de
   await directSessionOperationLocks.get(directSessionAccountKey(account))?.catch(() => undefined);
 }
 
+function yieldToEventLoop() {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
 function hashLike(input: string) {
   let seed = 0;
   for (const char of input) {
@@ -6826,7 +7092,7 @@ export async function getDirectRuntimeConfig(): Promise<DirectRuntimeConfig> {
     appVersion: config.DT_APP_VERSION,
     dingdongAppVersion: settings.dt_dingdong_app_version || config.DT_DINGDONG_APP_VERSION,
     apkCertificateSign: config.DT_APK_CERTIFICATE_SIGN,
-    listenHostConcurrency: parsePositiveIntSetting(settings.dt_direct_listener_host_concurrency, 2, 1, 8),
+    listenHostConcurrency: parsePositiveIntSetting(settings.dt_direct_listener_host_concurrency, 1, 1, 1),
     proxyUrl: (settings.dt_proxy_url || config.DT_PROXY_URL || "").trim()
   };
 }

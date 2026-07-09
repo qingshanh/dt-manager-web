@@ -337,9 +337,9 @@ function Invoke-PrismaGenerate {
 
 Import-DotEnvFile -Path $envFile
 
-$BackendPort = Resolve-EnvInt -Value $BackendPort -Names @("PORT", "BACKEND_PORT") -Default 3000
+$BackendPort = Resolve-EnvInt -Value $BackendPort -Names @("PORT", "BACKEND_PORT") -Default 5174
 $FrontendPort = Resolve-EnvInt -Value $FrontendPort -Names @("VITE_DEV_PORT", "FRONTEND_PORT") -Default 5173
-$HelperPort = Resolve-EnvInt -Value $HelperPort -Names @("HELPER_PORT", "DT_HELPER_PORT") -Default 19091
+$HelperPort = Resolve-EnvInt -Value $HelperPort -Names @("HELPER_PORT", "DT_HELPER_PORT") -Default 5175
 $HelperDeviceMode = Resolve-EnvString -Value $HelperDeviceMode -Name "DT_HELPER_DEVICE_MODE" -Default "usb"
 $HelperRemoteHost = Resolve-EnvString -Value $HelperRemoteHost -Name "DT_HELPER_REMOTE_HOST" -Default "127.0.0.1:27042"
 $HelperDeviceId = Resolve-EnvString -Value $HelperDeviceId -Name "DT_HELPER_DEVICE_ID" -Default ""

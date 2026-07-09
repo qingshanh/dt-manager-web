@@ -1,4 +1,4 @@
-﻿import { execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import { readFile, rm } from "node:fs/promises";
@@ -100,6 +100,10 @@ function extractMessageItems(xml: string, packageName: string) {
 }
 
 function isLikelySmsConversation(item: { senderId: string; content: string }) {
+  const text = `${item.senderId}\n${item.content}`;
+  if (/talku team|dingtone team|dingdong team|talkyou team|private number order|number order succeeded|will expire|order succeeded|number purchase|purchase succeeded|has expired|expires in|credits?|points?|balance changed|说道团队|叮咚团队|系统消息|号码订购|订购成功|购买成功|即将到期|已到期|过期|续费/i.test(text)) {
+    return true;
+  }
   if (/\d{4,8}/.test(item.content)) {
     return true;
   }

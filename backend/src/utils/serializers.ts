@@ -171,7 +171,7 @@ function roundTo(value: number, digits: number) {
 export function serializeMessage(message: Message) {
   const fromNumber = repairUtf8Mojibake(message.fromNumber);
   const toNumber = repairUtf8Mojibake(message.toNumber);
-  const content = repairUtf8Mojibake(message.content) ?? "";
+  const content = cleanSerializedMessageContent(repairUtf8Mojibake(message.content) ?? "");
   const rawInfo = repairUtf8Mojibake(message.rawInfo);
   const rawK3 = repairUtf8Mojibake(message.rawK3);
   return {
@@ -203,6 +203,9 @@ export function serializeSetting(setting: Setting) {
   };
 }
 
+function cleanSerializedMessageContent(value: string) {
+  return value.replace(/^[A-Za-z](?=(?:\?|<|\[硅基流动\]|\[SiliconFlow\]|\[Dingtone\]|\[TalkU\]))/, "");
+}
 export function repairUtf8Mojibake(value: string | null) {
   if (!value) {
     return value;
@@ -244,6 +247,7 @@ export function repairUtf8Mojibake(value: string | null) {
 
 function repairKnownReplacementText(value: string) {
   return value
+    .replace(/\u7ead\u546d\u7180\u5a34\u4f78\u59e9/g, "\u7845\u57fa\u6d41\u52a8")
     .replace(/\[\uFFFD{7}\](Verification code is:)/g, "[硅基流动]$1")
     .replace(/^\uFFFD{4}\s+OpenAI\s+\uFFFD{2}\u05A4\uFFFD{6}:(\d{4,8})$/g, "您的 OpenAI 验证代码是:$1");
 }

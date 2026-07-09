@@ -11,6 +11,16 @@ const AccountAdd = lazy(() => import('./pages/AccountAdd'));
 const AccountDetail = lazy(() => import('./pages/AccountDetail'));
 const Settings = lazy(() => import('./pages/Settings'));
 
+type IdleWindow = Window & {
+  requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
+  cancelIdleCallback?: (handle: number) => void;
+};
+
+function preloadPrimaryPages() {
+  void import('./pages/Dashboard');
+  void import('./pages/AccountList');
+}
+
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token);
   if (!token) return <Navigate to="/login" replace />;
@@ -20,18 +30,48 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 export default function App() {
   const checkAuth = useAuthStore((s) => s.checkAuth);
   const token = useAuthStore((s) => s.token);
-  const [ready, setReady] = useState(false);
+  const user = useAuthStore((s) => s.user);
+  const [ready, setReady] = useState(() => Boolean(useAuthStore.getState().token && useAuthStore.getState().user));
   const navigate = useNavigate();
 
   useEffect(() => {
-    checkAuth().finally(() => setReady(true));
-  }, [checkAuth]);
+    let cancelled = false;
+    if (!token) {
+      setReady(true);
+      return undefined;
+    }
+    if (token && user) {
+      setReady(true);
+    }
+    void checkAuth().finally(() => {
+      if (!cancelled) {
+        setReady(true);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [checkAuth, token]);
 
   useEffect(() => {
     if (ready && !token) {
       navigate('/login', { replace: true });
     }
   }, [ready, token, navigate]);
+  useEffect(() => {
+    if (ready && token) {
+      const idleWindow = window as IdleWindow;
+      if (idleWindow.requestIdleCallback) {
+        const handle = idleWindow.requestIdleCallback(() => preloadPrimaryPages(), { timeout: 1200 });
+        return () => idleWindow.cancelIdleCallback?.(handle);
+      }
+
+      const timer = window.setTimeout(preloadPrimaryPages, 0);
+      return () => window.clearTimeout(timer);
+    }
+
+    return undefined;
+  }, [ready, token]);
 
   if (!ready) {
     return (

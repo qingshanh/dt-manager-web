@@ -5,17 +5,21 @@ import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
 import { useNavigate } from 'react-router-dom';
 import {
+  CACHE_TTL_MS,
+  cacheKeys,
   deleteAccount,
   exportFullBackup,
   exportSessions,
   getAccounts,
+  isCachedDataFresh,
+  readCachedData,
   importFullBackup,
   importSessions,
   startMonitor,
   stopMonitor,
   updateAccount,
 } from '../services/endpoints';
-import type { DtAccountListItem } from '../types';
+import type { DtAccountListItem, PagedData } from '../types';
 
 const statusMap: Record<string, { color: string; label: string }> = {
   pending: { color: 'processing', label: '待验证' },
@@ -96,14 +100,28 @@ export default function AccountList() {
   const { message, modal } = App.useApp();
 
   const fetch = useCallback(
-    async (currentPage = page, currentKeyword = keyword) => {
-      setLoading(true);
+    async (currentPage = page, currentKeyword = keyword, options?: { force?: boolean }) => {
+      const params = { page: currentPage, pageSize: 20, keyword: currentKeyword || undefined };
+      const cacheKey = cacheKeys.accounts(params);
+      const cached = !options?.force ? readCachedData<PagedData<DtAccountListItem>>(cacheKey) : null;
+
+      if (cached) {
+        setAccounts(cached.list);
+        setTotal(cached.total);
+        setLoading(false);
+        if (isCachedDataFresh(cacheKey, CACHE_TTL_MS.accounts)) {
+          return;
+        }
+      } else {
+        setLoading(true);
+      }
+
       try {
-        const data = await getAccounts({ page: currentPage, pageSize: 20, keyword: currentKeyword || undefined });
+        const data = await getAccounts(params, { force: options?.force });
         setAccounts(data.list);
         setTotal(data.total);
       } catch (err) {
-        message.error(err instanceof Error ? err.message : '获取账户列表失败');
+        message.error(err instanceof Error ? err.message : 'Failed to load account list');
       } finally {
         setLoading(false);
       }
@@ -416,7 +434,7 @@ export default function AccountList() {
             }}
             style={{ width: 260 }}
           />
-          <Button icon={<ReloadOutlined />} onClick={() => void fetch()}>
+          <Button icon={<ReloadOutlined />} onClick={() => void fetch(page, keyword, { force: true })}>
             刷新
           </Button>
           <Button icon={<DownloadOutlined />} onClick={handleExportBackup}>

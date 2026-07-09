@@ -46,7 +46,7 @@
 
 当 `DT_GATEWAY_MODE=real` 时，需要配置：
 
-- `DT_REAL_BRIDGE_BASE_URL=http://127.0.0.1:19091`
+- `DT_REAL_BRIDGE_BASE_URL=http://127.0.0.1:5175`
 - `DT_REAL_BRIDGE_TOKEN=...`（可选）
 - `DT_REAL_BRIDGE_TIMEOUT_MS=60000`
 
@@ -116,7 +116,7 @@
 如果你要走“首次真实邮箱验证码登录”，建议按这个顺序：
 
 1. 把 `DT_GATEWAY_MODE` 设为 `real`，并确保 `DT_REAL_BRIDGE_BASE_URL` 指向可用的 helper。
-2. 先确认 `http://127.0.0.1:19091/health` 可访问，再确认模拟器或设备里的目标应用能正常打开。
+2. 先确认 `http://127.0.0.1:5175/health` 可访问，再确认模拟器或设备里的目标应用能正常打开。
 3. 前端创建账号时选择“邮箱验证码登录”，后端会先调用 `POST /api/accounts` 创建待验证账号，并触发一次真实发码。
 4. 如果要重发验证码，可以调用 `POST /api/accounts/:id/send-verification-code`。
 5. 收到真实邮箱验证码后，调用 `POST /api/accounts/:id/verify-code` 提交 `{ "code": "收到的验证码" }`。
@@ -190,7 +190,7 @@ python server.py
 
 ```bash
 DT_GATEWAY_MODE=real
-DT_REAL_BRIDGE_BASE_URL=http://127.0.0.1:19091
+DT_REAL_BRIDGE_BASE_URL=http://127.0.0.1:5175
 ```
 
 ## 本次验证结果

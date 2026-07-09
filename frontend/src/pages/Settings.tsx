@@ -16,7 +16,7 @@ import {
   Tag,
 } from 'antd';
 import { ApiOutlined, CloudServerOutlined, RobotOutlined } from '@ant-design/icons';
-import { getSettings, testTelegram, updateSettings } from '../services/endpoints';
+import { CACHE_TTL_MS, cacheKeys, getSettings, isCachedDataFresh, readCachedData, testTelegram, updateSettings } from '../services/endpoints';
 import type { SettingItem } from '../types';
 
 type GatewayMode = 'mock' | 'real' | 'bridge' | 'direct';
@@ -76,16 +76,40 @@ export default function Settings() {
   const [generalForm] = Form.useForm();
 
   useEffect(() => {
+    let cancelled = false;
+    const applySettings = (data: SettingItem[]) => {
+      setItems(data);
+      const map = toFormMap(data);
+      telegramForm.setFieldsValue(map);
+      serverForm.setFieldsValue(map);
+      generalForm.setFieldsValue(map);
+    };
+
+    const cached = readCachedData<SettingItem[]>(cacheKeys.settings);
+    if (cached) {
+      applySettings(cached);
+      setLoading(false);
+      if (isCachedDataFresh(cacheKeys.settings, CACHE_TTL_MS.settings)) {
+        return () => {
+          cancelled = true;
+        };
+      }
+    }
+
     getSettings()
       .then((data) => {
-        setItems(data);
-        const map = toFormMap(data);
-        telegramForm.setFieldsValue(map);
-        serverForm.setFieldsValue(map);
-        generalForm.setFieldsValue(map);
+        if (!cancelled) applySettings(data);
       })
-      .catch((err) => message.error(err.message))
-      .finally(() => setLoading(false));
+      .catch((err) => {
+        if (!cancelled) message.error(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [generalForm, message, serverForm, telegramForm]);
 
   const handleSave = async (values: Record<string, string | number | boolean>) => {
@@ -175,9 +199,9 @@ export default function Settings() {
                   <Form.Item
                     label="helper 地址（real / bridge 用）"
                     name="dt_real_bridge_base_url"
-                    help="例如 http://127.0.0.1:19091。验证码登录、抓取 app 登录态、helper 短信同步都依赖它。"
+                    help="例如 http://127.0.0.1:5175。验证码登录、抓取 app 登录态、helper 短信同步都依赖它。"
                   >
-                    <Input placeholder="http://127.0.0.1:19091" />
+                    <Input placeholder="http://127.0.0.1:5175" />
                   </Form.Item>
 
                   <Form.Item
@@ -432,7 +456,7 @@ export default function Settings() {
                     <Tag color={activeModeMeta.color}>{activeModeMeta.label}</Tag>
                   </Descriptions.Item>
                   <Descriptions.Item label="模式说明">{activeModeMeta.description}</Descriptions.Item>
-                  <Descriptions.Item label="API 端口">{settingsMap.PORT || '3000'}</Descriptions.Item>
+                  <Descriptions.Item label="API 端口">{settingsMap.PORT || '5174'}</Descriptions.Item>
                 </Descriptions>
               </Card>
             ),

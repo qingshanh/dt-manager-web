@@ -37,3 +37,46 @@ test("direct SMS parser leaves target empty when metadata only repeats the sende
 
   assert.equal(parsed?.toNumber, null);
 });
+
+test("direct SMS parser strips one-byte length prefix before provider text", () => {
+  const json = Buffer.from(JSON.stringify({ k1: 561, k2: "(833) 858-1657", k3: "length-prefix-regression" }), "utf8");
+  const content = Buffer.from("?<SiliconFlow?> Verification code is: 552420, valid for 5 minutes.", "utf8");
+  const metadata = Buffer.from("\u0004dtId\u0009170530439\u0003who\u000918188815435", "utf8");
+  const payload = Buffer.concat([Buffer.from([1, 7, 0, 0]), json, Buffer.from([0, content.length]), content, metadata]);
+
+  const parsed = parseSmsPush(payload);
+
+  assert.equal(parsed?.content, "?<SiliconFlow?> Verification code is: 552420, valid for 5 minutes.");
+});
+
+test("direct SMS parser strips one-byte length prefix before Chinese provider text", () => {
+  const json = Buffer.from(JSON.stringify({ k1: 561, k2: "Anster", k3: "length-prefix-chinese-regression" }), "utf8");
+  const content = Buffer.from("[硅基流动]Verification code is: 521153, valid for 5 minutes.", "utf8");
+  const metadata = Buffer.from("\u0004dtId\u0009170530439\u0003who\u0009447897076036", "utf8");
+  const payload = Buffer.concat([Buffer.from([1, 7, 0, 0]), json, Buffer.from([0, content.length]), content, metadata]);
+
+  const parsed = parseSmsPush(payload);
+
+  assert.equal(parsed?.content, "[硅基流动]Verification code is: 521153, valid for 5 minutes.");
+});
+test("direct SMS parser does not use a UK sender when metadata repeats it without country code", () => {
+  const metadata = Buffer.from("sender=7441399192", "latin1").toString("base64");
+  const json = Buffer.from(JSON.stringify({ k1: 561, k2: "+447441399192", info: metadata, k3: "uk-sender-only-regression" }), "utf8");
+  const content = Buffer.from("Your verification code is 246810", "utf8");
+  const payload = Buffer.concat([Buffer.from([1, 7, 0, 0]), json, Buffer.from([0]), content]);
+
+  const parsed = parseSmsPush(payload);
+
+  assert.equal(parsed?.toNumber, null);
+});
+test("direct SMS parser recovers provider label when the gateway sender is Unverified", () => {
+  const metadata = Buffer.from("target=61488827125", "latin1").toString("base64");
+  const json = Buffer.from(JSON.stringify({ k1: 561, k2: "Unverified", info: metadata, k3: "unverified-provider-regression" }), "utf8");
+  const content = Buffer.from("[SiliconFlow]Verification code is: 306497, valid for 5 minutes.", "utf8");
+  const payload = Buffer.concat([Buffer.from([1, 7, 0, 0]), json, Buffer.from([0]), content]);
+
+  const parsed = parseSmsPush(payload);
+
+  assert.equal(parsed?.fromNumber, "SiliconFlow");
+  assert.equal(parsed?.toNumber, "61488827125");
+});

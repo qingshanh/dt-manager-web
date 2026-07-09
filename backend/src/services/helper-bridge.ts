@@ -35,7 +35,7 @@ export async function dumpHelperSmsMessages(limit: number, appVariant: "dingtone
 
 export async function getCachedPrivateNumberEvent() {
   const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
-  const helperBaseUrl = normalizeOptionalString(settings.dt_real_bridge_base_url) || config.DT_REAL_BRIDGE_BASE_URL || "http://127.0.0.1:19091";
+  const helperBaseUrl = normalizeOptionalString(settings.dt_real_bridge_base_url) || config.DT_REAL_BRIDGE_BASE_URL || "http://127.0.0.1:5175";
   const response = await fetch(`${helperBaseUrl.replace(/\/+$/, "")}/cached/request_private_number`, {
     signal: AbortSignal.timeout(10_000)
   }).catch((error) => {
@@ -53,7 +53,7 @@ export async function getCachedPrivateNumberEvent() {
 
 export async function assertHelperAvailable(timeoutMs = 2_000) {
   const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
-  const helperBaseUrl = normalizeOptionalString(settings.dt_real_bridge_base_url) || config.DT_REAL_BRIDGE_BASE_URL || "http://127.0.0.1:19091";
+  const helperBaseUrl = normalizeOptionalString(settings.dt_real_bridge_base_url) || config.DT_REAL_BRIDGE_BASE_URL || "http://127.0.0.1:5175";
   const response = await fetch(`${helperBaseUrl.replace(/\/+$/, "")}/health`, {
     signal: AbortSignal.timeout(timeoutMs)
   }).catch((error) => {
@@ -68,7 +68,7 @@ export async function assertHelperAvailable(timeoutMs = 2_000) {
 
 async function postHelperExecute(action: string, input: Record<string, unknown>, timeoutMs: number) {
   const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
-  const helperBaseUrl = normalizeOptionalString(settings.dt_real_bridge_base_url) || config.DT_REAL_BRIDGE_BASE_URL || "http://127.0.0.1:19091";
+  const helperBaseUrl = normalizeOptionalString(settings.dt_real_bridge_base_url) || config.DT_REAL_BRIDGE_BASE_URL || "http://127.0.0.1:5175";
   const response = await fetch(`${helperBaseUrl.replace(/\/+$/, "")}/api/v1/dingtone/execute`, {
     method: "POST",
     headers: {

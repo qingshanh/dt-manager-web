@@ -7,7 +7,7 @@ dotenv.config({ path: path.resolve(process.cwd(), "..", ".env"), override: false
 
 const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-  PORT: z.coerce.number().int().positive().default(3000),
+  PORT: z.coerce.number().int().positive().default(5174),
   DATABASE_URL: z.string().default("file:./data/dingtone.db"),
   JWT_SECRET: z.string().min(16),
   JWT_EXPIRES_IN: z.string().default("24h"),
@@ -29,7 +29,7 @@ const schema = z.object({
     .default("false")
     .transform((value) => ["true", "1", "yes"].includes(value.trim().toLowerCase())),
   DT_APK_CERTIFICATE_SIGN: z.string().default("cf093a0e6b07dce3c8e05f7d4a9c261c"),
-  DT_REAL_BRIDGE_BASE_URL: z.string().optional().default(""),
+  DT_REAL_BRIDGE_BASE_URL: z.string().optional().default("http://127.0.0.1:5175"),
   DT_REAL_BRIDGE_TOKEN: z.string().optional().default(""),
   DT_REAL_BRIDGE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   DT_HELPER_PURCHASE_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),

@@ -1,5 +1,7 @@
 import { AppError } from "../utils/errors.js";
 
+const TELEGRAM_API_TIMEOUT_MS = 8_000;
+
 export class TelegramService {
   async sendMessage(input: { botToken: string; chatId: string; text: string; apiBaseUrl?: string | null; replyMarkup?: unknown }) {
     if (!input.botToken || !input.chatId) {
@@ -57,7 +59,8 @@ export class TelegramService {
     const response = await fetch(`${baseUrl}/bot${botToken}/${method}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TELEGRAM_API_TIMEOUT_MS)
     });
     if (!response.ok) {
       throw new AppError(`Telegram ${method} failed: ${response.status}`, 502, 502);

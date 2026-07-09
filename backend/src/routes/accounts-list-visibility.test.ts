@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { AccountStatus, MessageType } from "@prisma/client";
 import {
@@ -60,4 +61,11 @@ test("account routes include point and point store endpoints", () => {
   assert.ok(routes.includes("GET /:id/point"));
   assert.ok(routes.includes("GET /:id/pointstore"));
   assert.ok(routes.includes("POST /:id/pointstore/order"));
+});
+
+test("account list batches count lookups instead of running per-account count queries", () => {
+  const source = readFileSync(new URL("./accounts.ts", import.meta.url), "utf8");
+  assert.match(source, /prisma\.message\.groupBy\(/);
+  assert.match(source, /prisma\.phoneNumber\.groupBy\(/);
+  assert.doesNotMatch(source, /accounts\.map\(async \(item\) => \{\s*const \[unreadCount, activePhoneCount\]/s);
 });

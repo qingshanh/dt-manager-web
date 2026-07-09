@@ -8,7 +8,7 @@ import {
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useNavigate } from 'react-router-dom';
-import { getDashboardStats, getRecentMessages } from '../services/endpoints';
+import { CACHE_TTL_MS, cacheKeys, getDashboardStats, getRecentMessages, isCachedDataFresh, readCachedData } from '../services/endpoints';
 import type { DashboardStats, RecentMessage } from '../types';
 import dayjs from 'dayjs';
 
@@ -20,13 +20,49 @@ export default function Dashboard() {
   const { message: msg } = App.useApp();
 
   useEffect(() => {
+    let cancelled = false;
+    const statsKey = cacheKeys.dashboardStats;
+    const messagesKey = cacheKeys.recentMessages(10);
+    const cachedStats = readCachedData<DashboardStats>(statsKey);
+    const cachedMessages = readCachedData<RecentMessage[]>(messagesKey);
+    const hasCachedData = Boolean(cachedStats || cachedMessages);
+
+    if (cachedStats) {
+      setStats(cachedStats);
+    }
+    if (cachedMessages) {
+      setMessages(cachedMessages);
+    }
+    if (hasCachedData) {
+      setLoading(false);
+    }
+
+    const cacheFresh = isCachedDataFresh(statsKey, CACHE_TTL_MS.dashboard) && isCachedDataFresh(messagesKey, CACHE_TTL_MS.recentMessages);
+    if (cacheFresh && cachedStats && cachedMessages) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (!hasCachedData) {
+      setLoading(true);
+    }
     Promise.all([getDashboardStats(), getRecentMessages(10)])
       .then(([s, m]) => {
+        if (cancelled) return;
         setStats(s);
         setMessages(m);
       })
-      .catch((err) => msg.error(err.message))
-      .finally(() => setLoading(false));
+      .catch((err) => {
+        if (!cancelled) msg.error(err.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [msg]);
 
   const msgColumns: ColumnsType<RecentMessage> = [

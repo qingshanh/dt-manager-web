@@ -21,6 +21,6 @@ COPY package.json package-lock.json ./
 COPY --from=node-deps /app/node_modules ./node_modules
 COPY server.py frida_agent.js ./
 
-EXPOSE 19091
+EXPOSE 5175
 
 CMD ["python", "server.py"]

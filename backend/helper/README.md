@@ -55,7 +55,7 @@ python server.py
 
 默认监听地址：
 
-- `http://127.0.0.1:19091`
+- `http://127.0.0.1:5175`
 
 ## 环境变量说明
 
@@ -63,7 +63,7 @@ python server.py
 
 ```env
 DT_HELPER_BIND_HOST=127.0.0.1
-DT_HELPER_PORT=19091
+DT_HELPER_PORT=5175
 DT_HELPER_TOKEN=
 DT_HELPER_DEVICE_MODE=usb
 DT_HELPER_DEVICE_ID=

@@ -11,16 +11,16 @@ services:
       - ./.env
     environment:
       NODE_ENV: ${NODE_ENV:-production}
-      PORT: ${BACKEND_INTERNAL_PORT:-3000}
+      PORT: ${BACKEND_INTERNAL_PORT:-5174}
       APP_VERSION: ${APP_VERSION:-0.1.0}
       DATABASE_URL: file:/app/data/dingtone.db
-      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080,http://127.0.0.1:8080}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173,http://127.0.0.1:5173}
     volumes:
       - backend-data:/app/data
     ports:
-      - "${BACKEND_PORT:-3000}:${BACKEND_INTERNAL_PORT:-3000}"
+      - "${BACKEND_PORT:-5174}:${BACKEND_INTERNAL_PORT:-5174}"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${BACKEND_INTERNAL_PORT:-3000}/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${BACKEND_INTERNAL_PORT:-5174}/health >/dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
@@ -39,9 +39,9 @@ services:
     depends_on:
       - backend
     environment:
-      BACKEND_INTERNAL_PORT: ${BACKEND_INTERNAL_PORT:-3000}
+      BACKEND_INTERNAL_PORT: ${BACKEND_INTERNAL_PORT:-5174}
     ports:
-      - "${FRONTEND_PORT:-8080}:80"
+      - "${FRONTEND_PORT:-5173}:80"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health >/dev/null || exit 1"]
       interval: 30s
@@ -62,7 +62,7 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     environment:
       DT_HELPER_BIND_HOST: 0.0.0.0
-      DT_HELPER_PORT: ${HELPER_PORT:-19091}
+      DT_HELPER_PORT: ${HELPER_PORT:-5175}
       DT_HELPER_DEVICE_MODE: ${DT_HELPER_DEVICE_MODE:-remote}
       DT_HELPER_REMOTE_HOST: ${DT_HELPER_REMOTE_HOST:-host.docker.internal:27042}
       DT_HELPER_DEVICE_ID: ${DT_HELPER_DEVICE_ID:-}
@@ -72,7 +72,7 @@ services:
       DT_HELPER_TIMEOUT_MS: ${DT_HELPER_TIMEOUT_MS:-90000}
       DT_HELPER_SPAWN_PAUSE_MS: ${DT_HELPER_SPAWN_PAUSE_MS:-1500}
     ports:
-      - "${HELPER_PORT:-19091}:${HELPER_PORT:-19091}"
+      - "${HELPER_PORT:-5175}:${HELPER_PORT:-5175}"
 
 volumes:
   backend-data:

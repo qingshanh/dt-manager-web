@@ -76,7 +76,7 @@ class HelperConfig:
         base_dir = Path(__file__).resolve().parent
         return cls(
             bind_host=os.getenv("DT_HELPER_BIND_HOST", "127.0.0.1"),
-            bind_port=int(os.getenv("DT_HELPER_PORT", "19091")),
+            bind_port=int(os.getenv("DT_HELPER_PORT", "5175")),
             auth_token=os.getenv("DT_HELPER_TOKEN", "").strip(),
             device_mode=os.getenv("DT_HELPER_DEVICE_MODE", "usb").strip().lower(),
             device_id=os.getenv("DT_HELPER_DEVICE_ID", "").strip(),

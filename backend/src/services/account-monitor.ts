@@ -47,6 +47,8 @@ type MonitorRunner = {
   appCatchupIntervalMs: number;
   lastRefreshAt: number | null;
   lastCyclePreempted: boolean;
+  lastCycleUsedDirectSlot: boolean;
+  lastCycleSkippedDirectSlot: boolean;
 };
 
 type DirectMonitorFrameState = {
@@ -65,6 +67,7 @@ type DirectMonitorFrameState = {
 
 const directMonitorGateway = new DirectDingtoneGateway();
 let activeDirectMonitorPolls = 0;
+let appFallbackScanQueue = Promise.resolve() as Promise<unknown>;
 
 export class AccountMonitorService {
   private runners = new Map<number, MonitorRunner>();
@@ -113,7 +116,9 @@ export class AccountMonitorService {
       appCatchupEnabled: monitorConfig.appCatchupEnabled,
       appCatchupIntervalMs: monitorConfig.appCatchupIntervalMs,
       lastRefreshAt: null,
-      lastCyclePreempted: false
+      lastCyclePreempted: false,
+      lastCycleUsedDirectSlot: false,
+      lastCycleSkippedDirectSlot: false
     };
     this.runners.set(accountId, runner);
 
@@ -153,12 +158,13 @@ export class AccountMonitorService {
 
     const account = await prisma.dtAccount.findUnique({
       where: { id: accountId },
-      select: { dtUserId: true, dtDeviceId: true }
+      select: { dtUserId: true, dtDeviceId: true, appVariant: true }
     });
     if (account?.dtUserId) {
       preemptDirectSessionPushListener({
         dtUserId: account.dtUserId,
-        deviceId: account.dtDeviceId
+        deviceId: account.dtDeviceId,
+        appVariant: account.appVariant
       });
     }
 
@@ -194,6 +200,11 @@ export class AccountMonitorService {
         payload: { accountId, status: targetStatus }
       });
     }
+  }
+
+  isRunning(accountId: number) {
+    const runner = this.runners.get(accountId);
+    return Boolean(runner && !runner.stopped);
   }
 
   async restart(accountId: number) {
@@ -232,21 +243,38 @@ export class AccountMonitorService {
 
     const accountsToRestore = await this.disableDuplicateRestoreCandidates(accounts);
 
-    accountsToRestore.forEach((account, index) => {
-      const timer = setTimeout(() => {
-        void this.start(account.id)
-          .then(() => {
-            logger.info("Restored account monitor after backend restart", { accountId: account.id });
-          })
-          .catch((error) => {
-            const message = error instanceof Error ? error.message : String(error);
-            logger.warn("Failed to restore account monitor after backend restart", {
-              accountId: account.id,
-              error: message
-            });
-          });
-      }, index * restoreDelayMs);
-      timer.unref?.();
+    const restoreAccountIds = accountsToRestore.map((account) => account.id);
+    if (restoreAccountIds.length > 0) {
+      await prisma.monitorSession.updateMany({
+        where: {
+          accountId: { in: restoreAccountIds },
+          status: { in: [MonitorStatus.running, MonitorStatus.error] }
+        },
+        data: {
+          status: MonitorStatus.stopped,
+          stoppedAt: new Date(),
+          routeAddress: "monitor auto-restore restarting after backend startup"
+        }
+      });
+    }
+
+    const restoreTasks = accountsToRestore.map(async (account, index) => {
+      if (index > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, index * restoreDelayMs));
+      }
+      try {
+        await this.start(account.id);
+        logger.info("Restored account monitor after backend restart", { accountId: account.id });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn("Failed to restore account monitor after backend restart", {
+          accountId: account.id,
+          error: message
+        });
+      }
+    });
+    void Promise.allSettled(restoreTasks).then(() => {
+      logger.info("Account monitor restore queue finished", { count: accountsToRestore.length });
     });
 
     if (accountsToRestore.length > 0) {
@@ -366,10 +394,25 @@ export class AccountMonitorService {
       runner.running = false;
       if (!runner.stopped) {
         const elapsed = Date.now() - startedAt;
-        const nextDelay = runner.lastCyclePreempted ? 1_000 : Math.max(1_000, runner.pollIntervalMs - elapsed);
+        const nextDelay = runner.lastCyclePreempted
+          ? 1_000
+          : runner.lastCycleSkippedDirectSlot
+            ? 5_000
+            : runner.lastCycleUsedDirectSlot
+              ? this.hasDedicatedDirectSlots(runner) ? 1_000 : this.directSlotRotationDelay(runner)
+              : Math.max(1_000, runner.pollIntervalMs - elapsed);
         this.scheduleNext(runner, nextDelay);
       }
     }
+  }
+
+  private hasDedicatedDirectSlots(runner: MonitorRunner) {
+    return runner.maxConcurrentDirectPolls >= this.runners.size;
+  }
+
+  private directSlotRotationDelay(runner: MonitorRunner) {
+    const rotationSize = Math.ceil(this.runners.size / Math.max(1, runner.maxConcurrentDirectPolls));
+    return Math.max(runner.pollIntervalMs, runner.pollIntervalMs * rotationSize);
   }
 
   private async runCycle(runner: MonitorRunner, failFast: boolean) {
@@ -381,6 +424,8 @@ export class AccountMonitorService {
     runner.maxConcurrentDirectPolls = latestConfig.maxConcurrentDirectPolls;
     runner.appCatchupEnabled = latestConfig.appCatchupEnabled;
     runner.appCatchupIntervalMs = latestConfig.appCatchupIntervalMs;
+    runner.lastCycleUsedDirectSlot = false;
+    runner.lastCycleSkippedDirectSlot = false;
 
     try {
       let phoneCount = 0;
@@ -392,20 +437,10 @@ export class AccountMonitorService {
       );
       const useDirectFlow = await shouldUseDirectAccountFlow(account);
 
-      if (shouldRefreshRuntimeData(runner)) {
-        try {
-          const result = await refreshAccountRuntimeData(runner.accountId, useDirectFlow ? directMonitorGateway : dingtoneGateway);
-          phoneCount = result.phoneCount;
-          runner.lastRefreshAt = Date.now();
-        } catch (error) {
-          if (!useDirectFlow) {
-            throw error;
-          }
-          logger.warn("Direct refresh failed during monitor cycle, continuing with SMS polling", {
-            accountId: runner.accountId,
-            error: error instanceof Error ? error.message : String(error)
-          });
-        }
+      if (shouldRefreshRuntimeData(runner) && !useDirectFlow) {
+        const result = await refreshAccountRuntimeData(runner.accountId, dingtoneGateway);
+        phoneCount = result.phoneCount;
+        runner.lastRefreshAt = Date.now();
       }
       const dtUserId = account.dtUserId;
       const token = account.dtToken;
@@ -426,6 +461,8 @@ export class AccountMonitorService {
         : null;
       const createdMessages = directPollResult ? directPollResult.createdMessages : await this.pollHelperMessages(runner);
       runner.lastCyclePreempted = Boolean(directPollResult?.preempted);
+      runner.lastCycleUsedDirectSlot = Boolean(directPollResult?.listened);
+      runner.lastCycleSkippedDirectSlot = Boolean(directPollResult?.skippedForConcurrency);
       if (runner.stopped) {
         return;
       }
@@ -567,13 +604,13 @@ export class AccountMonitorService {
     );
     const refreshIntervalSeconds = parsePositiveIntSetting(settings.auto_refresh_interval, config.DEFAULT_AUTO_REFRESH_INTERVAL);
     const maxRetryCount = parsePositiveIntSetting(settings.max_retry_count, config.DEFAULT_MAX_RETRY_COUNT);
-    const maxConcurrentDirectPolls = parseNonNegativeIntSetting(settings.direct_monitor_max_concurrent, 0);
-    const appCatchupEnabled = parseBooleanSetting(settings.direct_monitor_app_catchup_enabled, false);
+    const maxConcurrentDirectPolls = parsePositiveIntSetting(settings.direct_monitor_max_concurrent, 10);
+    const appCatchupEnabled = parseBooleanSetting(settings.direct_monitor_app_catchup_enabled, true);
     const appCatchupIntervalSeconds = parsePositiveIntSetting(settings.direct_monitor_app_catchup_seconds, 45);
     return {
       pollIntervalMs: Math.max(15_000, pollIntervalSeconds * 1000),
       refreshIntervalMs: Math.max(30_000, refreshIntervalSeconds * 1000),
-      listenSeconds: Math.max(30, Math.min(1800, directListenSeconds)),
+      listenSeconds: Math.max(300, Math.min(1800, directListenSeconds)),
       maxRetryCount: Math.max(1, maxRetryCount),
       maxConcurrentDirectPolls,
       appCatchupEnabled,
@@ -591,25 +628,31 @@ export class AccountMonitorService {
       phone?: string | null;
       appVariant: AppVariant;
     }
-  ): Promise<{ createdMessages: number; preempted: boolean; diagnosticNote: string | null }> {
+  ): Promise<{ createdMessages: number; preempted: boolean; diagnosticNote: string | null; listened: boolean; skippedForConcurrency: boolean }> {
     if (runner.maxConcurrentDirectPolls > 0 && activeDirectMonitorPolls >= runner.maxConcurrentDirectPolls) {
       logger.info("Skipping direct SMS monitor cycle because concurrency limit is reached", {
         accountId: runner.accountId,
         activeDirectMonitorPolls,
         maxConcurrentDirectPolls: runner.maxConcurrentDirectPolls
       });
-      return { createdMessages: 0, preempted: false, diagnosticNote: "direct-monitor=skipped; reason=concurrency-limit" };
+      return { createdMessages: 0, preempted: false, diagnosticNote: "direct-monitor=skipped; reason=concurrency-limit", listened: false, skippedForConcurrency: true };
     }
 
     let createdMessages = 0;
     let preempted = false;
     let diagnosticNote: string | null = null;
     let lastDiagnosticUpdateAt = 0;
+    let directListenCompleted = false;
     let appCatchupInFlight = false;
     let appCatchupScanned = 0;
     let appCatchupImported = 0;
     let appCatchupSource: string | null = null;
     let appCatchupError: string | null = null;
+    let lastAppCatchupScheduledAt = 0;
+    let offlineCatchupAttempted = false;
+    let offlineCatchupSent = false;
+    let offlineCatchupSendCount = 0;
+    let offlineCatchupError: string | null = null;
     const liveState: DirectMonitorFrameState = {
       host: null,
       rawPushFrames: 0,
@@ -633,6 +676,11 @@ export class AccountMonitorService {
         imported: appCatchupImported,
         source: appCatchupSource,
         error: appCatchupError
+      }, {
+        attempted: offlineCatchupAttempted,
+        sent: offlineCatchupSent,
+        sendCount: offlineCatchupSendCount,
+        error: offlineCatchupError
       });
       await prisma.monitorSession.update({
         where: { id: runner.sessionId },
@@ -647,6 +695,7 @@ export class AccountMonitorService {
       });
     };
     activeDirectMonitorPolls += 1;
+    runner.lastCycleUsedDirectSlot = true;
     const appCatchupState: { promise: Promise<void> | null } = { promise: null };
     const runAppCatchup = async (source: string) => {
       if (runner.stopped || appCatchupInFlight) {
@@ -683,6 +732,7 @@ export class AccountMonitorService {
       if (appCatchupInFlight) {
         return;
       }
+      lastAppCatchupScheduledAt = Date.now();
       const promise = runAppCatchup(source).finally(() => {
         if (appCatchupState.promise === promise) {
           appCatchupState.promise = null;
@@ -707,7 +757,8 @@ export class AccountMonitorService {
           token: requireDecryptedToken(account.token),
           deviceId: account.deviceId,
           email: account.email,
-          phone: account.phone
+          phone: account.phone,
+          appVariant: account.appVariant
         },
         listenSeconds: runner.listenSeconds,
         onPush: async (push: DirectProbePushResult) => {
@@ -723,6 +774,13 @@ export class AccountMonitorService {
               error: error instanceof Error ? error.message : String(error)
             });
           }
+        },
+        onOfflineCatchup: async (status) => {
+          offlineCatchupAttempted = status.attempted;
+          offlineCatchupSent = status.sent;
+          offlineCatchupSendCount = status.sendCount;
+          offlineCatchupError = status.error;
+          await updateLiveDiagnostic(true);
         },
         onFrame: async (push, host) => {
           liveState.host = host;
@@ -757,13 +815,21 @@ export class AccountMonitorService {
           }
           hostState.statusCounts.set(status, (hostState.statusCounts.get(status) ?? 0) + 1);
           liveState.hostCounts.set(host, hostState);
+          if (
+            runner.appCatchupEnabled &&
+            shouldScheduleAppCatchupForFrame(liveState) &&
+            Date.now() - lastAppCatchupScheduledAt >= runner.appCatchupIntervalMs
+          ) {
+            scheduleAppCatchup("direct-frame-gap");
+          }
           await updateLiveDiagnostic(Boolean(push.sms));
         }
       });
       if (runner.stopped) {
-        return { createdMessages, preempted: Boolean(result.preempted), diagnosticNote };
+        return { createdMessages, preempted: Boolean(result.preempted), diagnosticNote, listened: true, skippedForConcurrency: false };
       }
       preempted = Boolean(result.preempted);
+      directListenCompleted = true;
       diagnosticNote = buildDirectMonitorDiagnosticNote(result, createdMessages);
       await prisma.monitorSession.update({
         where: { id: runner.sessionId },
@@ -791,9 +857,31 @@ export class AccountMonitorService {
       if (pendingAppCatchup) {
         await pendingAppCatchup.catch(() => undefined);
       }
+      if (directListenCompleted && !runner.stopped) {
+        diagnosticNote = buildDirectMonitorLiveDiagnosticNote(liveState, createdMessages, preempted, {
+          scanned: appCatchupScanned,
+          imported: appCatchupImported,
+          source: appCatchupSource,
+          error: appCatchupError
+        }, {
+          attempted: offlineCatchupAttempted,
+          sent: offlineCatchupSent,
+          sendCount: offlineCatchupSendCount,
+          error: offlineCatchupError
+        }, preempted ? "preempted" : "completed");
+        await prisma.monitorSession.update({
+          where: { id: runner.sessionId },
+          data: { routeAddress: diagnosticNote }
+        }).catch((error) => {
+          logger.warn("Failed to update final direct SMS monitor catch-up diagnostics", {
+            accountId: runner.accountId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        });
+      }
       activeDirectMonitorPolls = Math.max(0, activeDirectMonitorPolls - 1);
     }
-    return { createdMessages, preempted, diagnosticNote };
+    return { createdMessages, preempted, diagnosticNote, listened: true, skippedForConcurrency: false };
   }
 
   private async pollHelperMessages(runner: MonitorRunner) {
@@ -849,6 +937,15 @@ export class AccountMonitorService {
   }
 }
 
+function runSerializedAppFallbackScan<T>(run: () => Promise<T>): Promise<T> {
+  appFallbackScanQueue = appFallbackScanQueue.then(run, run);
+  const next = appFallbackScanQueue as Promise<T>;
+  appFallbackScanQueue = appFallbackScanQueue.then(() => undefined, () => undefined);
+  return next;
+}
+function shouldScheduleAppCatchupForFrame(state: DirectMonitorFrameState) {
+  return state.smsPushes === 0 && (state.missedStatus0103Sample !== null || state.nonSmsPushFrames >= 2);
+}
 function filterFreshUiSmsRows(rows: Awaited<ReturnType<typeof dumpSmsMessagesFromUi>>) {
   const freshSince = Date.now() - 30 * 60_000;
   return rows.filter((row) => {
@@ -881,7 +978,9 @@ function buildDirectMonitorDiagnosticNote(result: DirectProbeResult, storedMessa
     `smsPushes=${result.pushes.length}`,
     `nonSms8107=${nonSmsPushFrames}`,
     `stored=${storedMessages}`,
-    `listen=${result.preempted ? "preempted" : "completed"}`
+    `listen=${result.preempted ? "preempted" : "completed"}`,
+    `offlineTemplate=${result.offlineTemplateSent ? "sent" : result.offlineTemplateAttempted ? "attempted" : "not-attempted"}`,
+    `offlineCatchupSends=${result.offlineTemplateSendCount ?? 0}`
   ];
   if (statusSummary) {
     parts.push(`status=${statusSummary}`);
@@ -896,7 +995,9 @@ function buildDirectMonitorLiveDiagnosticNote(
   state: DirectMonitorFrameState,
   storedMessages: number,
   preempted: boolean,
-  appCatchup?: { scanned: number; imported: number; source: string | null; error: string | null }
+  appCatchup?: { scanned: number; imported: number; source: string | null; error: string | null },
+  offlineCatchup?: { attempted: boolean; sent: boolean; sendCount: number; error: string | null },
+  listenState?: "active" | "completed" | "preempted"
 ) {
   const statusSummary = Array.from(state.statusCounts.entries())
     .sort(([left], [right]) => left.localeCompare(right))
@@ -908,13 +1009,20 @@ function buildDirectMonitorLiveDiagnosticNote(
     `smsPushes=${state.smsPushes}`,
     `nonSms8107=${state.nonSmsPushFrames}`,
     `stored=${storedMessages}`,
-    `listen=${preempted ? "preempted" : "active"}`
+    `listen=${listenState ?? (preempted ? "preempted" : "active")}`
   ];
   if (statusSummary) {
     parts.push(`status=${statusSummary}`);
   }
   if (state.missedStatus0103Sample) {
     parts.push(`missed0103=${state.missedStatus0103Sample}`);
+  }
+  if (offlineCatchup) {
+    parts.push(`offlineTemplate=${offlineCatchup.sent ? "sent" : offlineCatchup.attempted ? "attempted" : "not-attempted"}`);
+    parts.push(`offlineCatchupSends=${offlineCatchup.sendCount}`);
+    if (offlineCatchup.error) {
+      parts.push(`offlineTemplateError=${offlineCatchup.error}`);
+    }
   }
   if (appCatchup) {
     parts.push(`appCatchup=${appCatchup.source ?? "none"}:${appCatchup.scanned}/${appCatchup.imported}`);
@@ -948,12 +1056,26 @@ function hostSummaryRank(state: { rawPushFrames: number; smsPushes: number; stat
 }
 
 function formatMissedDirectMonitorFrameSample(push: DirectProbePushResult) {
-  const bodyPreview = push.bodyHexPreview ? `${push.bodyHexPreview.slice(0, 80)}...` : "empty";
-  return `body=${push.bodyLength},bodyHex=${bodyPreview}`;
+  const bodyHex = push.bodyHex ?? push.bodyHexPreview ?? "";
+  const rawHex = push.rawHex ?? push.rawHexPreview ?? "";
+  const bodyPreview = bodyHex ? `${bodyHex.slice(0, 1600)}${bodyHex.length > 1600 ? "..." : ""}` : "empty";
+  const rawPreview = rawHex ? `${rawHex.slice(0, 240)}${rawHex.length > 240 ? "..." : ""}` : "empty";
+  return `body=${push.bodyLength},bodyHex=${bodyPreview},rawHex=${rawPreview}`;
 }
 
 function classifyMonitorError(message: string) {
   const normalized = message.toLowerCase();
+  if (
+    normalized.includes("rest call failed") ||
+    normalized.includes("socket closed") ||
+    normalized.includes("socket has been ended") ||
+    normalized.includes("timed out") ||
+    normalized.includes("timeout") ||
+    normalized.includes("econnreset") ||
+    normalized.includes("etimedout")
+  ) {
+    return "transient";
+  }
   if (
     normalized.includes("authen failed") ||
     normalized.includes("deviceid not find") ||

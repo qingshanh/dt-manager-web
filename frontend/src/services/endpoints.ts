@@ -1,4 +1,5 @@
 import api from './api';
+import { fetchCachedData, invalidateCachedData, isCachedDataFresh, makeCacheKey, readCachedData } from './client-cache';
 import type {
   ApiResponse,
   CreateAccountRequest,
@@ -31,7 +32,49 @@ import type {
   ValidateSessionRequest,
   ValidateSessionResult,
 } from '../types';
+type CacheOptions = { force?: boolean };
+const PAGE_NAVIGATION_TIMEOUT_MS = 30_000;
 
+export const CACHE_TTL_MS = {
+  dashboard: 60_000,
+  recentMessages: 30_000,
+  accounts: 60_000,
+  accountDetail: 60_000,
+  accountMessages: 15_000,
+  phoneNumbers: 5 * 60_000,
+  settings: 5 * 60_000,
+} as const;
+
+export const cacheKeys = {
+  dashboardStats: 'dashboard:stats',
+  recentMessages: (limit = 20) => makeCacheKey('dashboard:recent-messages', { limit }),
+  accounts: (params?: { page?: number; pageSize?: number; status?: string; keyword?: string }) =>
+    makeCacheKey('accounts:list', params ?? {}),
+  account: (id: number) => `account:${id}:detail`,
+  accountMessages: (
+    accountId: number,
+    params?: {
+      page?: number;
+      pageSize?: number;
+      keyword?: string;
+      msg_type?: Message['msg_type'];
+      exclude_system?: boolean;
+      is_read?: boolean;
+    },
+  ) => makeCacheKey(`account:${accountId}:messages`, params ?? {}),
+  phoneNumbers: (accountId: number) => `account:${accountId}:phone-numbers`,
+  settings: 'settings:all',
+};
+
+export { invalidateCachedData, isCachedDataFresh, readCachedData };
+
+function invalidateAccountCaches(accountId?: number) {
+  invalidateCachedData('dashboard:');
+  invalidateCachedData('accounts:');
+  if (accountId !== undefined) {
+    invalidateCachedData(`account:${accountId}:`);
+  }
+}
 // 鈹€鈹€ 璁よ瘉 鈹€鈹€
 
 export async function login(data: LoginRequest) {
@@ -55,16 +98,20 @@ export async function changePassword(old_password: string, new_password: string)
 
 // 鈹€鈹€ 浠〃鐩?鈹€鈹€
 
-export async function getDashboardStats() {
-  const res = await api.get<ApiResponse<DashboardStats>>('/dashboard/stats');
-  return res.data.data;
+export async function getDashboardStats(options?: CacheOptions) {
+  return fetchCachedData(cacheKeys.dashboardStats, CACHE_TTL_MS.dashboard, async () => {
+    const res = await api.get<ApiResponse<DashboardStats>>('/dashboard/stats');
+    return res.data.data;
+  }, options);
 }
 
-export async function getRecentMessages(limit = 20) {
-  const res = await api.get<ApiResponse<RecentMessage[]>>('/dashboard/recent-messages', {
-    params: { limit },
-  });
-  return res.data.data;
+export async function getRecentMessages(limit = 20, options?: CacheOptions) {
+  return fetchCachedData(cacheKeys.recentMessages(limit), CACHE_TTL_MS.recentMessages, async () => {
+    const res = await api.get<ApiResponse<RecentMessage[]>>('/dashboard/recent-messages', {
+      params: { limit },
+    });
+    return res.data.data;
+  }, options);
 }
 
 // 鈹€鈹€ 璐︽埛绠＄悊 鈹€鈹€
@@ -74,9 +121,11 @@ export async function getAccounts(params?: {
   pageSize?: number;
   status?: string;
   keyword?: string;
-}) {
-  const res = await api.get<ApiResponse<PagedData<DtAccountListItem>>>('/accounts', { params });
-  return res.data.data;
+}, options?: CacheOptions) {
+  return fetchCachedData(cacheKeys.accounts(params), CACHE_TTL_MS.accounts, async () => {
+    const res = await api.get<ApiResponse<PagedData<DtAccountListItem>>>('/accounts', { params });
+    return res.data.data;
+  }, options);
 }
 
 export async function createAccount(data: CreateAccountRequest) {
@@ -100,16 +149,20 @@ export async function createAccount(data: CreateAccountRequest) {
     data,
     { timeout: 120_000 },
   );
+  invalidateAccountCaches(res.data.data?.id);
   return res.data.data;
 }
 
-export async function getAccount(id: number) {
-  const res = await api.get<ApiResponse<DtAccountDetail>>(`/accounts/${id}`, { timeout: 10_000 });
-  return res.data.data;
+export async function getAccount(id: number, options?: CacheOptions) {
+  return fetchCachedData(cacheKeys.account(id), CACHE_TTL_MS.accountDetail, async () => {
+    const res = await api.get<ApiResponse<DtAccountDetail>>(`/accounts/${id}`, { timeout: PAGE_NAVIGATION_TIMEOUT_MS });
+    return res.data.data;
+  }, options);
 }
 
 export async function updateAccount(id: number, data: UpdateAccountRequest) {
   const res = await api.put<ApiResponse<DtAccountListItem>>(`/accounts/${id}`, data);
+  invalidateAccountCaches(id);
   return res.data.data;
 }
 
@@ -117,6 +170,7 @@ export async function deleteAccount(id: number) {
   const res = await api.delete<ApiResponse<null>>(`/accounts/${id}`, {
     params: { confirm: 'true' },
   });
+  invalidateAccountCaches(id);
   return res.data;
 }
 
@@ -126,6 +180,7 @@ export async function sendVerificationCode(id: number, options?: { fresh_device?
     options ?? undefined,
     { timeout: 90_000 },
   );
+  invalidateAccountCaches(id);
   return res.data.data;
 }
 
@@ -135,6 +190,7 @@ export async function verifyCode(id: number, code: string) {
     { code },
     { timeout: 120_000 },
   );
+  invalidateAccountCaches(id);
   return res.data.data;
 }
 
@@ -147,21 +203,25 @@ export async function probeAccessCode(id: number, data: AccessCodeProbeRequest) 
 
 export async function startMonitor(id: number) {
   const res = await api.post<ApiResponse<MonitorSession>>(`/accounts/${id}/start`);
+  invalidateAccountCaches(id);
   return res.data.data;
 }
 
 export async function stopMonitor(id: number) {
   const res = await api.post<ApiResponse<{ status: string; stopped_at: string }>>(`/accounts/${id}/stop`);
+  invalidateAccountCaches(id);
   return res.data.data;
 }
 
 export async function restartMonitor(id: number) {
   const res = await api.post<ApiResponse<MonitorSession>>(`/accounts/${id}/restart`);
+  invalidateAccountCaches(id);
   return res.data.data;
 }
 
 export async function reLogin(id: number) {
   const res = await api.post<ApiResponse<{ dt_user_id: string; status: string }>>(`/accounts/${id}/re-login`);
+  invalidateAccountCaches(id);
   return res.data.data;
 }
 
@@ -171,16 +231,19 @@ export async function refreshAccount(id: number) {
     undefined,
     { timeout: 12_000 },
   );
+  invalidateAccountCaches(id);
   return res.data.data;
 }
 
 export async function captureSession(id: number) {
   const res = await api.post<ApiResponse<ValidateSessionResult>>(`/accounts/${id}/capture-session`);
+  invalidateAccountCaches(id);
   return res.data.data;
 }
 
 export async function validateSession(id: number, data: ValidateSessionRequest) {
   const res = await api.post<ApiResponse<ValidateSessionResult>>(`/accounts/${id}/validate-session`, data);
+  invalidateAccountCaches(id);
   return res.data.data;
 }
 
@@ -196,23 +259,28 @@ export async function getAccountMessages(
     exclude_system?: boolean;
     is_read?: boolean;
   },
+  options?: CacheOptions,
 ) {
-  const isReadParam = params?.is_read === undefined ? undefined : String(params.is_read);
-  const excludeSystemParam = params?.exclude_system === undefined ? undefined : String(params.exclude_system);
-  const res = await api.get<ApiResponse<PagedData<Message>>>(`/accounts/${accountId}/messages`, {
-    params: { ...params, is_read: isReadParam, exclude_system: excludeSystemParam },
-    timeout: 10_000,
-  });
-  return res.data.data;
+  return fetchCachedData(cacheKeys.accountMessages(accountId, params), CACHE_TTL_MS.accountMessages, async () => {
+    const isReadParam = params?.is_read === undefined ? undefined : String(params.is_read);
+    const excludeSystemParam = params?.exclude_system === undefined ? undefined : String(params.exclude_system);
+    const res = await api.get<ApiResponse<PagedData<Message>>>(`/accounts/${accountId}/messages`, {
+      params: { ...params, is_read: isReadParam, exclude_system: excludeSystemParam },
+      timeout: PAGE_NAVIGATION_TIMEOUT_MS,
+    });
+    return res.data.data;
+  }, options);
 }
 
 export async function readAllMessages(accountId: number) {
   const res = await api.put<ApiResponse<null>>(`/accounts/${accountId}/messages/read-all`);
+  invalidateAccountCaches(accountId);
   return res.data;
 }
 
 export async function deleteMessage(accountId: number, messageId: number) {
   const res = await api.delete<ApiResponse<null>>(`/accounts/${accountId}/messages/${messageId}`);
+  invalidateAccountCaches(accountId);
   return res.data;
 }
 
@@ -222,6 +290,7 @@ export async function refreshAccountMessages(accountId: number, limit = 20, dire
     { limit, direct_only: directOnly },
     { timeout: 90_000 }
   );
+  invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
@@ -231,6 +300,7 @@ export async function syncHelperMessages(accountId: number, limit = 20) {
     { limit },
     { timeout: 90_000 }
   );
+  invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
@@ -255,6 +325,7 @@ export async function importSessions(data: { accounts: unknown[]; direct_setting
       results: Array<{ ok: boolean; account_id?: number; dt_user_id?: string; nickname?: string; error?: string }>;
     }>
   >('/accounts/sessions/import', data, { timeout: 120_000 });
+  invalidateCachedData();
   return res.data.data;
 }
 
@@ -316,14 +387,17 @@ export async function importFullBackup(data: {
       results: Array<{ ok: boolean; account_id?: number; dt_user_id?: string; nickname?: string; error?: string }>;
     }>
   >('/accounts/backup/import', data, { timeout: 180_000 });
+  invalidateCachedData();
   return res.data.data;
 }
 
 // 鈹€鈹€ 鎵嬫満鍙?鈹€鈹€
 
-export async function getPhoneNumbers(accountId: number) {
-  const res = await api.get<ApiResponse<PhoneNumber[]>>(`/accounts/${accountId}/phone-numbers`, { timeout: 10_000 });
-  return res.data.data;
+export async function getPhoneNumbers(accountId: number, options?: CacheOptions) {
+  return fetchCachedData(cacheKeys.phoneNumbers(accountId), CACHE_TTL_MS.phoneNumbers, async () => {
+    const res = await api.get<ApiResponse<PhoneNumber[]>>(`/accounts/${accountId}/phone-numbers`, { timeout: PAGE_NAVIGATION_TIMEOUT_MS });
+    return res.data.data;
+  }, options);
 }
 
 export async function syncPhoneNumbers(accountId: number) {
@@ -332,6 +406,7 @@ export async function syncPhoneNumbers(accountId: number) {
     undefined,
     { timeout: 12_000 },
   );
+  invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
@@ -354,19 +429,20 @@ export async function purchasePhoneNumber(accountId: number, data: PurchasePhone
   const res = await api.post<ApiResponse<PurchasePhoneNumberResult>>(`/accounts/${accountId}/phone-numbers/purchase`, data, {
     timeout: 180_000,
   });
+  invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
 export async function getAccountPoint(accountId: number) {
   const res = await api.get<ApiResponse<PointData>>(`/accounts/${accountId}/point`, {
-    timeout: 10_000,
+    timeout: PAGE_NAVIGATION_TIMEOUT_MS,
   });
   return res.data.data;
 }
 
 export async function getAccountPointStore(accountId: number) {
   const res = await api.get<ApiResponse<PointStoreData>>(`/accounts/${accountId}/pointstore`, {
-    timeout: 10_000,
+    timeout: PAGE_NAVIGATION_TIMEOUT_MS,
   });
   return res.data.data;
 }
@@ -377,6 +453,7 @@ export async function orderPointStoreProduct(accountId: number, productId: strin
     { product_id: productId, confirm: true },
     { timeout: 90_000 },
   );
+  invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
@@ -384,11 +461,13 @@ export async function renewPhoneNumber(accountId: number, phoneId: number) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/renew`, {
     confirm: true,
   });
+  invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
 export async function updatePhoneNumberLabel(accountId: number, phoneId: number, data: UpdatePhoneLabelBody) {
   const res = await api.put<ApiResponse<PhoneNumber>>(`/accounts/${accountId}/phone-numbers/${phoneId}/label`, data);
+  invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
@@ -396,6 +475,7 @@ export async function cancelPhoneNumber(accountId: number, phoneId: number) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/cancel`, {
     confirm: true,
   });
+  invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
@@ -403,6 +483,7 @@ export async function pausePhoneNumber(accountId: number, phoneId: number) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/pause`, {
     confirm: true,
   });
+  invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
@@ -410,6 +491,7 @@ export async function resumePhoneNumber(accountId: number, phoneId: number) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/resume`, {
     confirm: true,
   });
+  invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
@@ -417,18 +499,22 @@ export async function deletePhoneNumber(accountId: number, phoneId: number) {
   const res = await api.delete<ApiResponse<null>>(`/accounts/${accountId}/phone-numbers/${phoneId}`, {
     params: { confirm: 'true' },
   });
+  invalidateAccountCaches(accountId);
   return res.data;
 }
 
 // 鈹€鈹€ 璁剧疆 鈹€鈹€
 
-export async function getSettings() {
-  const res = await api.get<ApiResponse<SettingItem[]>>('/settings');
-  return res.data.data;
+export async function getSettings(options?: CacheOptions) {
+  return fetchCachedData(cacheKeys.settings, CACHE_TTL_MS.settings, async () => {
+    const res = await api.get<ApiResponse<SettingItem[]>>('/settings');
+    return res.data.data;
+  }, options);
 }
 
 export async function updateSettings(data: Record<string, string | number | boolean>) {
   const res = await api.put<ApiResponse<SettingItem[]>>('/settings', data);
+  invalidateCachedData('settings:');
   return res.data.data;
 }
 
@@ -443,5 +529,6 @@ export async function mockMessage(account_id: number, content: string, from_numb
     content,
     from_number,
   });
+  invalidateAccountCaches(account_id);
   return res.data.data;
 }

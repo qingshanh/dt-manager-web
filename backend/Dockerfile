@@ -27,6 +27,6 @@ COPY --from=build /app/prisma ./prisma
 
 RUN mkdir -p /app/data
 
-EXPOSE 3000
+EXPOSE 5174
 
 CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]

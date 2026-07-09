@@ -40,10 +40,11 @@ function parseCompressedSmsPush(payload: Buffer): ParsedSmsPush | null {
     return null;
   }
 
+  const rawSender = json.k2 ?? null;
   return {
     msgType: json.k1 ?? 0,
-    fromNumber: json.k2 ?? null,
-    toNumber: extractTargetNumberFromPushMetadata(json, json.k2 ?? null),
+    fromNumber: normalizeSmsSender(rawSender, content),
+    toNumber: extractTargetNumberFromPushMetadata(json, rawSender),
     content,
     rawInfo: json.info,
     rawK3: json.k3,
@@ -76,10 +77,11 @@ function parsePlaintextSmsPush(payload: Buffer): ParsedSmsPush | null {
     return null;
   }
 
+  const rawSender = json.k2 ?? null;
   return {
     msgType: json.k1 ?? 0,
-    fromNumber: json.k2 ?? null,
-    toNumber: extractTargetNumberFromPushMetadata(json, json.k2 ?? null),
+    fromNumber: normalizeSmsSender(rawSender, content),
+    toNumber: extractTargetNumberFromPushMetadata(json, rawSender),
     content,
     rawInfo: json.info,
     rawK3: json.k3,
@@ -87,6 +89,23 @@ function parsePlaintextSmsPush(payload: Buffer): ParsedSmsPush | null {
   };
 }
 
+
+function normalizeSmsSender(sender: string | null, content: string) {
+  const trimmed = sender?.trim() || null;
+  if (trimmed && !/^unverified$/i.test(trimmed)) {
+    return trimmed;
+  }
+  return extractProviderLabelFromContent(content) ?? trimmed;
+}
+
+function extractProviderLabelFromContent(content: string) {
+  const match = content.match(/^\s*\[([^\]]{2,40})\]/u);
+  const label = match?.[1]?.trim();
+  if (!label || /\d{4,}/.test(label)) {
+    return null;
+  }
+  return label;
+}
 function extractTargetNumberFromPushMetadata(json: { info?: string; k3?: string }, fromNumber: string | null) {
   const senderDigits = normalizePhoneDigits(fromNumber);
   const candidates = [json.info, json.k3]
@@ -98,18 +117,23 @@ function extractTargetNumberFromPushMetadata(json: { info?: string; k3?: string 
 }
 
 function samePhoneDigits(candidate: string, normalizedSender: string) {
-  const digits = normalizePhoneDigits(candidate);
-  if (!digits || !normalizedSender) {
-    return false;
-  }
-  if (digits === normalizedSender) {
-    return true;
-  }
-  return stripUsCountryCode(digits) === stripUsCountryCode(normalizedSender);
+  const digits = normalizeComparablePhoneDigits(candidate);
+  const senderDigits = normalizeComparablePhoneDigits(normalizedSender);
+  return Boolean(digits && senderDigits && digits === senderDigits);
 }
 
-function stripUsCountryCode(value: string) {
-  return value.length === 11 && value.startsWith("1") ? value.slice(1) : value;
+function normalizeComparablePhoneDigits(value: string | null | undefined) {
+  const digits = normalizePhoneDigits(value);
+  if (digits.length === 11 && digits.startsWith("1")) {
+    return digits.slice(1);
+  }
+  if (digits.length === 12 && digits.startsWith("447")) {
+    return digits.slice(2);
+  }
+  if (digits.length === 11 && digits.startsWith("07")) {
+    return digits.slice(1);
+  }
+  return digits;
 }
 
 function normalizePhoneDigits(value: string | null | undefined) {
@@ -213,9 +237,6 @@ function extractPlaintextContentBytes(payload: Buffer, afterJsonOffset: number) 
 }
 
 function readLengthPrefixedText(payload: Buffer, cursor: number) {
-  if (isLikelyTextLeadByte(payload[cursor])) {
-    return null;
-  }
   for (const width of [1, 2, 4]) {
     if (cursor + width >= payload.length) {
       continue;
@@ -225,7 +246,14 @@ function readLengthPrefixedText(payload: Buffer, cursor: number) {
     if (!length || cursor + width + length > payload.length) {
       continue;
     }
-    const candidate = payload.subarray(cursor + width, cursor + width + length);
+    if (width === 1 && isLikelyTextLeadByte(payload[cursor]) && !isLikelyLengthPrefixedContentStart(payload[cursor + width])) {
+      continue;
+    }
+    const end = cursor + width + length;
+    if (!looksLikeLengthPrefixedTextBoundary(payload, end)) {
+      continue;
+    }
+    const candidate = payload.subarray(cursor + width, end);
     const decoded = decodeSmsContent(candidate, candidate.toString("utf8"));
     if (scoreDecodedText(decoded) > 8 && /[A-Za-z0-9\u4e00-\u9fff]/.test(decoded)) {
       return candidate;
@@ -234,6 +262,23 @@ function readLengthPrefixedText(payload: Buffer, cursor: number) {
   return null;
 }
 
+function isLikelyLengthPrefixedContentStart(byte: number | undefined) {
+  return byte === 0x3f || byte === 0x3c || byte === 0x5b || byte === 0x28 || byte === 0x7b || (byte !== undefined && byte >= 0xe0);
+}
+function looksLikeLengthPrefixedTextBoundary(payload: Buffer, offset: number) {
+  if (offset >= payload.length) {
+    return true;
+  }
+  const next = payload[offset];
+  if (next === undefined) {
+    return true;
+  }
+  if (next === 0x00 || next <= 0x1f || next === 0x7f) {
+    return true;
+  }
+  const tail = payload.subarray(offset, Math.min(payload.length, offset + 80)).toString("latin1");
+  return /\b(?:dtId|who|devfilter|orgsrc|statusOff)\b/i.test(tail);
+}
 function isLikelyTextLeadByte(byte: number | undefined) {
   return byte !== undefined && (byte === 0x5b || byte === 0x28 || (byte >= 0x30 && byte <= 0x7a) || byte >= 0xe0);
 }

@@ -32,14 +32,19 @@ import {
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
 import {
+  CACHE_TTL_MS,
+  cacheKeys,
   captureSession,
   cancelPhoneNumber,
   deleteMessage,
   deletePhoneNumber,
   getAccount,
   getAccountMessages,
+  getAccountPointStore,
   getPhoneNumberCountries,
   getPhoneNumbers,
+  isCachedDataFresh,
+  readCachedData,
   pausePhoneNumber,
   previewPhoneNumbers,
   probeAccessCode,
@@ -66,6 +71,7 @@ import type {
   AccessCodeProbeDryRunResult,
   AccessCodeProbeResult,
   Message,
+  PagedData,
   PhoneCountryOption,
   PhoneNumber,
   PhoneActionResult,
@@ -73,6 +79,7 @@ import type {
   PhonePurchaseCandidate,
   PhonePurchasePreview,
   PhoneStatus,
+  PointStoreData,
   RefreshMessagesResult,
   ValidateSessionResult,
 } from '../types';
@@ -99,6 +106,8 @@ type AccessCodeProbeFormValues = {
   accessCode: string;
   dryRun: boolean;
 };
+
+const LOCAL_MESSAGE_POLL_MS = 30_000;
 
 const loginTypeLabelMap: Record<string, string> = {
   email_code: '邮箱验证码',
@@ -336,8 +345,6 @@ function parseSnapshotExtras(rawJson?: string | null): SnapshotExtras {
         ]),
       progressPointTotal:
         pickNumber(publicPoint ?? {}, ['progressPointTotal', 'progress_point_total']) ??
-        pickNumber(gameRedeemInfo ?? {}, ['validPoint']) ??
-        pickNumber(gameHomePage ?? {}, ['validPoint']) ??
         pickNumberFromRecords(records, [
           'progressPointTotal',
           'progress_point_total',
@@ -921,14 +928,15 @@ function formatOfflineTemplateDiagnostic(item: NonNullable<NonNullable<RefreshMe
   if (!item) {
     return '';
   }
-  const listen = item.listenStatus === 'preempted' ? ' / 监听：被抢占' : '';
+  const listen = item.listenStatus === 'preempted' ? ' / listener preempted' : '';
+  const count = item.sendCount ? ` x${item.sendCount}` : '';
   if (item.status === 'sent') {
-    return `离线补拉：已发送${listen}`;
+    return `offline catch-up sent${count}${listen}`;
   }
   if (item.status === 'attempted-not-sent') {
-    return `离线补拉：已尝试但未发送${item.error ? `（${item.error}）` : ''}${listen}`;
+    return `offline catch-up attempted but not sent${item.error ? ` (${item.error})` : ''}${listen}`;
   }
-  return `离线补拉：未尝试${listen}`;
+  return `offline catch-up not attempted${listen}`;
 }
 
 function formatProbeCall(call: AccessCodeProbeCall | null) {
@@ -1051,17 +1059,19 @@ export default function AccountDetail() {
   const [phoneLoading, setPhoneLoading] = useState(false);
   const [editNickname, setEditNickname] = useState(false);
   const [nickname, setNickname] = useState('');
+  const [pointStore, setPointStore] = useState<PointStoreData | null>(null);
+  const [pointStoreLoading, setPointStoreLoading] = useState(false);
 
   const snapshot = account?.snapshot;
   const snapshotExtras = useMemo(() => parseSnapshotExtras(snapshot?.raw_json), [snapshot?.raw_json]);
 
   const balanceValue = snapshotExtras.primaryBalance ?? snapshot?.primary_balance ?? null;
-  const validPointValue = snapshot?.valid_point ?? snapshotExtras.validPoint ?? null;
-  const progressPointValue = snapshotExtras.progressPoint ?? snapshot?.progress_point ?? null;
-  const progressPointTotalValue = snapshotExtras.progressPointTotal ?? null;
-  const expirePointValue = snapshotExtras.expirePoint;
-  const expireTimeValue = snapshotExtras.expireTime;
-  const userGradeValue = snapshotExtras.userGrade ?? snapshot?.user_grade ?? null;
+  const validPointValue = pointStore?.valid_point ?? snapshot?.valid_point ?? snapshotExtras.validPoint ?? null;
+  const userGradeValue = pointStore?.user_grade ?? snapshotExtras.userGrade ?? snapshot?.user_grade ?? null;
+  const progressPointValue = pointStore?.history_point ?? snapshotExtras.progressPoint ?? snapshot?.progress_point ?? null;
+  const progressPointTotalValue = snapshotExtras.progressPointTotal ?? (userGradeValue === 4 ? 5000 : null);
+  const expirePointValue = pointStore?.expire_point ?? snapshotExtras.expirePoint;
+  const expireTimeValue = pointStore?.expire_time ?? snapshotExtras.expireTime;
   const dingtoneIdValue = snapshotExtras.dtDingtoneId ?? snapshot?.dt_dingtone_id ?? null;
   const membershipLevelValue =
     snapshotExtras.membershipLevelLabel ||
@@ -1070,32 +1080,67 @@ export default function AccountDetail() {
     snapshot?.membership_type ||
     null;
   const boundPhoneValue = snapshot?.phone?.trim() ? snapshot.phone : null;
+  const pointStoreProductCount = pointStore?.products.length ?? snapshotExtras.membershipBenefits.length;
+  const pointStoreProductTags = pointStore?.products.map((item) => ({
+    key: item.product_id,
+    name: item.name,
+    price: item.price,
+    stock: item.stock,
+  })) ?? snapshotExtras.membershipBenefits.map((item) => ({
+    key: item.code || item.name,
+    name: item.name,
+    price: item.price,
+    stock: null as number | null,
+  }));
 
-  const fetchAccount = useCallback(async () => {
-    setLoading(true);
+  const fetchAccount = useCallback(async (options?: { force?: boolean }) => {
+    const cacheKey = cacheKeys.account(accountId);
+    const cached = !options?.force ? readCachedData<DtAccountDetail>(cacheKey) : null;
+    if (cached) {
+      setAccount(cached);
+      setNickname(cached.nickname);
+      setLoading(false);
+      if (isCachedDataFresh(cacheKey, CACHE_TTL_MS.accountDetail)) {
+        return;
+      }
+    } else {
+      setLoading(true);
+    }
+
     try {
-      const data = await getAccount(accountId);
+      const data = await getAccount(accountId, { force: options?.force });
       setAccount(data);
       setNickname(data.nickname);
     } catch (err) {
-      message.error(err instanceof Error ? err.message : '获取账户详情失败');
+      message.error(err instanceof Error ? err.message : '鑾峰彇璐︽埛璇︽儏澶辫触');
     } finally {
       setLoading(false);
     }
   }, [accountId, message]);
 
   const fetchMessages = useCallback(
-    async (page = 1, options?: { silent?: boolean; suppressError?: boolean }) => {
-      if (!options?.silent) {
+    async (page = 1, options?: { silent?: boolean; suppressError?: boolean; force?: boolean }) => {
+      const params = { page, pageSize: 10, exclude_system: true };
+      const cacheKey = cacheKeys.accountMessages(accountId, params);
+      const cached = !options?.force ? readCachedData<PagedData<Message>>(cacheKey) : null;
+
+      if (cached) {
+        setMessages(cached.list);
+        setMsgTotal(cached.total);
+        if (isCachedDataFresh(cacheKey, CACHE_TTL_MS.accountMessages)) {
+          return;
+        }
+      } else if (!options?.silent) {
         setMsgLoading(true);
       }
+
       try {
-        const data = await getAccountMessages(accountId, { page, pageSize: 10, exclude_system: true });
+        const data = await getAccountMessages(accountId, params, { force: options?.force });
         setMessages(data.list);
         setMsgTotal(data.total);
       } catch (err) {
         if (!options?.suppressError) {
-          message.error(err instanceof Error ? err.message : '获取消息失败');
+          message.error(err instanceof Error ? err.message : '鑾峰彇娑堟伅澶辫触');
         }
       } finally {
         if (!options?.silent) {
@@ -1106,14 +1151,46 @@ export default function AccountDetail() {
     [accountId, message],
   );
 
+  const fetchPointStore = useCallback(async (options?: { silent?: boolean }) => {
+    if (!options?.silent) {
+      setPointStoreLoading(true);
+    }
+    try {
+      const data = await getAccountPointStore(accountId);
+      setPointStore(data);
+      if (data.snapshot) {
+        setAccount((current) => (current ? { ...current, snapshot: data.snapshot } : current));
+      }
+    } catch (err) {
+      if (!options?.silent) {
+        message.error(err instanceof Error ? err.message : '刷新积分商城失败');
+      }
+    } finally {
+      if (!options?.silent) {
+        setPointStoreLoading(false);
+      }
+    }
+  }, [accountId, message]);
   const fetchTeamMessages = useCallback(
-    async (options?: { silent?: boolean }) => {
-      if (!options?.silent) setTeamMsgLoading(true);
+    async (options?: { silent?: boolean; force?: boolean }) => {
+      const params = { page: 1, pageSize: 100, msg_type: 'system' as const };
+      const cacheKey = cacheKeys.accountMessages(accountId, params);
+      const cached = !options?.force ? readCachedData<PagedData<Message>>(cacheKey) : null;
+
+      if (cached) {
+        setTeamMessages(cached.list);
+        if (isCachedDataFresh(cacheKey, CACHE_TTL_MS.accountMessages)) {
+          return;
+        }
+      } else if (!options?.silent) {
+        setTeamMsgLoading(true);
+      }
+
       try {
-        const data = await getAccountMessages(accountId, { page: 1, pageSize: 100, msg_type: 'system' });
+        const data = await getAccountMessages(accountId, params, { force: options?.force });
         setTeamMessages(data.list);
       } catch (err) {
-        if (!options?.silent) message.error(err instanceof Error ? err.message : '获取团队消息失败');
+        if (!options?.silent) message.error(err instanceof Error ? err.message : '鑾峰彇鍥㈤槦娑堟伅澶辫触');
       } finally {
         if (!options?.silent) setTeamMsgLoading(false);
       }
@@ -1128,7 +1205,7 @@ export default function AccountDetail() {
         return;
       }
       setMsgPage(1);
-      void Promise.all([fetchMessages(1, { silent: true }), fetchTeamMessages({ silent: true }), fetchAccount()]);
+      void Promise.all([fetchMessages(1, { silent: true, force: true }), fetchTeamMessages({ silent: true, force: true }), fetchAccount({ force: true })]);
     };
 
     window.addEventListener('dt:new-message', handleNewMessage);
@@ -1147,8 +1224,8 @@ export default function AccountDetail() {
       }
       inFlight = true;
       try {
-        await fetchMessages(msgPage, { silent: true, suppressError: true });
-        await fetchTeamMessages({ silent: true });
+        await fetchMessages(msgPage, { silent: true, suppressError: true, force: true });
+        await fetchTeamMessages({ silent: true, force: true });
       } finally {
         inFlight = false;
       }
@@ -1156,7 +1233,7 @@ export default function AccountDetail() {
 
     const timer = window.setInterval(() => {
       void pollLocalMessages();
-    }, 5000);
+    }, LOCAL_MESSAGE_POLL_MS);
 
     return () => {
       window.clearInterval(timer);
@@ -1169,7 +1246,12 @@ export default function AccountDetail() {
       const result = await refreshAccountMessages(accountId, 50, false);
       setLastRefreshDiagnostics(result.diagnostics ?? null);
       setMsgPage(1);
-      await Promise.all([fetchMessages(1), fetchTeamMessages(), fetchAccount()]);
+      await Promise.all([fetchMessages(1, { force: true }), fetchTeamMessages({ force: true }), fetchAccount({ force: true })]);
+      if (result.background) {
+        const diagnosticsSummary = buildRefreshDiagnosticsSummary(result.diagnostics);
+        message.info(diagnosticsSummary ? `Background SMS refresh started\n${diagnosticsSummary}` : 'Background SMS refresh started; messages will appear after import');
+        return;
+      }
       if (result.imported > 0) {
         message.success(`已导入 ${result.imported} 条新消息`);
         return;
@@ -1181,7 +1263,7 @@ export default function AccountDetail() {
     } finally {
       setSyncingLatestMessages(false);
     }
-  }, [accountId, fetchAccount, fetchMessages, message]);
+  }, [accountId, fetchAccount, fetchMessages, fetchTeamMessages, message]);
 
   const syncAppMessages = useCallback(async () => {
     setSyncingAppMessages(true);
@@ -1198,44 +1280,60 @@ export default function AccountDetail() {
         },
       ]);
       setMsgPage(1);
-      await Promise.all([fetchMessages(1), fetchTeamMessages(), fetchAccount()]);
+      await Promise.all([fetchMessages(1, { force: true }), fetchTeamMessages({ force: true }), fetchAccount({ force: true })]);
       message.success(result.imported > 0 ? `已从 app 同步 ${result.imported} 条消息` : 'app 消息同步完成，暂无新增');
     } catch (err) {
       message.error(err instanceof Error ? err.message : 'app 消息同步失败');
     } finally {
       setSyncingAppMessages(false);
     }
-  }, [accountId, fetchAccount, fetchMessages, message]);
+  }, [accountId, fetchAccount, fetchMessages, fetchTeamMessages, message]);
 
   const refreshLocalMessages = useCallback(async () => {
     setRefreshingLocalMessages(true);
     try {
-      await Promise.all([fetchMessages(msgPage), fetchTeamMessages()]);
+      await Promise.all([fetchMessages(msgPage, { force: true }), fetchTeamMessages({ force: true })]);
     } finally {
       setRefreshingLocalMessages(false);
     }
   }, [fetchMessages, fetchTeamMessages, msgPage]);
 
-  const fetchPhones = useCallback(async () => {
-    setPhoneLoading(true);
+  const fetchPhones = useCallback(async (options?: { force?: boolean }) => {
+    const cacheKey = cacheKeys.phoneNumbers(accountId);
+    const cached = !options?.force ? readCachedData<PhoneNumber[]>(cacheKey) : null;
+    if (cached) {
+      setPhones(cached);
+      setPhoneLoading(false);
+      if (isCachedDataFresh(cacheKey, CACHE_TTL_MS.phoneNumbers)) {
+        return;
+      }
+    } else {
+      setPhoneLoading(true);
+    }
+
     try {
-      const data = await getPhoneNumbers(accountId);
+      const data = await getPhoneNumbers(accountId, { force: options?.force });
       setPhones(data);
     } catch (err) {
-      message.error(err instanceof Error ? err.message : '获取手机号失败');
+      message.error(err instanceof Error ? err.message : 'Failed to load phone numbers');
     } finally {
       setPhoneLoading(false);
     }
   }, [accountId, message]);
 
   const fetchPhoneCountries = useCallback(async () => {
+    if (phoneCountries.length > 0) {
+      return phoneCountries;
+    }
     try {
       const data = await getPhoneNumberCountries(accountId);
       setPhoneCountries(data);
+      return data;
     } catch {
       setPhoneCountries([]);
+      return [];
     }
-  }, [accountId]);
+  }, [accountId, phoneCountries]);
 
   const syncOwnedPhones = useCallback(async () => {
     setPhoneLoading(true);
@@ -1256,15 +1354,17 @@ export default function AccountDetail() {
       return;
     }
     fetchAccount();
-    fetchPhones();
-    fetchPhoneCountries();
-  }, [accountId, fetchAccount, fetchPhones, fetchPhoneCountries]);
+    const pointStoreTimer = window.setTimeout(() => {
+      void fetchPointStore({ silent: true });
+    }, 800);
+    return () => window.clearTimeout(pointStoreTimer);
+  }, [accountId, fetchAccount, fetchPointStore]);
 
   const handleTabChange = (key: string) => {
     setActiveTab(key);
     if (key === 'messages') {
-      fetchMessages(msgPage);
-      fetchTeamMessages();
+      fetchMessages(msgPage, { force: true });
+      fetchTeamMessages({ force: true });
     }
     if (key === 'phone-numbers') {
       fetchPhones();
@@ -1289,7 +1389,7 @@ export default function AccountDetail() {
     try {
       await refreshAccount(accountId);
       setMsgPage(1);
-      await Promise.all([fetchAccount(), fetchPhones(), fetchMessages(1)]);
+      await Promise.all([fetchAccount(), fetchPhones(), fetchMessages(1), fetchPointStore({ silent: true })]);
       message.success('资料和本地消息已刷新');
     } catch (err) {
       message.error(err instanceof Error ? err.message : '刷新失败');
@@ -1325,12 +1425,13 @@ export default function AccountDetail() {
     });
   };
 
-  const handleImportDirectSession = () => {
+  const handleImportDirectSession = async () => {
+    const countries = await fetchPhoneCountries();
     let dtUserId = account?.dt_user_id ?? '';
     let token = '';
     let deviceId = account?.dt_device_id ?? '';
     let deviceCandidatesText = '';
-    let phonePreviewCountryCode: number | undefined = phoneCountries[0]?.country_code;
+    let phonePreviewCountryCode: number | undefined = countries[0]?.country_code;
 
     modal.confirm({
       title: '导入直连会话',
@@ -1357,12 +1458,12 @@ export default function AccountDetail() {
           <Select
             allowClear
             defaultValue={phonePreviewCountryCode}
-            disabled={phoneCountries.length === 0}
-            options={phoneCountries.map((item) => ({
+            disabled={countries.length === 0}
+            options={countries.map((item) => ({
               label: item.label,
               value: item.country_code,
             }))}
-            placeholder={phoneCountries.length === 0 ? '国家列表尚未加载，跳过候选号预览' : '可选：顺手验证一个国家的候选号预览'}
+            placeholder={countries.length === 0 ? '国家列表尚未加载，跳过候选号预览' : '可选：顺手验证一个国家的候选号预览'}
             onChange={(value) => { phonePreviewCountryCode = value ? Number(value) : undefined; }}
           />
         </Space>
@@ -1583,8 +1684,9 @@ export default function AccountDetail() {
     }
   };
 
-  const handleRequestNumber = () => {
-    let selectedCountry = phoneCountries[0];
+  const handleRequestNumber = async () => {
+    const countries = await fetchPhoneCountries();
+    let selectedCountry = countries[0];
     let selectedAreaCode: number | undefined;
 
     if (!selectedCountry) {
@@ -1608,12 +1710,12 @@ export default function AccountDetail() {
             showSearch
             optionFilterProp="label"
             style={{ width: '100%' }}
-            options={phoneCountries.map((item) => ({
+            options={countries.map((item) => ({
               label: item.label,
               value: item.country_key,
             }))}
             onChange={(value) => {
-              selectedCountry = phoneCountries.find((item) => item.country_key === value) ?? selectedCountry;
+              selectedCountry = countries.find((item) => item.country_key === value) ?? selectedCountry;
             }}
           />
           <InputNumber
@@ -2065,13 +2167,13 @@ export default function AccountDetail() {
                   </Col>
                   <Col xs={12} sm={6}>
                     <Card size="small" loading={loading}>
-                      <Statistic title="有效积分" value={formatNumber(validPointValue, 2)} />
+                      <Statistic title="可兑换积分" value={formatNumber(validPointValue, 2)} />
                     </Card>
                   </Col>
                   <Col xs={12} sm={6}>
                     <Card size="small" loading={loading}>
                       <Statistic
-                        title="可用/总积分"
+                        title="升级进度"
                         value={
                           progressPointValue !== null
                             ? `${formatNumber(progressPointValue, 1)} / ${formatNumber(progressPointTotalValue, 1, '-')}`
@@ -2119,26 +2221,27 @@ export default function AccountDetail() {
                   </Space>
                 </Card>
 
-                <Card size="small" title="会员与积分商城" style={{ marginTop: 16 }}>
+                <Card size="small" title="积分商城" loading={pointStoreLoading} extra={<Button size="small" icon={<ReloadOutlined />} onClick={() => fetchPointStore()} loading={pointStoreLoading}>刷新</Button>} style={{ marginTop: 16 }}>
                   <Descriptions bordered column={2} size="small">
                     <Descriptions.Item label="当前等级">{membershipLevelValue || '-'}</Descriptions.Item>
                     <Descriptions.Item label="会员到期">
                       {snapshot?.membership_expire_at ? dayjs(snapshot.membership_expire_at).format('YYYY-MM-DD HH:mm') : '-'}
                     </Descriptions.Item>
                     <Descriptions.Item label="积分权益">{snapshotExtras.walletPrivilege || '暂未解析'}</Descriptions.Item>
-                    <Descriptions.Item label="商城项目数">{snapshotExtras.membershipBenefits.length || 0}</Descriptions.Item>
+                    <Descriptions.Item label="商城项目数">{pointStoreProductCount || 0}</Descriptions.Item>
                     <Descriptions.Item label="年底过期积分">
                       {expirePointValue !== null
                         ? `${formatNumber(expirePointValue, 0, '0')} 积分${expireTimeValue ? ` / ${expireTimeValue}` : ''}`
                         : '未同步'}
                     </Descriptions.Item>
                   </Descriptions>
-                  {snapshotExtras.membershipBenefits.length > 0 ? (
+                  {pointStoreProductTags.length > 0 ? (
                     <Space wrap style={{ marginTop: 12 }}>
-                      {snapshotExtras.membershipBenefits.map((item) => (
-                        <Tag key={`${item.code}-${item.name}`} color="blue">
+                      {pointStoreProductTags.map((item) => (
+                        <Tag key={`${item.key}-${item.name}`} color="blue">
                           {item.name}
                           {item.price !== null ? ` / ${formatPointPriceZh(item.price)}` : ''}
+                          {item.stock !== null ? ` / 库存 ${item.stock}` : ''}
                         </Tag>
                       ))}
                     </Space>
@@ -2210,7 +2313,7 @@ export default function AccountDetail() {
                     pageSize: 10,
                     onChange: (page) => {
                       setMsgPage(page);
-                      fetchMessages(page);
+                      fetchMessages(page, { force: true });
                     },
                   }}
                   scroll={{ x: 860 }}

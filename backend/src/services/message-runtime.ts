@@ -66,10 +66,12 @@ export async function storeHelperSmsMessages(accountId: number, rows: HelperSmsM
 async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, options: MessageRuntimeOptions) {
   const db = options.db ?? prisma;
   const content = repairUtf8Mojibake(push.content.trim()) ?? push.content.trim();
+  const fromNumber = repairUtf8Mojibake(push.fromNumber?.trim() ?? null);
   let normalizedPush = {
     ...push,
     content,
-    toNumber: normalizeDirectTargetNumber(push.toNumber ?? null, push.fromNumber ?? null)
+    fromNumber,
+    toNumber: normalizeDirectTargetNumber(push.toNumber ?? null, fromNumber)
   };
   const account = await db.dtAccount.findUnique({
     where: { id: accountId }
@@ -82,6 +84,12 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
     ...normalizedPush,
     toNumber: normalizedPush.toNumber ?? (await inferDirectTargetNumberFromAccountPhones(accountId, normalizedPush, db))
   };
+  const directOwner = await resolveTargetPhoneOwner(account, normalizedPush.toNumber, normalizedPush.fromNumber, db);
+  const targetAccount = directOwner?.account ?? account;
+  normalizedPush = {
+    ...normalizedPush,
+    toNumber: directOwner?.phoneNumber ?? normalizedPush.toNumber
+  };
 
   const msgType = inferMessageType(normalizedPush);
   const systemMessage = msgType === MessageType.system;
@@ -89,14 +97,14 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
     return false;
   }
 
-  const duplicate = await findDuplicateMessage(accountId, normalizedPush, db);
+  const duplicate = await findDuplicateMessage(targetAccount.id, normalizedPush, db);
   if (duplicate) {
     return false;
   }
 
   const message = await db.message.create({
     data: {
-      accountId,
+      accountId: targetAccount.id,
       direction: MessageDirection.incoming,
       msgType,
       fromNumber: normalizedPush.fromNumber,
@@ -110,16 +118,13 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
     }
   });
 
-  if (!systemMessage) {
-    await maybeSendTelegram(account, normalizedPush, message.id, message.receivedAt, db, options.sendTelegram ?? true);
-  }
   if ((options.emitEvents ?? true) && !systemMessage) {
     eventBus.emitEvent({
       type: "new_message",
       payload: {
         id: message.id,
-        accountId,
-        accountNickname: deriveFallbackName(account),
+        accountId: targetAccount.id,
+        accountNickname: deriveFallbackName(targetAccount),
         from: normalizedPush.fromNumber,
         content,
         msgType,
@@ -127,8 +132,11 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
       }
     });
   }
+  if (!systemMessage) {
+    void maybeSendTelegram(targetAccount, normalizedPush, message.id, message.receivedAt, db, options.sendTelegram ?? true);
+  }
   logger.info("Stored incoming direct SMS push", {
-    accountId,
+    accountId: targetAccount.id,
     messageId: message.id,
     fromNumber: normalizedPush.fromNumber,
     toNumber: normalizedPush.toNumber
@@ -186,19 +194,24 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
     return false;
   }
 
-  const duplicate = await findDuplicateHelperSmsMessage(accountId, normalizedRow, db);
+
+  const receivedAt = normalizeHelperReceivedAt(normalizedRow);
+  const sender = normalizedRow.senderId ?? normalizedRow.data1 ?? null;
+  let toNumber =
+    extractTargetNumber(normalizedRow.conversationId, sender) ??
+    (await inferTargetNumberFromAccountPhones(accountId, normalizedRow, sender, db));
+  const helperOwner = await resolveTargetPhoneOwner(account, toNumber, sender, db);
+  const targetAccount = helperOwner?.account ?? account;
+  toNumber = helperOwner?.phoneNumber ?? toNumber;
+
+  const duplicate = await findDuplicateHelperSmsMessage(targetAccount.id, normalizedRow, db, toNumber);
   if (duplicate) {
     return false;
   }
 
-  const receivedAt = normalizeHelperReceivedAt(normalizedRow);
-  const sender = normalizedRow.senderId ?? normalizedRow.data1 ?? null;
-  const toNumber =
-    extractTargetNumber(normalizedRow.conversationId, sender) ??
-    (await inferTargetNumberFromAccountPhones(accountId, normalizedRow, sender, db));
   const message = await db.message.create({
     data: {
-      accountId,
+      accountId: targetAccount.id,
       direction: MessageDirection.incoming,
       msgType,
       fromNumber: sender,
@@ -214,7 +227,7 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
 
   if (!systemMessage) {
     await maybeSendTelegram(
-      account,
+      targetAccount,
       {
         msgType: normalizedRow.type ?? 0,
         fromNumber: sender,
@@ -235,8 +248,8 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
       type: "new_message",
       payload: {
         id: message.id,
-        accountId,
-        accountNickname: deriveFallbackName(account),
+        accountId: targetAccount.id,
+        accountNickname: deriveFallbackName(targetAccount),
         from: sender,
         content,
         msgType,
@@ -245,16 +258,16 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
     });
   }
   logger.info("Stored helper SMS message from app database", {
-    accountId,
+    accountId: targetAccount.id,
     messageId: message.id,
     fromNumber: sender
   });
   return true;
 }
 
-async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMessageRecord, db: MessageRuntimeDb) {
+async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMessageRecord, db: MessageRuntimeDb, targetOverride?: string | null) {
   const sender = row.senderId ?? row.data1 ?? null;
-  const target = extractTargetNumber(row.conversationId, sender) ?? (await inferTargetNumberFromAccountPhones(accountId, row, sender, db));
+  const target = targetOverride ?? extractTargetNumber(row.conversationId, sender) ?? (await inferTargetNumberFromAccountPhones(accountId, row, sender, db));
   const content = row.content?.trim() ?? "";
   if (row.msgId) {
     const byMsgId = await db.message.findFirst({
@@ -437,6 +450,46 @@ async function inferDirectTargetNumberFromAccountPhones(accountId: number, push:
   return candidates.length === 1 ? candidates[0]!.phoneNumber : null;
 }
 
+async function resolveTargetPhoneOwner(
+  currentAccount: { id: number; adminId?: number | null; appVariant?: unknown; dtUserId?: string | null },
+  targetNumber: string | null | undefined,
+  sender: string | null | undefined,
+  db: MessageRuntimeDb
+) {
+  if (!targetNumber?.trim() || samePhoneDigits(targetNumber, sender)) {
+    return null;
+  }
+  if (currentAccount.adminId === undefined || currentAccount.adminId === null) {
+    return null;
+  }
+
+  const rows = await db.phoneNumber.findMany({
+    where: {
+      account: {
+        adminId: currentAccount.adminId,
+        appVariant: currentAccount.appVariant as never
+      }
+    },
+    select: {
+      accountId: true,
+      phoneNumber: true
+    }
+  });
+  const matches = rows.filter((row) => samePhoneDigits(row.phoneNumber, targetNumber));
+  const accountIds = Array.from(new Set(matches.map((row) => row.accountId)));
+  if (accountIds.length !== 1) {
+    return null;
+  }
+
+  const account = await db.dtAccount.findUnique({ where: { id: accountIds[0]! } });
+  if (!account) {
+    return null;
+  }
+  return {
+    account,
+    phoneNumber: matches[0]?.phoneNumber ?? targetNumber
+  };
+}
 function normalizeDirectTargetNumber(toNumber: string | null | undefined, sender: string | null | undefined) {
   if (!toNumber?.trim()) {
     return null;
@@ -515,6 +568,12 @@ function samePhoneDigits(a: string | null | undefined, b: string | null | undefi
 function normalizeComparablePhoneDigits(value: string | null | undefined) {
   const digits = normalizeDigits(value);
   if (digits.length === 11 && digits.startsWith("1")) {
+    return digits.slice(1);
+  }
+  if (digits.length === 12 && digits.startsWith("447")) {
+    return digits.slice(2);
+  }
+  if (digits.length === 11 && digits.startsWith("07")) {
     return digits.slice(1);
   }
   return digits;
