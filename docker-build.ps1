@@ -16,6 +16,10 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
   throw "Missing command: docker"
 }
 
+if (-not $env:APP_COMMIT_SHA -and (Get-Command git -ErrorAction SilentlyContinue)) {
+  $env:APP_COMMIT_SHA = (& git -C $root rev-parse HEAD).Trim()
+}
+
 $args = @("compose", "-f", $composeFile, "build")
 if ($NoCache) {
   $args += "--no-cache"

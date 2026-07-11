@@ -1,25 +1,47 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { App, Button, Card, Checkbox, Input, Popconfirm, Space, Switch, Table, Tag, Tooltip, Typography } from 'antd';
-import { CheckOutlined, CopyOutlined, DownloadOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, UploadOutlined } from '@ant-design/icons';
+import { App, Button, Card, Checkbox, Dropdown, Grid, Input, Pagination, Popconfirm, Space, Switch, Table, Tag, Tooltip, Typography, theme as antdTheme } from 'antd';
+import {
+  ArrowDownOutlined,
+  ArrowUpOutlined,
+  CheckOutlined,
+  CopyOutlined,
+  DeleteOutlined,
+  DownloadOutlined,
+  EyeInvisibleOutlined,
+  EyeOutlined,
+  NotificationOutlined,
+  InfoCircleOutlined,
+  MoreOutlined,
+  PauseCircleOutlined,
+  PlayCircleOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+  UploadOutlined,
+  VerticalAlignBottomOutlined,
+  VerticalAlignTopOutlined,
+} from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
 import { useNavigate } from 'react-router-dom';
 import {
   CACHE_TTL_MS,
   cacheKeys,
+  bulkAccountAction,
   deleteAccount,
   exportFullBackup,
   exportSessions,
   getAccounts,
   isCachedDataFresh,
   readCachedData,
+  reorderAccount,
   importFullBackup,
   importSessions,
   startMonitor,
   stopMonitor,
   updateAccount,
 } from '../services/endpoints';
-import type { DtAccountListItem, PagedData } from '../types';
+import type { BulkAccountAction, DtAccountListItem, PagedData } from '../types';
+import { notifyMessageReadStateChanged } from '../services/ui-events';
 
 const statusMap: Record<string, { color: string; label: string }> = {
   pending: { color: 'processing', label: '待验证' },
@@ -44,7 +66,7 @@ type CopyableCellProps = {
 function CopyableCell({ value, copied, onCopy, fallback = '-', maxWidth = 220 }: CopyableCellProps) {
   const text = value?.trim();
   if (!text) {
-    return <span style={{ color: '#999' }}>{fallback}</span>;
+    return <Typography.Text type="secondary">{fallback}</Typography.Text>;
   }
   return (
     <Tooltip title="Click to copy">
@@ -64,7 +86,7 @@ function CopyableCell({ value, copied, onCopy, fallback = '-', maxWidth = 220 }:
             <CheckOutlined /> copied
           </Typography.Text>
         ) : (
-          <CopyOutlined style={{ color: '#999', fontSize: 12 }} />
+          <CopyOutlined style={{ fontSize: 12 }} />
         )}
       </Space>
     </Tooltip>
@@ -93,11 +115,16 @@ export default function AccountList() {
   const [page, setPage] = useState(1);
   const [keyword, setKeyword] = useState('');
   const [actionLoading, setActionLoading] = useState<number | null>(null);
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [selectedAccountIds, setSelectedAccountIds] = useState<number[]>([]);
   const [validateImportedSessions, setValidateImportedSessions] = useState(false);
   const [copiedCell, setCopiedCell] = useState<string | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const navigate = useNavigate();
   const { message, modal } = App.useApp();
+  const { token } = antdTheme.useToken();
+  const screens = Grid.useBreakpoint();
+  const compactAccountRows = screens.xxl === false;
 
   const fetch = useCallback(
     async (currentPage = page, currentKeyword = keyword, options?: { force?: boolean }) => {
@@ -145,13 +172,55 @@ export default function AccountList() {
         document.body.appendChild(textarea);
         textarea.focus();
         textarea.select();
-        document.execCommand('copy');
+        if (!document.execCommand('copy')) {
+          throw new Error('Copy failed');
+        }
         document.body.removeChild(textarea);
       }
       setCopiedCell(key);
+      message.success('copied');
       window.setTimeout(() => setCopiedCell((current) => (current === key ? null : current)), 1400);
     } catch (err) {
       message.error(err instanceof Error ? err.message : 'Copy failed');
+    }
+  };
+
+  const handleBulkAction = async (action: BulkAccountAction, successLabel: string) => {
+    if (selectedAccountIds.length === 0) {
+      return;
+    }
+    setBulkLoading(true);
+    try {
+      const result = await bulkAccountAction(selectedAccountIds, action);
+      if (result.failed > 0) {
+        const details = result.results.filter((item) => !item.ok).map((item) => `#${item.account_id}: ${item.error || '失败'}`).join('; ');
+        message.warning(`${successLabel}：成功 ${result.succeeded}，失败 ${result.failed}${details ? `。${details}` : ''}`);
+      } else {
+        message.success(`${successLabel}：已处理 ${result.succeeded} 个账户`);
+      }
+      if (action === 'mark_read' || action === 'mark_unread') {
+        notifyMessageReadStateChanged();
+      }
+      await fetch(page, keyword, { force: true });
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '批量操作失败');
+    } finally {
+      setBulkLoading(false);
+    }
+  };
+
+  const handleReorder = async (accountId: number, action: 'move_up' | 'move_down' | 'move_top' | 'move_bottom') => {
+    if (actionLoading !== null) {
+      return;
+    }
+    setActionLoading(accountId);
+    try {
+      await reorderAccount(accountId, action);
+      await fetch(page, keyword, { force: true });
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '账户排序失败');
+    } finally {
+      setActionLoading(null);
     }
   };
   const handleToggleMonitor = async (id: number, enabled: boolean) => {
@@ -175,6 +244,7 @@ export default function AccountList() {
   const handleDelete = async (id: number) => {
     try {
       await deleteAccount(id);
+      setSelectedAccountIds((items) => items.filter((item) => item !== id));
       message.success('账户已删除');
     } catch (err) {
       message.error(err instanceof Error ? err.message : '删除失败');
@@ -293,6 +363,8 @@ export default function AccountList() {
     {
       title: '备注',
       dataIndex: 'nickname',
+      width: 116,
+      ellipsis: true,
       render: (text, record) => (
         <Typography.Text
           editable={{
@@ -306,7 +378,7 @@ export default function AccountList() {
             value={text || 'Unnamed account'}
             copied={copiedCell === `nickname:${record.id}`}
             onCopy={(value) => void copyCellValue(`nickname:${record.id}`, value)}
-            maxWidth={180}
+            maxWidth={98}
           />
         </Typography.Text>
       ),
@@ -314,61 +386,55 @@ export default function AccountList() {
     {
       title: '类型',
       dataIndex: 'app_variant',
-      width: 90,
+      width: 80,
       render: (value) => <Tag color={value === 'dingdong' ? 'blue' : 'gold'}>{value === 'dingdong' ? '叮咚' : '说道'}</Tag>,
     },
     {
       title: '邮箱',
       dataIndex: 'email',
+      width: 196,
       ellipsis: true,
       render: (value, record) => (
         <CopyableCell
           value={value}
           copied={copiedCell === `email:${record.id}`}
           onCopy={(copyValue) => void copyCellValue(`email:${record.id}`, copyValue)}
-          maxWidth={220}
+          maxWidth={180}
         />
       ),
     },
     {
-      title: '手机号',
-      dataIndex: 'phone',
-      width: 140,
-      render: (value) => (value ? <Tag color="green">{value}</Tag> : <Tag color="default">未绑定</Tag>),
-    },
-    {
       title: '用户 ID',
       dataIndex: 'dt_user_id',
-      width: 170,
+      width: 120,
       render: (value, record) => (
         <CopyableCell
           value={value}
           copied={copiedCell === `user:${record.id}`}
           onCopy={(copyValue) => void copyCellValue(`user:${record.id}`, copyValue)}
-          maxWidth={150}
+          maxWidth={128}
         />
       ),
     },
     {
       title: '状态',
       dataIndex: 'status',
-      width: 90,
+      width: 82,
       render: (value: string, record) => {
         const item = statusMap[value] || { color: 'default', label: value };
-        const tag = <Tag color={item.color}>{item.label}</Tag>;
-        return record.last_error ? <Tooltip title={record.last_error}>{tag}</Tooltip> : tag;
+        const tags = (
+          <Space direction="vertical" size={2}>
+            <Tag color={item.color} style={{ marginInlineEnd: 0 }}>{item.label}</Tag>
+            <Typography.Text type="secondary" style={{ fontSize: 11 }}>{record.monitor_enabled ? '监听中' : '未监听'}</Typography.Text>
+          </Space>
+        );
+        return record.last_error ? <Tooltip title={record.last_error}>{tags}</Tooltip> : tags;
       },
     },
     {
-      title: '监听',
-      dataIndex: 'monitor_enabled',
-      width: 80,
-      render: (value) => (value ? <Tag color="green">开启</Tag> : <Tag>停止</Tag>),
-    },
-    {
-      title: 'Telegram',
+      title: '电报',
       dataIndex: 'telegram_notify',
-      width: 100,
+      width: 58,
       render: (value, record) => (
         <Switch size="small" checked={value} loading={actionLoading === record.id} onChange={(checked) => void handleTelegramToggle(record, checked)} />
       ),
@@ -376,63 +442,121 @@ export default function AccountList() {
     {
       title: '未读',
       dataIndex: 'unread_count',
-      width: 70,
-      render: (value) => (value > 0 ? <Tag color="red">{value}</Tag> : <span style={{ color: '#999' }}>0</span>),
+      width: 48,
+      render: (value) => (value > 0 ? <Tag color="red" style={{ marginInlineEnd: 0 }}>{value}</Tag> : <Typography.Text type="secondary">0</Typography.Text>),
     },
-    { title: '活跃号码', dataIndex: 'active_phone_count', width: 90 },
+    {
+      title: '排序',
+      width: 48,
+      render: (_, record) => (
+        <Dropdown
+          trigger={['click']}
+          menu={{
+            items: [
+              { key: 'move_top', icon: <VerticalAlignTopOutlined />, label: '置顶' },
+              { key: 'move_up', icon: <ArrowUpOutlined />, label: '上移' },
+              { key: 'move_down', icon: <ArrowDownOutlined />, label: '下移' },
+              { key: 'move_bottom', icon: <VerticalAlignBottomOutlined />, label: '置底' },
+            ],
+            onClick: ({ key, domEvent }) => {
+              domEvent.stopPropagation();
+              void handleReorder(record.id, key as 'move_up' | 'move_down' | 'move_top' | 'move_bottom');
+            },
+          }}
+        >
+          <Tooltip title="调整排序">
+            <Button type="text" size="small" icon={<MoreOutlined />} disabled={actionLoading !== null} loading={actionLoading === record.id} onClick={(event) => event.stopPropagation()} />
+          </Tooltip>
+        </Dropdown>
+      ),
+    },
     {
       title: '最近登录',
       dataIndex: 'last_login_at',
-      width: 140,
+      width: 78,
       render: (value) => (value ? dayjs(value).format('MM-DD HH:mm') : '-'),
     },
     {
       title: '操作',
-      width: 220,
+      width: 92,
       render: (_, record) => (
-        <Space size="small">
-          <Button
-            size="small"
-            type={record.monitor_enabled ? 'default' : 'primary'}
-            icon={record.monitor_enabled ? <PauseCircleOutlined /> : <PlayCircleOutlined />}
-            loading={actionLoading === record.id}
-            disabled={record.status === 'pending'}
-            onClick={() => void handleToggleMonitor(record.id, record.monitor_enabled)}
-          >
-            {record.monitor_enabled ? '停止' : '启动'}
-          </Button>
-          <Button size="small" onClick={() => navigate(`/accounts/${record.id}`)}>
-            详情
-          </Button>
+        <Space size={2}>
+          <Tooltip title={record.monitor_enabled ? '停止监听' : '启动监听'}>
+            <Button
+              size="small"
+              type="text"
+              icon={record.monitor_enabled ? <PauseCircleOutlined /> : <PlayCircleOutlined />}
+              loading={actionLoading === record.id}
+              disabled={record.status === 'pending'}
+              onClick={() => void handleToggleMonitor(record.id, record.monitor_enabled)}
+            />
+          </Tooltip>
+          <Tooltip title="账户详情">
+            <Button type="text" size="small" icon={<InfoCircleOutlined />} onClick={() => navigate(`/accounts/${record.id}`)} />
+          </Tooltip>
           <Popconfirm
             title="确认删除此账户？相关消息和号码都会一起删除。"
             onConfirm={() => void handleDelete(record.id)}
             okText="确认删除"
             cancelText="取消"
           >
-            <Button size="small" danger>
-              删除
-            </Button>
+            <Tooltip title="删除账户">
+              <Button type="text" size="small" danger icon={<DeleteOutlined />} />
+            </Tooltip>
           </Popconfirm>
         </Space>
       ),
     },
   ];
 
+  const pagination = {
+    current: page,
+    total,
+    pageSize: 20,
+    showTotal: (value: number) => `共 ${value} 个账户`,
+    onChange: (currentPage: number) => {
+      setPage(currentPage);
+      void fetch(currentPage, keyword);
+    },
+  };
+
+  const selectionToolbar = selectedAccountIds.length > 0 ? (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        flexWrap: 'wrap',
+        padding: '0 0 12px',
+        marginBottom: 12,
+        borderBottom: `1px solid ${token.colorBorderSecondary}`,
+      }}
+    >
+      <Typography.Text strong>已选择 {selectedAccountIds.length} 个账户</Typography.Text>
+      <Button icon={<PlayCircleOutlined />} loading={bulkLoading} onClick={() => void handleBulkAction('start_monitor', '启动监听')}>监听</Button>
+      <Button icon={<PauseCircleOutlined />} loading={bulkLoading} onClick={() => void handleBulkAction('stop_monitor', '停止监听')}>停止监听</Button>
+      <Button icon={<NotificationOutlined />} loading={bulkLoading} onClick={() => void handleBulkAction('telegram_on', '开启 Telegram 通知')}>开启通知</Button>
+      <Button icon={<NotificationOutlined />} loading={bulkLoading} onClick={() => void handleBulkAction('telegram_off', '关闭 Telegram 通知')}>关闭通知</Button>
+      <Button icon={<EyeOutlined />} loading={bulkLoading} onClick={() => void handleBulkAction('mark_read', '标记已读')}>已读</Button>
+      <Button icon={<EyeInvisibleOutlined />} loading={bulkLoading} onClick={() => void handleBulkAction('mark_unread', '标记未读')}>未读</Button>
+      <Button type="link" onClick={() => setSelectedAccountIds([])}>取消选择</Button>
+    </div>
+  ) : null;
+
   return (
     <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, gap: 12 }}>
-        <h2 style={{ margin: 0 }}>账户列表</h2>
-        <Space wrap>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', marginBottom: 16, gap: 12 }}>
+        <h2 style={{ margin: 0, whiteSpace: 'nowrap', flexShrink: 0 }}>账户列表</h2>
+        <Space wrap style={{ maxWidth: '100%' }}>
           <Input.Search
-            placeholder="搜索备注 / 邮箱 / 手机号"
+            placeholder="搜索备注 / 邮箱"
             allowClear
             onSearch={(value) => {
               setKeyword(value);
               setPage(1);
               void fetch(1, value);
             }}
-            style={{ width: 260 }}
+            style={{ width: 260, maxWidth: '100%' }}
           />
           <Button icon={<ReloadOutlined />} onClick={() => void fetch(page, keyword, { force: true })}>
             刷新
@@ -461,25 +585,82 @@ export default function AccountList() {
           </Button>
         </Space>
       </div>
-      <Card>
-        <Table
-          columns={columns}
-          dataSource={accounts}
-          rowKey="id"
-          loading={loading}
-          scroll={{ x: 1100 }}
-          pagination={{
-            current: page,
-            total,
-            pageSize: 20,
-            showTotal: (value) => `共 ${value} 个账户`,
-            onChange: (currentPage) => {
-              setPage(currentPage);
-              void fetch(currentPage, keyword);
-            },
-          }}
-        />
-      </Card>
+      {selectionToolbar}
+      {compactAccountRows ? (
+        <div>
+          <div style={{ borderTop: `1px solid ${token.colorBorderSecondary}`, borderBottom: `1px solid ${token.colorBorderSecondary}` }}>
+            {accounts.map((record) => {
+              const status = statusMap[record.status] || { color: 'default', label: record.status };
+              const selected = selectedAccountIds.includes(record.id);
+              return (
+                <div key={record.id} style={{ padding: '12px 0', borderBottom: `1px solid ${token.colorBorderSecondary}` }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                    <Checkbox
+                      checked={selected}
+                      onChange={(event) => setSelectedAccountIds((items) => event.target.checked ? [...new Set([...items, record.id])] : items.filter((id) => id !== record.id))}
+                    />
+                    <Typography.Text strong ellipsis style={{ flex: 1, minWidth: 0 }}>{record.nickname || 'Unnamed account'}</Typography.Text>
+                    <Tag color={record.app_variant === 'dingdong' ? 'blue' : 'gold'} style={{ marginInlineEnd: 0 }}>{record.app_variant === 'dingdong' ? '叮咚' : '说道'}</Tag>
+                    <Tag color={status.color} style={{ marginInlineEnd: 0 }}>{status.label}</Tag>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: '8px 16px', margin: '10px 0', alignItems: 'center' }}>
+                    <CopyableCell value={record.email} copied={copiedCell === `email:${record.id}`} onCopy={(value) => void copyCellValue(`email:${record.id}`, value)} maxWidth={360} />
+                    <Typography.Text type="secondary">{record.monitor_enabled ? '监听中' : '未监听'} · 未读 {record.unread_count}</Typography.Text>
+                    <CopyableCell value={record.dt_user_id} copied={copiedCell === `user:${record.id}`} onCopy={(value) => void copyCellValue(`user:${record.id}`, value)} maxWidth={240} />
+                    <Typography.Text type="secondary">{record.last_login_at ? dayjs(record.last_login_at).format('MM-DD HH:mm') : '未登录'}</Typography.Text>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                    <Space size={8}>
+                      <Typography.Text type="secondary">电报</Typography.Text>
+                      <Switch size="small" checked={record.telegram_notify} loading={actionLoading === record.id} onChange={(checked) => void handleTelegramToggle(record, checked)} />
+                    </Space>
+                    <Space size={2}>
+                      <Dropdown
+                        trigger={['click']}
+                        menu={{
+                          items: [
+                            { key: 'move_top', icon: <VerticalAlignTopOutlined />, label: '置顶' },
+                            { key: 'move_up', icon: <ArrowUpOutlined />, label: '上移' },
+                            { key: 'move_down', icon: <ArrowDownOutlined />, label: '下移' },
+                            { key: 'move_bottom', icon: <VerticalAlignBottomOutlined />, label: '置底' },
+                          ],
+                          onClick: ({ key }) => void handleReorder(record.id, key as 'move_up' | 'move_down' | 'move_top' | 'move_bottom'),
+                        }}
+                      >
+                        <Tooltip title="调整排序"><Button type="text" size="small" icon={<MoreOutlined />} /></Tooltip>
+                      </Dropdown>
+                      <Tooltip title={record.monitor_enabled ? '停止监听' : '启动监听'}><Button type="text" size="small" icon={record.monitor_enabled ? <PauseCircleOutlined /> : <PlayCircleOutlined />} disabled={record.status === 'pending'} onClick={() => void handleToggleMonitor(record.id, record.monitor_enabled)} /></Tooltip>
+                      <Tooltip title="账户详情"><Button type="text" size="small" icon={<InfoCircleOutlined />} onClick={() => navigate(`/accounts/${record.id}`)} /></Tooltip>
+                      <Popconfirm title="确认删除此账户？相关消息和号码都会一起删除。" onConfirm={() => void handleDelete(record.id)} okText="确认删除" cancelText="取消">
+                        <Tooltip title="删除账户"><Button type="text" size="small" danger icon={<DeleteOutlined />} /></Tooltip>
+                      </Popconfirm>
+                    </Space>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <Pagination style={{ marginTop: 16 }} {...pagination} />
+        </div>
+      ) : (
+        <Card styles={{ body: { padding: 16 } }}>
+          <Table
+            columns={columns}
+            dataSource={accounts}
+            rowKey="id"
+            rowSelection={{
+              selectedRowKeys: selectedAccountIds,
+              preserveSelectedRowKeys: true,
+              onChange: (keys) => setSelectedAccountIds(keys.map(Number)),
+            }}
+            loading={loading}
+            size="small"
+            tableLayout="fixed"
+            className="account-table"
+            pagination={pagination}
+          />
+        </Card>
+      )}
     </div>
   );
 }

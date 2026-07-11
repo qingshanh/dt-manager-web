@@ -30,6 +30,17 @@ type PhoneNotificationInput = {
   verificationNote?: string | null;
 };
 
+type PointStoreNotificationInput = {
+  account: NotifyAccount;
+  email: string;
+  productName: string;
+  productId: string;
+  productPrice: number | null;
+  orderId: string | null;
+  status: string;
+  orderTime: Date | string | null;
+};
+
 export async function sendSmsTelegramNotification(input: SmsNotificationInput) {
   const code = extractVerificationCode(input.content);
   return sendAccountTelegramNotification(
@@ -51,6 +62,21 @@ export async function sendSmsTelegramNotification(input: SmsNotificationInput) {
 
 export async function sendPhoneTelegramNotification(input: PhoneNotificationInput) {
   return sendAccountTelegramNotification(input.account, phoneActionTitle(input.action ?? "purchase"), buildPhoneTelegramNotificationFields(input));
+}
+
+export async function sendPointStoreTelegramNotification(input: PointStoreNotificationInput) {
+  return sendAccountTelegramNotification(input.account, "积分商城兑换成功", [
+    ["账号", deriveAccountName(input.account)],
+    ["面板账号ID", input.account.id],
+    ["说道用户ID", input.account.dtUserId],
+    ["兑换邮箱", input.email],
+    ["兑换商品", input.productName],
+    ["商品 ID", input.productId],
+    ["消耗积分", input.productPrice],
+    ["订单 ID", input.orderId],
+    ["订单状态", input.status],
+    ["兑换时间", formatTelegramTime(input.orderTime)]
+  ]);
 }
 
 export function buildPhoneTelegramNotificationText(input: PhoneNotificationInput) {

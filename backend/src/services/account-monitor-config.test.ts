@@ -73,7 +73,7 @@ test("direct monitor passes account app variant into direct push listener", () =
   assert.match(monitorSource, /listenDirectSessionPushes\(\{[\s\S]*account: \{[\s\S]*appVariant: account\.appVariant[\s\S]*\}/);
 });
 test("direct monitor preemption preserves account app variant", () => {
-  assert.match(monitorSource, /select: \{ dtUserId: true, dtDeviceId: true, appVariant: true \}/);
+  assert.match(monitorSource, /select: \{ adminId: true, dtUserId: true, dtDeviceId: true, appVariant: true \}/);
   assert.match(monitorSource, /preemptDirectSessionPushListener\(\{[\s\S]*appVariant: account\.appVariant[\s\S]*\}\)/);
 });
 test("account monitor restore timers stay referenced and independent", () => {

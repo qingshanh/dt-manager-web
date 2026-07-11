@@ -45,6 +45,7 @@ export interface DtAccountListItem {
   status: AccountStatus;
   monitor_enabled: boolean;
   telegram_notify: boolean;
+  sort_order: number;
   last_error: string | null;
   unread_count: number;
   active_phone_count: number;
@@ -382,7 +383,65 @@ export interface PointStoreOrderResult {
   order_id: string | null;
   order: unknown;
   order_info: unknown;
+  history_order: PointStoreOrder;
   point_store: PointStoreData;
+}
+
+export interface PointStoreOrder {
+  id: number;
+  account_id: number;
+  remote_order_id: string | null;
+  product_id: string;
+  product_name: string;
+  product_price: number | null;
+  email: string;
+  status: string;
+  order_time: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type BulkAccountAction = 'start_monitor' | 'stop_monitor' | 'telegram_on' | 'telegram_off' | 'mark_read' | 'mark_unread';
+
+export interface BulkAccountActionResult {
+  action: BulkAccountAction;
+  requested: number;
+  succeeded: number;
+  failed: number;
+  messages_updated?: number;
+  results: Array<{
+    account_id: number;
+    ok: boolean;
+    error: string | null;
+  }>;
+}
+
+export interface UnreadNotificationFeed {
+  unread_count: number;
+  list: RecentMessage[];
+}
+
+export interface VersionInfo {
+  version: string;
+  build_version: string;
+  commit_sha: string | null;
+  short_sha: string | null;
+  branch: string | null;
+  repository: string;
+  update_branch: string;
+  latest_version: VersionCommit | null;
+  update_available: boolean | null;
+  check_error: string | null;
+  checked_at: string;
+  recent_versions: VersionCommit[];
+}
+
+export interface VersionCommit {
+  sha: string;
+  short_sha: string;
+  title: string;
+  committed_at: string | null;
+  url: string | null;
 }
 
 export interface PhoneActionVerification {
@@ -481,6 +540,7 @@ export interface SSENewMessageEvent {
   accountId: number;
   accountNickname: string;
   from: string | null;
+  toNumber: string | null;
   content: string;
   msgType?: string;
   receivedAt: string;

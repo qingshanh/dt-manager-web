@@ -6,6 +6,7 @@ type CacheEntry<T> = {
 const CACHE_PREFIX = 'dt-manager-cache:';
 const DEFAULT_MAX_AGE_MS = 30 * 60_000;
 const memoryCache = new Map<string, CacheEntry<unknown>>();
+const cacheGenerations = new Map<string, number>();
 
 export function makeCacheKey(scope: string, params?: unknown) {
   return params === undefined ? scope : `${scope}:${stableStringify(params)}`;
@@ -50,16 +51,27 @@ export async function fetchCachedData<T>(
       return cached;
     }
   }
+  const generation = getCacheGeneration(key);
   const value = await loader();
-  writeCachedData(key, value);
+  if (generation === getCacheGeneration(key)) {
+    writeCachedData(key, value);
+  }
   return value;
 }
 
 export function invalidateCachedData(prefix?: string) {
   if (!prefix) {
+    for (const key of cacheGenerations.keys()) {
+      cacheGenerations.set(key, getCacheGeneration(key) + 1);
+    }
     memoryCache.clear();
     removeStorageKeys('');
     return;
+  }
+  for (const key of cacheGenerations.keys()) {
+    if (key === prefix || key.startsWith(prefix)) {
+      cacheGenerations.set(key, getCacheGeneration(key) + 1);
+    }
   }
   for (const key of Array.from(memoryCache.keys())) {
     if (key === prefix || key.startsWith(prefix)) {
@@ -67,6 +79,14 @@ export function invalidateCachedData(prefix?: string) {
     }
   }
   removeStorageKeys(prefix);
+}
+
+function getCacheGeneration(key: string) {
+  const generation = cacheGenerations.get(key) ?? 0;
+  if (!cacheGenerations.has(key)) {
+    cacheGenerations.set(key, generation);
+  }
+  return generation;
 }
 
 function readCacheEntry<T>(key: string): CacheEntry<T> | null {

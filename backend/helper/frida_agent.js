@@ -1682,8 +1682,9 @@ function getSmsConversationsPayload() {
   const ConversationMgr = Java.use("me.dingtone.app.im.conversation.ConversationMgr");
   const list = tryCall(() => ConversationMgr.getInstance().getConversationListData(), null);
   return listToArray(list, 200)
-    .filter((item) => toNumber(tryCall(() => item.getConversationType(), null)) === 3)
+    .filter((item) => [3, 4, 8, 9, 11].indexOf(toNumber(tryCall(() => item.getConversationType(), null))) >= 0)
     .map((item) => ({
+      conversationType: toNumber(tryCall(() => item.getConversationType(), null)),
       conversationId: cleanString(tryCall(() => item.getConversationId(), null)),
       conversationUserId: cleanString(tryCall(() => item.getConversationUserId(), null)),
       privatePhoneNumber: cleanString(tryCall(() => item.getPrivatePhoneNumber(), null)),
@@ -1698,7 +1699,7 @@ function getSmsConversationsPayload() {
 function dumpSmsMessagesFromDatabase(limit) {
   const DatabaseManager = Java.use("me.dingtone.app.im.database.DatabaseManager");
   const cursor = DatabaseManager.getInstance().getSqliteDB().rawQuery(
-    "select _id,conversationId,conversationUserId,type,senderId,msgId,content,timestamp,time,isRead,data1,data2,data3 from dt_message where conversationType = 3 order by _id desc limit " +
+    "select _id,conversationType,conversationId,conversationUserId,type,senderId,msgId,content,timestamp,time,isRead,data1,data2,data3 from dt_message where conversationType in (3,4,8,9,11) order by _id desc limit " +
       Math.max(1, Math.min(100, limit || 20)),
     null
   );
@@ -1707,18 +1708,19 @@ function dumpSmsMessagesFromDatabase(limit) {
     while (cursor.moveToNext()) {
       rows.push({
         id: toNumber(cursor.getString(0)),
-        conversationId: cleanString(cursor.getString(1)),
-        conversationUserId: cleanString(cursor.getString(2)),
-        type: toNumber(cursor.getString(3)),
-        senderId: cleanString(cursor.getString(4)),
-        msgId: cleanString(cursor.getString(5)),
-        content: cleanString(cursor.getString(6)),
-        timestamp: toNumber(cursor.getString(7)),
-        time: toNumber(cursor.getString(8)),
-        isRead: toNumber(cursor.getString(9)),
-        data1: cleanString(cursor.getString(10)),
-        data2: cleanString(cursor.getString(11)),
-        data3: cleanString(cursor.getString(12))
+        conversationType: toNumber(cursor.getString(1)),
+        conversationId: cleanString(cursor.getString(2)),
+        conversationUserId: cleanString(cursor.getString(3)),
+        type: toNumber(cursor.getString(4)),
+        senderId: cleanString(cursor.getString(5)),
+        msgId: cleanString(cursor.getString(6)),
+        content: cleanString(cursor.getString(7)),
+        timestamp: toNumber(cursor.getString(8)),
+        time: toNumber(cursor.getString(9)),
+        isRead: toNumber(cursor.getString(10)),
+        data1: cleanString(cursor.getString(11)),
+        data2: cleanString(cursor.getString(12)),
+        data3: cleanString(cursor.getString(13))
       });
     }
   } finally {

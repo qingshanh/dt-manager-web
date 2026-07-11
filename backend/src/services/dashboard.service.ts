@@ -1,8 +1,9 @@
 import { prisma } from "../lib/prisma.js";
 import { serializeMessage } from "../utils/serializers.js";
 
-export async function getDashboardStats() {
+export async function getDashboardStats(adminId: number) {
   const activeAccountFilter = {
+    adminId,
     NOT: {
       status: "pending" as const
     }
@@ -10,10 +11,10 @@ export async function getDashboardStats() {
   const [totalAccounts, onlineAccounts, totalMessages, unreadMessages, totalPhoneNumbers, activePhoneNumbers] = await Promise.all([
     prisma.dtAccount.count({ where: activeAccountFilter }),
     prisma.dtAccount.count({ where: { ...activeAccountFilter, status: "online" } }),
-    prisma.message.count(),
-    prisma.message.count({ where: { isRead: false } }),
-    prisma.phoneNumber.count(),
-    prisma.phoneNumber.count({ where: { status: "active" } })
+    prisma.message.count({ where: { account: { adminId } } }),
+    prisma.message.count({ where: { account: { adminId }, isRead: false } }),
+    prisma.phoneNumber.count({ where: { account: { adminId } } }),
+    prisma.phoneNumber.count({ where: { account: { adminId }, status: "active" } })
   ]);
 
   return {
@@ -26,8 +27,9 @@ export async function getDashboardStats() {
   };
 }
 
-export async function getRecentMessages(limit = 20) {
+export async function getRecentMessages(limit = 20, adminId?: number) {
   const messages = await prisma.message.findMany({
+    where: adminId ? { account: { adminId } } : undefined,
     take: limit,
     orderBy: [{ receivedAt: "desc" }, { id: "desc" }],
     include: {
@@ -44,4 +46,31 @@ export async function getRecentMessages(limit = 20) {
     ...serializeMessage(message),
     account: message.account
   }));
+}
+
+export async function getUnreadNotifications(adminId: number, limit = 20) {
+  const [unreadCount, messages] = await Promise.all([
+    prisma.message.count({ where: { account: { adminId }, isRead: false } }),
+    prisma.message.findMany({
+      where: { account: { adminId }, isRead: false },
+      take: limit,
+      orderBy: [{ receivedAt: "desc" }, { id: "desc" }],
+      include: {
+        account: {
+          select: { id: true, nickname: true, appVariant: true }
+        }
+      }
+    })
+  ]);
+  return {
+    unread_count: unreadCount,
+    list: messages.map((message) => ({ ...serializeMessage(message), account: message.account }))
+  };
+}
+
+export async function markAllMessagesRead(adminId: number) {
+  return prisma.message.updateMany({
+    where: { account: { adminId }, isRead: false },
+    data: { isRead: true }
+  });
 }

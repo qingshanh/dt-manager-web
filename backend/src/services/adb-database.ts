@@ -12,12 +12,13 @@ const execFileAsync = promisify(execFile);
 export async function dumpSmsMessagesFromAdb(limit: number, variant: AdbAppVariant = "dingtone"): Promise<HelperSmsMessageRecord[]> {
   const rowLimit = Math.max(20, Math.min(200, limit * 6));
   const sql =
-    "select _id,conversationId,conversationUserId,type,senderId,msgId,content,timestamp,time,isRead,data1,data2,data3 " +
-    `from dt_message where conversationType = 3 order by _id desc limit ${rowLimit}`;
+    "select _id,conversationType,conversationId,conversationUserId,type,senderId,msgId,content,timestamp,time,isRead,data1,data2,data3 " +
+    `from dt_message where conversationType in (3,4,8,9,11) order by _id desc limit ${rowLimit}`;
   const rows = await queryDatabase(sql, variant);
   return rows
     .map((row) => ({
       id: toNumber(row._id),
+      conversationType: toNumber(row.conversationType),
       conversationId: cleanString(row.conversationId),
       conversationUserId: cleanString(row.conversationUserId),
       type: toNumber(row.type),

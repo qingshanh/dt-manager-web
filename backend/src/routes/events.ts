@@ -1,8 +1,8 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
-import jwt from "jsonwebtoken";
-import { config } from "../config.js";
 import { eventBus } from "../services/event-bus.js";
+import { verifyAuthToken } from "../middleware/auth.js";
+import type { AppEvent } from "../services/event-bus.js";
 
 export const eventsRouter = Router();
 
@@ -12,8 +12,9 @@ eventsRouter.get("/", (req: Request, res: Response) => {
     return res.status(401).json({ code: 401, message: "Missing token", data: null });
   }
 
+  let auth;
   try {
-    jwt.verify(token, config.JWT_SECRET);
+    auth = verifyAuthToken(token);
   } catch {
     return res.status(401).json({ code: 401, message: "Invalid token", data: null });
   }
@@ -30,7 +31,10 @@ eventsRouter.get("/", (req: Request, res: Response) => {
 
   send("connected", { time: new Date().toISOString() });
 
-  const listener = (event: { type: string; payload: unknown }) => {
+  const listener = (event: AppEvent) => {
+    if (event.adminId !== auth.userId) {
+      return;
+    }
     send(event.type, event.payload);
   };
   eventBus.on("event", listener);

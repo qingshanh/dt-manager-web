@@ -81,8 +81,10 @@ import type {
   PhoneStatus,
   PointStoreData,
   RefreshMessagesResult,
+  SSENewMessageEvent,
   ValidateSessionResult,
 } from '../types';
+import { notifyMessageReadStateChanged } from '../services/ui-events';
 
 type SnapshotExtras = {
   dtDingtoneId: string | null;
@@ -1200,17 +1202,53 @@ export default function AccountDetail() {
 
   useEffect(() => {
     const handleNewMessage = (event: Event) => {
-      const detail = (event as CustomEvent<{ accountId?: number }>).detail;
+      const detail = (event as CustomEvent<SSENewMessageEvent>).detail;
       if (detail?.accountId !== accountId) {
         return;
       }
-      setMsgPage(1);
-      void Promise.all([fetchMessages(1, { silent: true, force: true }), fetchTeamMessages({ silent: true, force: true }), fetchAccount({ force: true })]);
+      const receivedAt = detail.receivedAt || new Date().toISOString();
+      const messageType = detail.msgType === 'verification' || detail.msgType === 'mms' || detail.msgType === 'system' ? detail.msgType : 'sms';
+      const nextMessage: Message = {
+        id: detail.id ?? -Date.now(),
+        account_id: accountId,
+        direction: 'incoming',
+        msg_type: messageType,
+        from_number: detail.from,
+        to_number: detail.toNumber,
+        content: detail.content,
+        raw_info: null,
+        raw_k3: null,
+        k5_flag: null,
+        is_read: messageType === 'system',
+        telegram_sent: false,
+        telegram_msg_id: null,
+        received_at: receivedAt,
+        created_at: receivedAt,
+      };
+      if (detail.msgType === 'system') {
+        setTeamMessages((current) => [nextMessage, ...current.filter((item) => item.id !== nextMessage.id)].slice(0, 100));
+        setAccount((current) => current ? {
+          ...current,
+          total_messages: current.total_messages + 1,
+          today_messages: current.today_messages + 1,
+        } : current);
+        return;
+      }
+      if (msgPage === 1) {
+        setMessages((current) => [nextMessage, ...current.filter((item) => item.id !== nextMessage.id)].slice(0, 10));
+      }
+      setMsgTotal((current) => current + 1);
+      setAccount((current) => current ? {
+        ...current,
+        total_messages: current.total_messages + 1,
+        unread_messages: current.unread_messages + 1,
+        today_messages: current.today_messages + 1,
+      } : current);
     };
 
     window.addEventListener('dt:new-message', handleNewMessage);
     return () => window.removeEventListener('dt:new-message', handleNewMessage);
-  }, [accountId, fetchAccount, fetchMessages, fetchTeamMessages]);
+  }, [accountId, msgPage]);
 
   useEffect(() => {
     if (activeTab !== 'messages') {
@@ -1643,7 +1681,9 @@ export default function AccountDetail() {
   const handleMarkAllRead = async () => {
     try {
       await readAllMessages(accountId);
-      await Promise.all([fetchMessages(msgPage), fetchAccount()]);
+      setMessages((items) => items.map((item) => ({ ...item, is_read: true })));
+      setAccount((current) => current ? { ...current, unread_messages: 0 } : current);
+      notifyMessageReadStateChanged();
       message.success('已全部标记为已读');
     } catch (err) {
       message.error(err instanceof Error ? err.message : '操作失败');
@@ -2221,7 +2261,18 @@ export default function AccountDetail() {
                   </Space>
                 </Card>
 
-                <Card size="small" title="积分商城" loading={pointStoreLoading} extra={<Button size="small" icon={<ReloadOutlined />} onClick={() => fetchPointStore()} loading={pointStoreLoading}>刷新</Button>} style={{ marginTop: 16 }}>
+                <Card
+                  size="small"
+                  title="积分商城"
+                  loading={pointStoreLoading}
+                  extra={(
+                    <Space>
+                      <Button size="small" onClick={() => navigate(`/accounts/${accountId}/point-store`)}>进入商城</Button>
+                      <Button size="small" icon={<ReloadOutlined />} onClick={() => fetchPointStore()} loading={pointStoreLoading}>刷新</Button>
+                    </Space>
+                  )}
+                  style={{ marginTop: 16 }}
+                >
                   <Descriptions bordered column={2} size="small">
                     <Descriptions.Item label="当前等级">{membershipLevelValue || '-'}</Descriptions.Item>
                     <Descriptions.Item label="会员到期">

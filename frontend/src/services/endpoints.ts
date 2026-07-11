@@ -2,6 +2,8 @@ import api from './api';
 import { fetchCachedData, invalidateCachedData, isCachedDataFresh, makeCacheKey, readCachedData } from './client-cache';
 import type {
   ApiResponse,
+  BulkAccountAction,
+  BulkAccountActionResult,
   CreateAccountRequest,
   DashboardStats,
   DtAccountDetail,
@@ -17,6 +19,7 @@ import type {
   PhonePurchasePreview,
   PointData,
   PointStoreData,
+  PointStoreOrder,
   PointStoreOrderResult,
   PurchasePhoneNumberBody,
   PurchasePhoneNumberResult,
@@ -26,11 +29,13 @@ import type {
   SettingItem,
   UpdatePhoneLabelBody,
   UpdateAccountRequest,
+  UnreadNotificationFeed,
   AccessCodeProbeRequest,
   AccessCodeProbeDryRunResult,
   AccessCodeProbeResult,
   ValidateSessionRequest,
   ValidateSessionResult,
+  VersionInfo,
 } from '../types';
 type CacheOptions = { force?: boolean };
 const PAGE_NAVIGATION_TIMEOUT_MS = 30_000;
@@ -114,6 +119,17 @@ export async function getRecentMessages(limit = 20, options?: CacheOptions) {
   }, options);
 }
 
+export async function getUnreadNotifications(limit = 20) {
+  const res = await api.get<ApiResponse<UnreadNotificationFeed>>('/dashboard/notifications', { params: { limit } });
+  return res.data.data;
+}
+
+export async function markAllDashboardMessagesRead() {
+  const res = await api.put<ApiResponse<{ updated: number }>>('/dashboard/messages/read-all');
+  invalidateAccountCaches();
+  return res.data.data;
+}
+
 // 鈹€鈹€ 璐︽埛绠＄悊 鈹€鈹€
 
 export async function getAccounts(params?: {
@@ -126,6 +142,21 @@ export async function getAccounts(params?: {
     const res = await api.get<ApiResponse<PagedData<DtAccountListItem>>>('/accounts', { params });
     return res.data.data;
   }, options);
+}
+
+export async function bulkAccountAction(accountIds: number[], action: BulkAccountAction) {
+  const res = await api.post<ApiResponse<BulkAccountActionResult>>('/accounts/bulk-action', {
+    account_ids: accountIds,
+    action,
+  }, { timeout: 120_000 });
+  invalidateAccountCaches();
+  return res.data.data;
+}
+
+export async function reorderAccount(accountId: number, action: 'move_up' | 'move_down' | 'move_top' | 'move_bottom') {
+  const res = await api.post<ApiResponse<{ account_id: number; action: string; sort_order: number }>>(`/accounts/${accountId}/reorder`, { action });
+  invalidateAccountCaches(accountId);
+  return res.data.data;
 }
 
 export async function createAccount(data: CreateAccountRequest) {
@@ -447,13 +478,23 @@ export async function getAccountPointStore(accountId: number) {
   return res.data.data;
 }
 
-export async function orderPointStoreProduct(accountId: number, productId: string) {
+export async function getAccountPointStoreOrders(accountId: number) {
+  const res = await api.get<ApiResponse<PointStoreOrder[]>>(`/accounts/${accountId}/pointstore/orders`);
+  return res.data.data;
+}
+
+export async function orderPointStoreProduct(accountId: number, productId: string, email?: string) {
   const res = await api.post<ApiResponse<PointStoreOrderResult>>(
     `/accounts/${accountId}/pointstore/order`,
-    { product_id: productId, confirm: true },
+    { product_id: productId, email, confirm: true },
     { timeout: 90_000 },
   );
   invalidateAccountCaches(accountId);
+  return res.data.data;
+}
+
+export async function refreshPointStoreOrder(accountId: number, orderId: number) {
+  const res = await api.post<ApiResponse<PointStoreOrder>>(`/accounts/${accountId}/pointstore/orders/${orderId}/refresh`);
   return res.data.data;
 }
 
@@ -515,6 +556,11 @@ export async function getSettings(options?: CacheOptions) {
 export async function updateSettings(data: Record<string, string | number | boolean>) {
   const res = await api.put<ApiResponse<SettingItem[]>>('/settings', data);
   invalidateCachedData('settings:');
+  return res.data.data;
+}
+
+export async function getVersionInfo(force = false) {
+  const res = await api.get<ApiResponse<VersionInfo>>('/version', { params: force ? { refresh: 'true' } : undefined });
   return res.data.data;
 }
 

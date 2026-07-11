@@ -1172,6 +1172,7 @@ async function phoneActionText(
       return "未找到该号码。";
     }
     const direct = directAccount(account);
+    const renewalBaseline = action === "renew" ? await getBotPhoneBaseline(direct, phone.phoneNumber) : null;
     if (action === "renew") {
       await botGateway.renewPhoneNumber(direct, phone.phoneNumber, mapStoredPhoneContext(phone));
     } else if (action === "pause") {
@@ -1183,7 +1184,7 @@ async function phoneActionText(
     }
     const expectedStatus =
       action === "renew" ? null : action === "resume" ? PhoneStatus.active : action === "pause" ? PhoneStatus.paused : PhoneStatus.cancelled;
-    const verified = await verifyPhoneStatus(direct, phone.phoneNumber, expectedStatus);
+    const verified = await verifyPhoneStatus(direct, phone.phoneNumber, expectedStatus, renewalBaseline?.expiredTime);
     const updated = await prisma.phoneNumber.update({
       where: { id: phone.id },
       data: mapPhoneNumber({ ...verified, phoneNumber: phone.phoneNumber })
@@ -1344,7 +1345,8 @@ async function confirmPurchasedPhone(account: { dtUserId: string; token: string;
 async function verifyPhoneStatus(
   account: { dtUserId: string; token: string; deviceId?: string | null },
   phoneNumber: string,
-  expectedStatus: PhoneStatus | null
+  expectedStatus: PhoneStatus | null,
+  previousExpiry?: string | null
 ) {
   let lastError: unknown;
   for (const waitMs of [1_500, 3_000, 5_000]) {
@@ -1364,6 +1366,12 @@ async function verifyPhoneStatus(
         continue;
       }
       if (!expectedStatus) {
+        const baseline = parseBotPhoneExpiry(previousExpiry);
+        const current = parseBotPhoneExpiry(matched.expiredTime);
+        if (baseline === null || current === null || current <= baseline) {
+          lastError = new Error("远端号码到期时间尚未延长");
+          continue;
+        }
         return matched;
       }
       if (matched.status !== expectedStatus) {
@@ -1380,6 +1388,29 @@ async function verifyPhoneStatus(
     }
   }
   throw new Error(`操作已发送但远端校验失败：${errorMessage(lastError)}`);
+}
+
+async function getBotPhoneBaseline(
+  account: { dtUserId: string; token: string; deviceId?: string | null },
+  phoneNumber: string
+) {
+  const matched = (await botGateway.listPhoneNumbers(account)).find(
+    (item) => normalizePhoneDigits(item.phoneNumber) === normalizePhoneDigits(phoneNumber)
+  );
+  if (!matched || parseBotPhoneExpiry(matched.expiredTime) === null) {
+    throw new Error("续期前无法从远端读取号码到期时间");
+  }
+  return matched;
+}
+
+function parseBotPhoneExpiry(value: string | null | undefined) {
+  if (!value) return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 async function savePurchasedPhone(accountId: number, phone: DingtonePhoneNumber) {
@@ -1447,7 +1478,7 @@ function phoneActionVerificationText(action: "renew" | "pause" | "resume" | "can
     return "已通过已购号码列表确认号码取消或不再返回";
   }
   if (action === "renew") {
-    return "已通过已购号码列表确认号码仍存在并合并远端记录";
+    return "已通过已购号码列表确认到期时间已延长";
   }
   return `已通过已购号码列表确认状态为 ${status}`;
 }
@@ -1457,7 +1488,7 @@ export function buildBotPhoneActionVerificationNote(action: "renew" | "pause" | 
     return "Action was confirmed by polling the remote purchased phone list until the number disappeared or returned cancelled.";
   }
   if (action === "renew") {
-    return "Action was confirmed by polling the remote purchased phone list and merging the returned phone record.";
+    return "Action was confirmed by polling the remote purchased phone list until the expiry time advanced.";
   }
   return `Action was confirmed by polling the remote purchased phone list until status became ${status ?? "expected"}.`;
 }

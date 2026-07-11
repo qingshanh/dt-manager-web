@@ -7,6 +7,7 @@ services:
       args:
         NODE_IMAGE: ${DOCKER_NODE_IMAGE:-docker.hanxi.cc/library/node:22-alpine}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        APP_COMMIT_SHA: ${APP_COMMIT_SHA:-}
     env_file:
       - ./.env
     environment:

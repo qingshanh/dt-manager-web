@@ -153,6 +153,20 @@ export type DirectProbePushResult = {
   sms?: ParsedSmsPush | null;
 };
 
+export type DirectWebOfflineMessage = {
+  conversationType: 4;
+  conversationId: string | null;
+  type: number | null;
+  senderId: string | null;
+  msgId: string | null;
+  content: string;
+  timestamp: number | null;
+  isRead: number;
+  data1: string | null;
+  data2: string | null;
+  data3: "direct-web-offline";
+};
+
 export type DirectProbeResult = {
   ok: boolean;
   host: string;
@@ -639,7 +653,7 @@ export class DirectDingtoneGateway implements DingtoneGateway {
             return enrichPreviewWithLivePrices(session, account, normalized, requestConfig);
           }
           return normalized;
-        });
+        }, 1);
         previews.push(result);
         if (result.candidates.length > 0) {
           return result;
@@ -655,6 +669,9 @@ export class DirectDingtoneGateway implements DingtoneGateway {
           attempt: index + 1,
           error: error instanceof Error ? error.message : String(error)
         });
+        if (isDirectTransportError(error)) {
+          break;
+        }
       }
     }
 
@@ -1026,7 +1043,8 @@ export class DirectDingtoneGateway implements DingtoneGateway {
   private async withSession<T>(
     runtime: DirectRuntimeConfig,
     account: { dtUserId: string; token: string; deviceId?: string | null; email?: string | null },
-    handler: (session: DirectSession) => Promise<T>
+    handler: (session: DirectSession) => Promise<T>,
+    maxAttempts = 2
   ): Promise<T> {
     if (preemptActiveDirectPushListener(account)) {
       await delay(750);
@@ -1035,7 +1053,7 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     const hosts = uniqueHosts([runtime.primaryHost, runtime.backupHost]);
     let lastError: unknown;
 
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       for (const host of hosts) {
         const session = new DirectSession(runtime, host);
         try {
@@ -1053,7 +1071,7 @@ export class DirectDingtoneGateway implements DingtoneGateway {
           });
         }
       }
-      if (attempt < 2) {
+      if (attempt < maxAttempts) {
         await delay(1_250);
       }
     }
@@ -1134,6 +1152,11 @@ export async function listenDirectSessionPushes(input: {
     sendCount: number;
     error: string | null;
   }) => Promise<void> | void;
+  onWebOfflineMessages?: (messages: DirectWebOfflineMessage[], status: {
+    host: string;
+    reason: "startup" | "interval" | "notify-only";
+    error: string | null;
+  }) => Promise<void> | void;
 }) {
   const runtime = await getDirectRuntimeConfig();
   const baseHosts = uniqueHosts([runtime.primaryHost, runtime.backupHost, ...APP_DIRECT_PUSH_HOSTS]);
@@ -1192,6 +1215,44 @@ export async function listenDirectSessionPushes(input: {
           error: offlineTemplateError
         });
       } finally {
+        let webOfflineError: string | null = null;
+        let webOfflineMessages: DirectWebOfflineMessage[] = [];
+        try {
+          const payload = await session.callCommonRestJson(
+            "getWebOfflineMessage",
+            "getWebOfflineMessage",
+            buildGetWebOfflineMessageQuery(input.account, runtime, session.nextTrackCode()),
+            Math.min(5_000, runtime.ioTimeoutMs)
+          );
+          webOfflineMessages = normalizeDirectWebOfflineMessages(payload);
+          if (webOfflineMessages.length > 0) {
+            logger.info("Direct web offline messages fetched", {
+              host,
+              reason,
+              count: webOfflineMessages.length
+            });
+          }
+        } catch (error) {
+          webOfflineError = error instanceof Error ? error.message : String(error);
+          logger.debug("Direct getWebOfflineMessage did not return usable data", {
+            host,
+            reason,
+            error: webOfflineError
+          });
+        }
+        try {
+          await input.onWebOfflineMessages?.(webOfflineMessages, {
+            host,
+            reason,
+            error: webOfflineError
+          });
+        } catch (error) {
+          logger.warn("Direct web offline message callback failed", {
+            host,
+            reason,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
         nextOfflineCatchupAt = Date.now() + (offlineTemplateError ? DIRECT_OFFLINE_CATCHUP_RETRY_MS : DIRECT_OFFLINE_CATCHUP_INTERVAL_MS);
         try {
           await input.onOfflineCatchup?.({
@@ -2341,10 +2402,10 @@ class DirectSession {
         pushes.push(push);
         await onPush?.(push);
       } catch (error) {
-        if (
-          (error instanceof AppError && error.statusCode === 504) ||
-          (error instanceof Error && /socket closed/i.test(error.message))
-        ) {
+        if (isSocketClosedError(error)) {
+          throw error;
+        }
+        if (error instanceof AppError && error.statusCode === 504) {
           break;
         }
         throw error;
@@ -2543,14 +2604,15 @@ class DirectSession {
     return true;
   }
   private async write(frame: Buffer) {
-    if (!this.socket) {
-      throw new Error("Direct gateway socket is not open");
+    const socket = this.socket;
+    if (!socket || this.closed || socket.destroyed || !socket.writable) {
+      throw new Error("Direct gateway socket is not writable");
     }
     if (process.env.DT_DIRECT_DEBUG_DUMP_DIR) {
       console.log(`[Socket Write] Length: ${frame.length}, Hex: ${frame.toString("hex")}`);
     }
     await new Promise<void>((resolve, reject) => {
-      this.socket!.write(frame, (error) => {
+      socket.write(frame, (error) => {
         if (error) {
           reject(error);
           return;
@@ -2901,6 +2963,9 @@ function isExpectedCommonRestJsonPayload(apiName: string, payload: ApiResult) {
   if (normalized.includes("pstn/share/getprivatenumber")) {
     return hasPhoneListPayload(payload) || hasErrCode(payload, 7001);
   }
+  if (normalized.includes("getwebofflinemessage")) {
+    return hasWebOfflineMessagePayload(payload) || hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]);
+  }
   if (normalized.includes("checkactivated") || normalized.includes("checkuseractivate")) {
     return hasActivatedUserPayload(payload) || hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]);
   }
@@ -2961,10 +3026,106 @@ function hasStrongExpectedCommonRestShape(apiName: string, payload: ApiResult) {
   if (normalized.includes("pstn/share/getprivatenumber")) {
     return hasPhoneListPayload(payload);
   }
+  if (normalized.includes("getwebofflinemessage")) {
+    return hasWebOfflineMessagePayload(payload);
+  }
   if (normalized.includes("checkactivated") || normalized.includes("checkuseractivate")) {
     return hasActivatedUserPayload(payload);
   }
   return false;
+}
+
+function hasWebOfflineMessagePayload(payload: ApiResult) {
+  return (
+    hasNestedOwnKey(payload, "aOfflineMessagse") ||
+    hasNestedOwnKey(payload, "aOfflineMessages") ||
+    hasNestedOwnKey(payload, "offlineMessages")
+  );
+}
+
+export function normalizeDirectWebOfflineMessages(payload: unknown): DirectWebOfflineMessage[] {
+  const rows: DirectWebOfflineMessage[] = [];
+  const seen = new Set<string>();
+  for (const record of collectDirectWebOfflineRecords(payload)) {
+    const title = pickString(record, ["msgTitle", "title"]);
+    const body = pickString(record, ["msgContent", "content", "message", "body"]);
+    const content = title && body && title !== body ? `${title}\n${body}` : title ?? body;
+    if (!content) {
+      continue;
+    }
+    const msgId = pickString(record, ["msgId", "messageId", "id"]) ?? null;
+    const senderId = pickString(record, ["msgSenderID", "msgSenderId", "senderId", "sender", "from"]) ?? null;
+    const timestamp = pickNumber(record, ["msgTimeStamp", "timestamp", "time", "createdAt"]) ?? null;
+    const messageType = pickNumber(record, ["msgType", "type"]) ?? null;
+    const meta = normalizeDirectWebOfflineMeta(record.msgMeta ?? record.meta);
+    const dedupeKey = msgId ?? `${senderId ?? ""}|${timestamp ?? ""}|${content}`;
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+    rows.push({
+      conversationType: 4,
+      conversationId: pickString(record, ["conversationId", "threadId"]) ?? `web-offline:${senderId ?? "team"}`,
+      type: messageType,
+      senderId,
+      msgId,
+      content,
+      timestamp,
+      isRead: 0,
+      data1: title ?? null,
+      data2: meta,
+      data3: "direct-web-offline"
+    });
+  }
+  return rows;
+}
+
+function collectDirectWebOfflineRecords(value: unknown, depth = 0): Record<string, unknown>[] {
+  if (depth > 5) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectDirectWebOfflineRecords(item, depth + 1));
+  }
+  if (!isRecord(value)) {
+    return [];
+  }
+  if (hasAnyOwnKey(value, ["msgContent", "msgId", "msgSenderID", "msgTimeStamp", "msgTitle"])) {
+    return [value];
+  }
+
+  const rows: Record<string, unknown>[] = [];
+  for (const [key, nested] of Object.entries(value)) {
+    const normalizedKey = key.toLowerCase();
+    if (
+      normalizedKey === "aofflinemessagse" ||
+      normalizedKey === "aofflinemessages" ||
+      normalizedKey === "offlinemessages" ||
+      normalizedKey === "messages" ||
+      normalizedKey === "list" ||
+      normalizedKey === "data" ||
+      normalizedKey === "result" ||
+      normalizedKey === "payload" ||
+      normalizedKey === "response"
+    ) {
+      rows.push(...collectDirectWebOfflineRecords(nested, depth + 1));
+    }
+  }
+  return rows;
+}
+
+function normalizeDirectWebOfflineMeta(value: unknown) {
+  if (typeof value === "string") {
+    return value.trim() || null;
+  }
+  if (value === undefined || value === null) {
+    return null;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
 }
 
 function hasStrongExpectedTemplateShape(label: string, payload: ApiResult) {
@@ -4946,6 +5107,23 @@ function activationTemplateBaseSettingKey(apiName: string): DirectActivationTemp
   return "dt_direct_template_register_email";
 }
 
+function buildGetWebOfflineMessageQuery(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  trackCode: string
+) {
+  const appVersion = resolveDirectAppVersion(account, runtime);
+  return [
+    queryPair("deviceId", accountDeviceId(account)),
+    queryPair("TrackCode", trackCode),
+    queryPair("clientVersion", appVersion),
+    queryPair("appVersion", appVersion),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
+    queryPair("userId", account.dtUserId),
+    queryPair("token", account.token)
+  ].join("&");
+}
+
 function activationTemplateVariantSettingKey(
   baseKey: DirectActivationTemplateSettingKey,
   identity?: DirectActivationIdentity
@@ -6478,7 +6656,8 @@ function normalizePhoneStatus(record: Record<string, unknown>): DingtonePhoneNum
     return "paused";
   }
   const expireTime = pickNumber(record, ["expireTime", "expire_time"]);
-  if (expireTime && expireTime <= Date.now()) {
+  const expireAt = expireTime ? (expireTime > 1_000_000_000_000 ? expireTime : expireTime * 1000) : null;
+  if (expireAt && expireAt <= Date.now()) {
     return "expired";
   }
   return "active";
@@ -7323,9 +7502,17 @@ function isFatalDirectSessionError(error: unknown) {
   return /authen failed|deviceid not find|60011|missing dt_token|missing dt_user_id|bootstrap failed/i.test(message);
 }
 
-function isSocketClosedError(error: unknown) {
+export function isSocketClosedError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return /socket.*closed|closed.*socket|econnreset|write after end/i.test(message);
+  return /socket.*(?:closed|ended|not writable)|(?:closed|ended).*socket|stream was destroyed|write after (?:a stream was destroyed|end)|econn(?:aborted|reset)|socket hang up/i.test(message);
+}
+
+function isDirectTransportError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    isSocketClosedError(error) ||
+    /direct (?:gateway|proxy|tls) connection timed out|econnrefused|enotfound|etimedout|network socket disconnected/i.test(message)
+  );
 }
 
 function isNoResponseAfterPhoneActionWrite(error: unknown) {

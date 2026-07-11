@@ -82,6 +82,7 @@ model DtAccount {
   monitorEnabled  Boolean         @default(false) @map("monitor_enabled")
   telegramNotify  Boolean         @default(false) @map("telegram_notify")
   proxyEnabled    Boolean         @default(false) @map("proxy_enabled")
+  sortOrder       Int             @default(0) @map("sort_order")
   lastLoginAt     DateTime?       @map("last_login_at")
   lastError       String?         @map("last_error")
   createdAt       DateTime        @default(now()) @map("created_at")
@@ -91,6 +92,7 @@ model DtAccount {
   phoneNumbers    PhoneNumber[]
   messages        Message[]
   monitorSessions MonitorSession[]
+  pointStoreOrders PointStoreOrder[]
 
   @@index([adminId])
   @@index([status])
@@ -196,6 +198,28 @@ model MonitorSession {
 
   @@index([accountId, status])
   @@map("monitor_sessions")
+}
+
+model PointStoreOrder {
+  id             Int       @id @default(autoincrement())
+  accountId      Int       @map("account_id")
+  remoteOrderId  String?   @map("remote_order_id")
+  productId      String    @map("product_id")
+  productName    String    @map("product_name")
+  productPrice   Float?    @map("product_price")
+  email          String
+  status         String    @default("pending")
+  orderTime      String?   @map("order_time")
+  rawOrderJson   String?   @map("raw_order_json")
+  rawInfoJson    String?   @map("raw_info_json")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  account        DtAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, remoteOrderId])
+  @@index([accountId, createdAt(sort: Desc)])
+  @@index([remoteOrderId])
+  @@map("point_store_orders")
 }
 
 model Setting {

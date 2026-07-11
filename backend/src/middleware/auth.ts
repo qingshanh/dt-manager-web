@@ -29,7 +29,7 @@ export function verifyAuthToken(token: string) {
 export function requireAuth(req: Request, _res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
-    return next(new AppError("Missing bearer token", 401, 401));
+    return next(new AppError("Missing bearer token", 401, 40101));
   }
 
   try {
@@ -37,6 +37,6 @@ export function requireAuth(req: Request, _res: Response, next: NextFunction) {
     req.auth = verifyAuthToken(token);
     next();
   } catch {
-    next(new AppError("Invalid or expired token", 401, 401));
+    next(new AppError("Invalid or expired token", 401, 40101));
   }
 }

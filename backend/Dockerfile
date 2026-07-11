@@ -19,6 +19,8 @@ FROM ${NODE_IMAGE} AS runtime
 
 WORKDIR /app
 ENV NODE_ENV=production
+ARG APP_COMMIT_SHA=""
+ENV APP_COMMIT_SHA=${APP_COMMIT_SHA}
 
 COPY package.json package-lock.json ./
 COPY --from=build /app/node_modules ./node_modules

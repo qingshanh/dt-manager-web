@@ -22,7 +22,13 @@ import { RealDingtoneGateway } from "../services/dingtone/real-gateway.js";
 import { dumpHelperSmsMessages, executeHelperAction, executeHelperActionWithRetry, getCachedPrivateNumberEvent } from "../services/helper-bridge.js";
 import { refreshAccountRuntimeData } from "../services/account-runtime.js";
 import { getAccountPoint } from "../services/point.js";
-import { getAccountPointStore, orderAccountPointStoreProduct } from "../services/point-store.js";
+import {
+  getAccountPointStore,
+  listAccountPointStoreOrders,
+  orderAccountPointStoreProduct,
+  refreshAccountPointStoreOrder,
+  serializeStoredPointStoreOrder
+} from "../services/point-store.js";
 import { dumpSmsMessagesFromAdb, listPhoneNumbersFromAdb } from "../services/adb-database.js";
 import { exportSessionFromAdbConfig } from "../services/adb-session.js";
 import { previewPhoneNumbersFromAdb } from "../services/adb-phone-preview.js";
@@ -104,7 +110,17 @@ const phoneActionConfirmSchema = z.object({
 
 const pointStoreOrderSchema = z.object({
   product_id: z.string().trim().min(1),
+  email: z.string().trim().email().optional(),
   confirm: z.boolean().optional().default(false)
+});
+
+const bulkAccountActionSchema = z.object({
+  account_ids: z.array(z.number().int().positive()).min(1).max(500).transform((items) => Array.from(new Set(items))),
+  action: z.enum(["start_monitor", "stop_monitor", "telegram_on", "telegram_off", "mark_read", "mark_unread"])
+});
+
+const reorderAccountSchema = z.object({
+  action: z.enum(["move_up", "move_down", "move_top", "move_bottom"])
 });
 
 const validateSessionSchema = z.object({
@@ -176,11 +192,20 @@ const messagesQuerySchema = z.object({
 });
 
 type MessagesQuery = z.infer<typeof messagesQuerySchema>;
+const TEAM_MESSAGE_SENDERS = ["叮咚团队", "说道团队"];
 
 function buildMessagesWhere(accountId: number, query: MessagesQuery): Prisma.MessageWhereInput {
+  const messageTypeWhere =
+    query.msg_type === MessageType.system
+      ? { msgType: MessageType.system, fromNumber: { in: TEAM_MESSAGE_SENDERS } }
+      : query.msg_type
+        ? { msgType: query.msg_type }
+        : query.exclude_system
+          ? { msgType: { not: MessageType.system } }
+          : {};
   return {
     accountId,
-    ...(query.msg_type ? { msgType: query.msg_type } : query.exclude_system ? { msgType: { not: MessageType.system } } : {}),
+    ...messageTypeWhere,
     ...(query.keyword
       ? {
           OR: [
@@ -204,6 +229,7 @@ const syncHelperMessagesSchema = z.object({
 });
 
 const activeMessageRefreshes = new Set<number>();
+const accountReorderQueues = new Map<number, Promise<unknown>>();
 
 const updatePhoneLabelSchema = z.object({
   display_name: z.string().trim().max(100)
@@ -240,6 +266,26 @@ const fullBackupImportSchema = z.object({
 });
 
 export const accountsRouter = Router();
+
+accountsRouter.param("id", async (req, _res, next, value) => {
+  try {
+    const accountId = Number(value);
+    if (!Number.isInteger(accountId) || accountId <= 0) {
+      throw new AppError("Account not found", 404, 404);
+    }
+    const account = await prisma.dtAccount.findFirst({
+      where: { id: accountId, adminId: req.auth!.userId },
+      select: { id: true }
+    });
+    if (!account) {
+      throw new AppError("Account not found", 404, 404);
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
 const directRefreshGateway = new DirectDingtoneGateway();
 const helperRefreshGateway = new RealDingtoneGateway();
 const SESSION_EXPORT_SETTING_KEYS = [
@@ -347,12 +393,19 @@ accountsRouter.get("/", async (req, res, next) => {
         where,
         skip: (page - 1) * pageSize,
         take: pageSize,
-        orderBy: { createdAt: "desc" },
+        orderBy: [{ sortOrder: "asc" }, { createdAt: "desc" }],
         include: {
           snapshot: {
             select: {
-              fullName: true
+              fullName: true,
+              phone: true
             }
+          },
+          phoneNumbers: {
+            where: { status: { in: [PhoneStatus.active, PhoneStatus.paused] } },
+            orderBy: [{ isPrimary: "desc" }, { updatedAt: "desc" }],
+            take: 1,
+            select: { phoneNumber: true }
           }
         }
       })
@@ -381,13 +434,14 @@ accountsRouter.get("/", async (req, res, next) => {
       nickname: resolveAccountName(item),
       app_variant: item.appVariant,
       email: item.email,
-      phone: item.phone,
+      phone: resolveAccountBoundPhone(item),
       dt_user_id: item.dtUserId,
       status: item.status,
       monitor_enabled: item.monitorEnabled,
       telegram_notify: item.telegramNotify,
       unread_count: unreadCountByAccountId.get(item.id) ?? 0,
       active_phone_count: activePhoneCountByAccountId.get(item.id) ?? 0,
+      sort_order: item.sortOrder,
       last_login_at: item.lastLoginAt,
       created_at: item.createdAt
     }));
@@ -397,6 +451,116 @@ accountsRouter.get("/", async (req, res, next) => {
     next(error);
   }
 });
+
+accountsRouter.post("/bulk-action", async (req, res, next) => {
+  try {
+    const body = bulkAccountActionSchema.parse(req.body ?? {});
+    const accounts = await prisma.dtAccount.findMany({
+      where: {
+        id: { in: body.account_ids },
+        adminId: req.auth!.userId,
+        ...accountListVisibleWhere()
+      },
+      select: { id: true }
+    });
+    const ownedIds = new Set(accounts.map((item) => item.id));
+    const missingIds = body.account_ids.filter((id) => !ownedIds.has(id));
+    if (missingIds.length > 0) {
+      throw new AppError(`Accounts not found or not accessible: ${missingIds.join(", ")}`, 404, 404);
+    }
+
+    if (body.action === "telegram_on" || body.action === "telegram_off") {
+      await prisma.dtAccount.updateMany({
+        where: { id: { in: body.account_ids }, adminId: req.auth!.userId },
+        data: { telegramNotify: body.action === "telegram_on" }
+      });
+      return ok(res, buildBulkActionResult(body.action, body.account_ids));
+    }
+
+    if (body.action === "mark_read" || body.action === "mark_unread") {
+      const updated = await prisma.message.updateMany({
+        where: { accountId: { in: body.account_ids } },
+        data: { isRead: body.action === "mark_read" }
+      });
+      return ok(res, {
+        ...buildBulkActionResult(body.action, body.account_ids),
+        messages_updated: updated.count
+      });
+    }
+
+    const results: Array<{ account_id: number; ok: boolean; error: string | null }> = [];
+    for (const accountId of body.account_ids) {
+      try {
+        if (body.action === "start_monitor") {
+          await accountMonitorService.start(accountId);
+        } else {
+          await accountMonitorService.stop(accountId);
+        }
+        results.push({ account_id: accountId, ok: true, error: null });
+      } catch (error) {
+        results.push({
+          account_id: accountId,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+    ok(res, {
+      action: body.action,
+      requested: body.account_ids.length,
+      succeeded: results.filter((item) => item.ok).length,
+      failed: results.filter((item) => !item.ok).length,
+      results
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.post("/:id/reorder", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const body = reorderAccountSchema.parse(req.body ?? {});
+    const targetIndex = await runSerializedAccountReorder(req.auth!.userId, async () => {
+      const accounts = await prisma.dtAccount.findMany({
+        where: { adminId: req.auth!.userId, ...accountListVisibleWhere() },
+        orderBy: [{ sortOrder: "asc" }, { createdAt: "desc" }],
+        select: { id: true }
+      });
+      const currentIndex = accounts.findIndex((item) => item.id === accountId);
+      if (currentIndex < 0) {
+        throw new AppError("Account not found", 404, 404);
+      }
+      const ids = accounts.map((item) => item.id);
+      const [current] = ids.splice(currentIndex, 1);
+      const nextIndex = body.action === "move_top"
+        ? 0
+        : body.action === "move_bottom"
+          ? ids.length
+          : body.action === "move_up"
+            ? Math.max(0, currentIndex - 1)
+            : Math.min(ids.length, currentIndex + 1);
+      ids.splice(nextIndex, 0, current!);
+      await prisma.$transaction(ids.map((id, index) => prisma.dtAccount.update({ where: { id }, data: { sortOrder: index } })));
+      return nextIndex;
+    });
+    ok(res, { account_id: accountId, action: body.action, sort_order: targetIndex });
+  } catch (error) {
+    next(error);
+  }
+});
+
+function runSerializedAccountReorder<T>(adminId: number, run: () => Promise<T>): Promise<T> {
+  const previous = accountReorderQueues.get(adminId) ?? Promise.resolve();
+  const next = previous.then(run, run);
+  accountReorderQueues.set(adminId, next);
+  void next.finally(() => {
+    if (accountReorderQueues.get(adminId) === next) {
+      accountReorderQueues.delete(adminId);
+    }
+  }).catch(() => undefined);
+  return next;
+}
 
 accountsRouter.post("/", async (req, res, next) => {
   try {
@@ -1178,6 +1342,17 @@ accountsRouter.get("/:id/pointstore", async (req, res, next) => {
   }
 });
 
+accountsRouter.get("/:id/pointstore/orders", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+    const orders = await listAccountPointStoreOrders(accountId);
+    ok(res, orders.map(serializeStoredPointStoreOrder));
+  } catch (error) {
+    next(error);
+  }
+});
+
 accountsRouter.post("/:id/pointstore/order", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);
@@ -1186,8 +1361,19 @@ accountsRouter.post("/:id/pointstore/order", async (req, res, next) => {
     if (!body.confirm) {
       throw new AppError("Point store order requires confirmation.", 400, 400);
     }
-    const data = await orderAccountPointStoreProduct(accountId, body.product_id);
+    const data = await orderAccountPointStoreProduct(accountId, body.product_id, body.email);
     ok(res, serializePointStoreOrder(data));
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.post("/:id/pointstore/orders/:orderId/refresh", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+    const order = await refreshAccountPointStoreOrder(accountId, Number(req.params.orderId));
+    ok(res, serializeStoredPointStoreOrder(order));
   } catch (error) {
     next(error);
   }
@@ -1307,9 +1493,15 @@ accountsRouter.put("/:id/messages/read-all", async (req, res, next) => {
 
 accountsRouter.delete("/:id/messages/:messageId", async (req, res, next) => {
   try {
-    await prisma.message.delete({
-      where: { id: Number(req.params.messageId) }
+    const deleted = await prisma.message.deleteMany({
+      where: {
+        id: Number(req.params.messageId),
+        accountId: Number(req.params.id)
+      }
     });
+    if (deleted.count === 0) {
+      throw new AppError("Message not found", 404, 404);
+    }
     ok(res, null);
   } catch (error) {
     next(error);
@@ -1541,6 +1733,7 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
     const account = await assertAccount(Number(req.params.id));
     const phoneItem = await assertAccountPhoneNumber(account.id, Number(req.params.phoneId));
     const useDirect = await shouldUseDirectAccountFlow(account);
+    const renewalBaseline = useDirect ? await getDirectPhoneBaseline(account, phoneItem) : phoneItem;
     const remote = useDirect
       ? await directRefreshGateway.renewPhoneNumber(
           {
@@ -1554,7 +1747,7 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
       : normalizeHelperPhoneNumberPatch(
           await executeHelperAction("renew_phone_number", { appVariant: account.appVariant, phoneNumber: phoneItem.phoneNumber }, 45_000)
         );
-    const verified = useDirect ? await verifyDirectPhoneAction(account, phoneItem, null) : {};
+    const verified = useDirect ? await verifyDirectPhoneAction(account, renewalBaseline, null, true) : {};
 
     const updated = await prisma.phoneNumber.update({
       where: { id: phoneItem.id },
@@ -2541,8 +2734,10 @@ async function verifyDirectPhoneAction(
   },
   phoneItem: {
     phoneNumber: string;
+    expiredTime?: string | null;
   },
-  expectedStatus: PhoneStatus | null
+  expectedStatus: PhoneStatus | null,
+  verifyRenewal = false
 ): Promise<Partial<DingtonePhoneNumber>> {
   const directAccount = {
     dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
@@ -2577,6 +2772,14 @@ async function verifyDirectPhoneAction(
         lastError = new AppError(`Remote verification failed: expected ${expectedStatus}, got ${matched.status ?? "unknown"}.`, 502, 502);
         continue;
       }
+      if (verifyRenewal) {
+        try {
+          assertPhoneRenewalAdvanced(phoneItem, matched);
+        } catch (error) {
+          lastError = error;
+          continue;
+        }
+      }
       return matched;
     } catch (error) {
       lastError = error;
@@ -2591,6 +2794,54 @@ async function verifyDirectPhoneAction(
     502,
     502
   );
+}
+
+async function getDirectPhoneBaseline(
+  account: {
+    dtUserId: string | null;
+    dtToken: string | null;
+    dtDeviceId: string | null;
+  },
+  phoneItem: { phoneNumber: string }
+) {
+  const remotePhones = await directRefreshGateway.listPhoneNumbers({
+    dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+    token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+    deviceId: account.dtDeviceId
+  });
+  const target = normalizePhoneDigits(phoneItem.phoneNumber);
+  const matched = remotePhones.find((item) => normalizePhoneDigits(item.phoneNumber) === target);
+  if (!matched) {
+    throw new AppError("Remote verification failed: phone number was not found before renewal.", 502, 502);
+  }
+  if (parsePhoneExpiry(matched.expiredTime) === null) {
+    throw new AppError("Remote verification failed: phone expiry baseline was unavailable before renewal.", 502, 502);
+  }
+  return matched;
+}
+
+function assertPhoneRenewalAdvanced(
+  previous: { expiredTime?: string | null },
+  current: Partial<DingtonePhoneNumber>
+) {
+  const previousExpiry = parsePhoneExpiry(previous.expiredTime);
+  const currentExpiry = parsePhoneExpiry(current.expiredTime);
+  if (previousExpiry !== null && currentExpiry !== null && currentExpiry > previousExpiry) {
+    return;
+  }
+  throw new AppError("Remote verification failed: renewed phone expiry did not advance.", 502, 502);
+}
+
+function parsePhoneExpiry(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function phoneActionResponse(
@@ -2649,7 +2900,7 @@ function phoneActionVerificationNote(action: "renew" | "cancel" | "pause" | "res
     return "Action was confirmed by polling the remote purchased phone list until the number disappeared or returned cancelled.";
   }
   if (action === "renew") {
-    return "Action was confirmed by polling the remote purchased phone list and merging the returned phone record.";
+    return "Action was confirmed by polling the remote purchased phone list until the expiry time advanced.";
   }
   return `Action was confirmed by polling the remote purchased phone list until status became ${verified.status ?? "expected"}.`;
 }
@@ -4243,6 +4494,28 @@ function resolveAccountName(input: {
   );
 }
 
+function resolveAccountBoundPhone(input: {
+  phone?: string | null;
+  snapshot?: { phone?: string | null } | null;
+  phoneNumbers?: Array<{ phoneNumber: string }>;
+}) {
+  return (
+    normalizeOptionalString(input.snapshot?.phone) ??
+    normalizeOptionalString(input.phone) ??
+    normalizeOptionalString(input.phoneNumbers?.[0]?.phoneNumber)
+  );
+}
+
+function buildBulkActionResult(action: string, accountIds: number[]) {
+  return {
+    action,
+    requested: accountIds.length,
+    succeeded: accountIds.length,
+    failed: 0,
+    results: accountIds.map((accountId) => ({ account_id: accountId, ok: true, error: null }))
+  };
+}
+
 function mapPurchaseCandidate(input: z.infer<typeof purchasePhoneCandidateSchema>): DingtonePhonePurchaseCandidate {
   return {
     phoneNumber: input.phone_number,
@@ -4371,6 +4644,7 @@ function serializePointStoreOrder(data: Awaited<ReturnType<typeof orderAccountPo
     order_id: data.orderId,
     order: data.order,
     order_info: data.orderInfo,
+    history_order: serializeStoredPointStoreOrder(data.storedOrder),
     point_store: serializePointStore(data.pointStore)
   };
 }
@@ -4883,12 +5157,14 @@ export async function createMockIncomingMessage(accountId: number, content: stri
   }
 
   eventBus.emitEvent({
+    adminId: account.adminId,
     type: "new_message",
     payload: {
       id: message.id,
       accountId,
       accountNickname: deriveFallbackName(account),
       from: fromNumber,
+      toNumber: null,
       content,
       msgType: message.msgType,
       receivedAt: message.receivedAt.toISOString()

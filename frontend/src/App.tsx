@@ -9,6 +9,7 @@ const Dashboard = lazy(() => import('./pages/Dashboard'));
 const AccountList = lazy(() => import('./pages/AccountList'));
 const AccountAdd = lazy(() => import('./pages/AccountAdd'));
 const AccountDetail = lazy(() => import('./pages/AccountDetail'));
+const PointStore = lazy(() => import('./pages/PointStore'));
 const Settings = lazy(() => import('./pages/Settings'));
 
 type IdleWindow = Window & {
@@ -97,6 +98,7 @@ export default function App() {
         <Route path="accounts" element={<AccountList />} />
         <Route path="accounts/new" element={<AccountAdd />} />
         <Route path="accounts/:id" element={<AccountDetail />} />
+        <Route path="accounts/:id/point-store" element={<PointStore />} />
         <Route path="settings" element={<Settings />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

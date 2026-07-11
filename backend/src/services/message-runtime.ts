@@ -19,6 +19,7 @@ type MessageRuntimeOptions = {
 
 export type HelperSmsMessageRecord = {
   id?: number | null;
+  conversationType?: number | null;
   conversationId?: string | null;
   conversationUserId?: string | null;
   type?: number | null;
@@ -91,7 +92,8 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
     toNumber: directOwner?.phoneNumber ?? normalizedPush.toNumber
   };
 
-  const msgType = inferMessageType(normalizedPush);
+  const teamName = resolveNamedTeamName(normalizedPush.fromNumber, normalizedPush.rawInfo);
+  const msgType = teamName ? MessageType.system : inferMessageType(normalizedPush);
   const systemMessage = msgType === MessageType.system;
   if (systemMessage && !(await shouldCollectTeamMessages(options))) {
     return false;
@@ -107,7 +109,7 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
       accountId: targetAccount.id,
       direction: MessageDirection.incoming,
       msgType,
-      fromNumber: normalizedPush.fromNumber,
+      fromNumber: teamName ?? normalizedPush.fromNumber,
       toNumber: normalizedPush.toNumber ?? null,
       content,
       rawInfo: normalizedPush.rawInfo ?? null,
@@ -120,12 +122,14 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
 
   if ((options.emitEvents ?? true) && !systemMessage) {
     eventBus.emitEvent({
+      adminId: targetAccount.adminId,
       type: "new_message",
       payload: {
         id: message.id,
         accountId: targetAccount.id,
         accountNickname: deriveFallbackName(targetAccount),
-        from: normalizedPush.fromNumber,
+        from: teamName ?? normalizedPush.fromNumber,
+        toNumber: normalizedPush.toNumber,
         content,
         msgType,
         receivedAt: message.receivedAt.toISOString()
@@ -188,23 +192,29 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
     return false;
   }
 
-  const msgType = inferHelperMessageType(normalizedRow);
+  const teamName = resolveHelperTeamName(normalizedRow, account.appVariant);
+  if (isKnownSystemConversation(normalizedRow) && !teamName) {
+    return false;
+  }
+  const msgType = teamName ? MessageType.system : inferHelperMessageType(normalizedRow);
   const systemMessage = msgType === MessageType.system;
   if (systemMessage && !(await shouldCollectTeamMessages(options))) {
     return false;
   }
 
 
-  const receivedAt = normalizeHelperReceivedAt(normalizedRow);
-  const sender = normalizedRow.senderId ?? normalizedRow.data1 ?? null;
+  const storedContent = teamName ? extractTeamMessageContent(normalizedRow.content) : content;
+  const rowForStorage = { ...normalizedRow, content: storedContent };
+  const receivedAt = normalizeHelperReceivedAt(rowForStorage);
+  const sender = teamName ?? normalizedRow.senderId ?? normalizedRow.data1 ?? null;
   let toNumber =
-    extractTargetNumber(normalizedRow.conversationId, sender) ??
-    (await inferTargetNumberFromAccountPhones(accountId, normalizedRow, sender, db));
+    extractTargetNumber(rowForStorage.conversationId, sender) ??
+    (await inferTargetNumberFromAccountPhones(accountId, rowForStorage, sender, db));
   const helperOwner = await resolveTargetPhoneOwner(account, toNumber, sender, db);
   const targetAccount = helperOwner?.account ?? account;
   toNumber = helperOwner?.phoneNumber ?? toNumber;
 
-  const duplicate = await findDuplicateHelperSmsMessage(targetAccount.id, normalizedRow, db, toNumber);
+  const duplicate = await findDuplicateHelperSmsMessage(targetAccount.id, rowForStorage, db, toNumber);
   if (duplicate) {
     return false;
   }
@@ -216,11 +226,11 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
       msgType,
       fromNumber: sender,
       toNumber,
-      content,
-      rawInfo: normalizedRow.conversationId ?? null,
-      rawK3: normalizedRow.msgId ?? null,
-      k5Flag: normalizedRow.type ?? null,
-      isRead: systemMessage || normalizeReadFlag(normalizedRow.isRead),
+      content: storedContent,
+      rawInfo: rowForStorage.conversationId ?? null,
+      rawK3: rowForStorage.msgId ?? null,
+      k5Flag: rowForStorage.type ?? null,
+      isRead: systemMessage || normalizeReadFlag(rowForStorage.isRead),
       receivedAt
     }
   });
@@ -229,13 +239,13 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
     await maybeSendTelegram(
       targetAccount,
       {
-        msgType: normalizedRow.type ?? 0,
+        msgType: rowForStorage.type ?? 0,
         fromNumber: sender,
         toNumber,
-        content,
-        rawInfo: normalizedRow.conversationId ?? undefined,
-        rawK3: normalizedRow.msgId ?? undefined,
-        k5Flag: normalizedRow.type ?? undefined
+        content: storedContent,
+        rawInfo: rowForStorage.conversationId ?? undefined,
+        rawK3: rowForStorage.msgId ?? undefined,
+        k5Flag: rowForStorage.type ?? undefined
       },
       message.id,
       message.receivedAt,
@@ -245,12 +255,14 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
   }
   if ((options.emitEvents ?? true) && !systemMessage) {
     eventBus.emitEvent({
+      adminId: targetAccount.adminId,
       type: "new_message",
       payload: {
         id: message.id,
         accountId: targetAccount.id,
         accountNickname: deriveFallbackName(targetAccount),
         from: sender,
+        toNumber,
         content,
         msgType,
         receivedAt: message.receivedAt.toISOString()
@@ -335,7 +347,7 @@ async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMe
 }
 
 function inferMessageType(push: ParsedSmsPush) {
-  if (isTeamOrSystemMessage(push)) {
+  if (resolveNamedTeamName(push.fromNumber, push.rawInfo)) {
     return MessageType.system;
   }
   if (/\d{4,8}/.test(push.content) || push.msgType === 25) {
@@ -345,13 +357,7 @@ function inferMessageType(push: ParsedSmsPush) {
 }
 
 function inferHelperMessageType(row: HelperSmsMessageRecord) {
-  if (
-    isTeamOrSystemMessage({
-      fromNumber: row.senderId ?? row.data1 ?? null,
-      content: row.content,
-      rawInfo: row.conversationId
-    })
-  ) {
+  if (resolveNamedTeamName(row.senderId, row.data1, row.conversationId, row.conversationUserId)) {
     return MessageType.system;
   }
   if (/\d{4,8}/.test(row.content ?? "")) {
@@ -361,24 +367,93 @@ function inferHelperMessageType(row: HelperSmsMessageRecord) {
 }
 
 function isTeamOrSystemMessage(input: { fromNumber?: string | null; content?: string | null; rawInfo?: string | null }) {
-  const sender = (input.fromNumber ?? "").trim();
-  const content = (input.content ?? "").trim();
-  const rawInfo = (input.rawInfo ?? "").trim();
-  const text = `${sender}\n${content}\n${rawInfo}`;
-  if (containsTeamOrSystemText(text)) {
-    return true;
-  }
-  if (/鍙挌鍥㈤槦|璇撮亾鍥㈤槦|绯荤当娑堟伅|绯荤粺娑堟伅/i.test(`${sender}\n${content}\n${rawInfo}`)) {
-    return true;
-  }
-  return /^(dingtone|talku|talkyou|dingdong|dingtone team|talku team|dingdong team|team)$/i.test(sender) ||
-    /dingtone team|talku team|talkyou team|dingdong team|鍙挌鍥㈤槦|璇撮亾鍥㈤槦|绯荤当娑堟伅|绯荤粺娑堟伅|TalkU number|free calling and messaging/i.test(`${sender}\n${content}\n${rawInfo}`);
+  return Boolean(resolveNamedTeamName(input.fromNumber, input.rawInfo));
 }
 
-function containsTeamOrSystemText(value: string) {
-  return /dingtone team|talku team|talkyou team|dingdong team|TalkU number|free calling and messaging|private number order|number order succeeded|order succeeded|number purchase|purchase succeeded|will expire|has expired|expires in|credits?|points?|balance changed|\u53ee\u549a\u56e2\u961f|\u8bf4\u9053\u56e2\u961f|\u7cfb\u7d71\u6d88\u606f|\u7cfb\u7edf\u6d88\u606f|\u8bf4\u9053\u5e01|\u53ee\u549a\u5e01|\u79ef\u5206|\u53f7\u7801\u8ba2\u8d2d|\u8ba2\u8d2d\u6210\u529f|\u8d2d\u4e70\u6210\u529f|\u5373\u5c06\u5230\u671f|\u5df2\u5230\u671f|\u8fc7\u671f|\u7eed\u8d39/i.test(
-    value
-  );
+function resolveNamedTeamName(...values: Array<string | null | undefined>) {
+  const candidates = values
+    .filter((value): value is string => Boolean(value?.trim()))
+    .flatMap((value) => value.split(/[|\n]/))
+    .map((value) => repairUtf8Mojibake(value.trim()) ?? value.trim())
+    .filter(Boolean);
+  for (const candidate of candidates) {
+    if (/^(?:叮咚团队|dingtone\s+team|dingdong\s+team)$/i.test(candidate)) {
+      return "叮咚团队";
+    }
+    if (/^(?:说道团队|talku\s+team|talkyou\s+team)$/i.test(candidate)) {
+      return "说道团队";
+    }
+  }
+  return null;
+}
+
+function resolveHelperTeamName(row: HelperSmsMessageRecord, appVariant: unknown) {
+  const named = resolveNamedTeamName(row.senderId, row.data1, row.conversationId, row.conversationUserId);
+  if (named) {
+    return named;
+  }
+  if (row.conversationType === 4 && row.conversationId === "10000") {
+    return appVariant === "dingdong" ? "叮咚团队" : "说道团队";
+  }
+  return null;
+}
+
+function extractTeamMessageContent(content: string) {
+  const envelope = parseJsonRecord(content);
+  if (!envelope) {
+    return content;
+  }
+  const title = readJsonString(envelope.msgTitle);
+  const body = readJsonString(envelope.msgContent);
+  const meta = parseJsonRecord(readJsonString(envelope.msgMeta));
+  const credits = readFiniteNumber(meta?.credits);
+  if (credits !== null) {
+    return `积分变动：${formatTeamNumber(credits)}`;
+  }
+  if (title && body && !looksLikeJson(body)) {
+    return `${title}\n${body}`;
+  }
+  if (body && !looksLikeJson(body)) {
+    return body;
+  }
+  if (title) {
+    return title;
+  }
+  return content;
+}
+
+function parseJsonRecord(value: string | null | undefined) {
+  if (!value?.trim()) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function readJsonString(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function readFiniteNumber(value: unknown) {
+  const parsed = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatTeamNumber(value: number) {
+  return Number.isInteger(value) ? String(value) : String(value);
+}
+
+function looksLikeJson(value: string) {
+  const text = value.trim();
+  return (text.startsWith("{") && text.endsWith("}")) || (text.startsWith("[") && text.endsWith("]"));
+}
+
+function isKnownSystemConversation(row: HelperSmsMessageRecord) {
+  return row.conversationType !== null && row.conversationType !== undefined && [4, 8, 9, 11].includes(row.conversationType);
 }
 
 async function shouldCollectTeamMessages(options: MessageRuntimeOptions) {
@@ -396,8 +471,10 @@ function parseBooleanSetting(value: string | undefined, fallback: boolean) {
   return !/^(false|0|no|off)$/i.test(value.trim());
 }
 function normalizeHelperReceivedAt(row: HelperSmsMessageRecord) {
-  const candidate = row.time ?? row.timestamp ?? null;
-  if (!candidate || !Number.isFinite(candidate)) {
+  const candidate = [row.time, row.timestamp].find(
+    (value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0
+  );
+  if (candidate === undefined) {
     return new Date();
   }
   return new Date(candidate > 1_000_000_000_000 ? candidate : candidate * 1000);

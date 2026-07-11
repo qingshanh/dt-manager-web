@@ -1,18 +1,28 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { App, Badge, Button, Layout, Menu } from 'antd';
+import { App, Badge, Button, Empty, Grid, Layout, List, Menu, Popover, Segmented, Space, Spin, Tooltip, Typography, theme as antdTheme } from 'antd';
 import type { MenuProps } from 'antd';
 import {
   BellOutlined,
   DashboardOutlined,
+  DesktopOutlined,
   LogoutOutlined,
+  MoonOutlined,
   PlusOutlined,
   SettingOutlined,
+  SunOutlined,
   UserOutlined,
 } from '@ant-design/icons';
 import { useAuthStore } from '../stores/auth';
-import { getRecentMessages, invalidateCachedData } from '../services/endpoints';
+import { useThemeStore, type ThemeMode } from '../stores/theme';
+import {
+  getRecentMessages,
+  getUnreadNotifications,
+  invalidateCachedData,
+  markAllDashboardMessagesRead,
+} from '../services/endpoints';
 import type { RecentMessage, SSENewMessageEvent } from '../types';
+import { MESSAGE_READ_STATE_EVENT } from '../services/ui-events';
 
 const { Header, Sider, Content } = Layout;
 const RECENT_MESSAGE_FALLBACK_POLL_MS = 30_000;
@@ -50,12 +60,22 @@ export default function AppLayout() {
   const logout = useAuthStore((state) => state.logout);
   const user = useAuthStore((state) => state.user);
   const [collapsed, setCollapsed] = useState(false);
+  const screens = Grid.useBreakpoint();
+  const isNarrow = screens.lg === false;
+  const siderCollapsed = isNarrow || collapsed;
   const [notificationCount, setNotificationCount] = useState(0);
+  const [notificationItems, setNotificationItems] = useState<RecentMessage[]>([]);
+  const [notificationLoading, setNotificationLoading] = useState(false);
+  const [bellOpen, setBellOpen] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const seenMessageIdsRef = useRef<Set<number>>(new Set());
   const seenMessageKeysRef = useRef<Set<string>>(new Set());
   const recentBaselineReadyRef = useRef(false);
-  const { notification } = App.useApp();
+  const { message, notification } = App.useApp();
+  const { token } = antdTheme.useToken();
+  const themeMode = useThemeStore((state) => state.mode);
+  const resolvedTheme = useThemeStore((state) => state.resolvedTheme);
+  const setThemeMode = useThemeStore((state) => state.setMode);
   const appVersion = __APP_VERSION__;
 
   const selectedKey = (() => {
@@ -72,23 +92,79 @@ export default function AppLayout() {
     navigate('/login');
   };
 
-  const notifyIncomingMessage = useCallback(
-    (data: SSENewMessageEvent) => {
-      if (data.msgType === 'system') {
-        return;
+  const loadUnreadNotifications = useCallback(async (showLoading = false) => {
+    if (showLoading) {
+      setNotificationLoading(true);
+    }
+    try {
+      const data = await getUnreadNotifications(20);
+      setNotificationCount(data.unread_count);
+      setNotificationItems(data.list);
+    } catch (err) {
+      if (showLoading) {
+        message.error(err instanceof Error ? err.message : '加载未读消息失败');
       }
+    } finally {
+      if (showLoading) {
+        setNotificationLoading(false);
+      }
+    }
+  }, [message]);
+
+  const handleMarkAllNotificationsRead = useCallback(async () => {
+    try {
+      const result = await markAllDashboardMessagesRead();
+      setNotificationCount(0);
+      setNotificationItems([]);
+      message.success(result.updated > 0 ? `已将 ${result.updated} 条消息标记为已读` : '当前没有未读消息');
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '标记已读失败');
+    }
+  }, [message]);
+
+  const rememberIncomingMessage = useCallback((data: SSENewMessageEvent) => {
       if (data.id && seenMessageIdsRef.current.has(data.id)) {
-        return;
+        return false;
       }
       const key = buildMessageKey(data);
       if (seenMessageKeysRef.current.has(key)) {
-        return;
+        return false;
       }
       if (data.id) {
         seenMessageIdsRef.current.add(data.id);
       }
       seenMessageKeysRef.current.add(key);
+      return true;
+  }, []);
+
+  const notifyIncomingMessage = useCallback(
+    (data: SSENewMessageEvent) => {
+      if (data.msgType === 'system') {
+        return;
+      }
       setNotificationCount((count) => count + 1);
+      if (data.id) {
+        const receivedAt = data.receivedAt || new Date().toISOString();
+        const nextNotification: RecentMessage = {
+          id: data.id!,
+          account_id: data.accountId,
+          direction: 'incoming',
+          msg_type: data.msgType === 'verification' || data.msgType === 'mms' || data.msgType === 'system' ? data.msgType : 'sms',
+          from_number: data.from,
+          to_number: data.toNumber,
+          content: data.content,
+          raw_info: null,
+          raw_k3: null,
+          k5_flag: null,
+          is_read: false,
+          telegram_sent: false,
+          telegram_msg_id: null,
+          received_at: receivedAt,
+          created_at: receivedAt,
+          account: { id: data.accountId, nickname: data.accountNickname },
+        };
+        setNotificationItems((current) => [nextNotification, ...current.filter((item) => item.id !== data.id)].slice(0, 20));
+      }
       notification.info({
         message: `新短信 - ${data.accountNickname}`,
         description: `${data.from || '-'}: ${data.content}`,
@@ -105,6 +181,9 @@ export default function AppLayout() {
 
   const handleIncomingMessage = useCallback(
     (data: SSENewMessageEvent) => {
+      if (!rememberIncomingMessage(data)) {
+        return;
+      }
       invalidateCachedData('dashboard:');
       invalidateCachedData('accounts:');
       if (data.accountId) {
@@ -113,7 +192,7 @@ export default function AppLayout() {
       dispatchIncomingMessage(data);
       notifyIncomingMessage(data);
     },
-    [dispatchIncomingMessage, notifyIncomingMessage],
+    [dispatchIncomingMessage, notifyIncomingMessage, rememberIncomingMessage],
   );
 
   const connectSSE = useCallback(() => {
@@ -165,6 +244,17 @@ export default function AppLayout() {
   }, [connectSSE]);
 
   useEffect(() => {
+    void loadUnreadNotifications();
+    const timer = window.setInterval(() => void loadUnreadNotifications(), RECENT_MESSAGE_FALLBACK_POLL_MS);
+    const handleReadStateChange = () => void loadUnreadNotifications();
+    window.addEventListener(MESSAGE_READ_STATE_EVENT, handleReadStateChange);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener(MESSAGE_READ_STATE_EVENT, handleReadStateChange);
+    };
+  }, [loadUnreadNotifications]);
+
+  useEffect(() => {
     let stopped = false;
 
     const rememberRecentMessages = (items: RecentMessage[]) => {
@@ -196,6 +286,7 @@ export default function AppLayout() {
             accountId: item.account_id,
             accountNickname: item.account.nickname,
             from: item.from_number,
+            toNumber: item.to_number,
             content: item.content,
             msgType: item.msg_type,
             receivedAt: item.received_at,
@@ -219,9 +310,66 @@ export default function AppLayout() {
     };
   }, [handleIncomingMessage]);
 
+  const notificationPanel = (
+    <div style={{ width: 'min(320px, calc(100vw - 48px))' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+        <Typography.Text strong>未读消息</Typography.Text>
+        <Button type="link" size="small" disabled={notificationCount === 0} onClick={() => void handleMarkAllNotificationsRead()}>
+          全部已读
+        </Button>
+      </div>
+      {notificationLoading ? (
+        <div style={{ display: 'flex', justifyContent: 'center', padding: 24 }}><Spin /></div>
+      ) : notificationItems.length === 0 ? (
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无未读消息" />
+      ) : (
+        <List
+          size="small"
+          dataSource={notificationItems}
+          style={{ maxHeight: 420, overflowY: 'auto' }}
+          renderItem={(item) => (
+            <List.Item
+              style={{ cursor: 'pointer', alignItems: 'flex-start' }}
+              onClick={() => {
+                setBellOpen(false);
+                navigate(`/accounts/${item.account_id}`);
+              }}
+            >
+              <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                <Space size={6}>
+                  <Typography.Text strong>{item.account.nickname || `账户 #${item.account_id}`}</Typography.Text>
+                  <Typography.Text type="secondary">{item.to_number || '未知接收号码'}</Typography.Text>
+                </Space>
+                <Typography.Text ellipsis>{item.from_number || '-'}：{item.content}</Typography.Text>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>{new Date(item.received_at).toLocaleString()}</Typography.Text>
+              </Space>
+            </List.Item>
+          )}
+        />
+      )}
+    </div>
+  );
+
   return (
-    <Layout style={{ minHeight: '100vh' }}>
-      <Sider collapsible collapsed={collapsed} onCollapse={setCollapsed} theme="dark">
+    <Layout style={{ height: '100vh', overflow: 'hidden', background: token.colorBgLayout }}>
+      <Sider
+        collapsible
+        collapsed={siderCollapsed}
+        onCollapse={(value) => {
+          if (!isNarrow) setCollapsed(value);
+        }}
+        breakpoint="lg"
+        collapsedWidth={64}
+        theme={resolvedTheme === 'dark' ? 'dark' : 'light'}
+        style={{
+          position: 'sticky',
+          top: 0,
+          height: '100vh',
+          overflow: 'hidden',
+          alignSelf: 'flex-start',
+          borderRight: `1px solid ${token.colorBorderSecondary}`,
+        }}
+      >
         <div
           style={{
             height: 48,
@@ -229,53 +377,75 @@ export default function AppLayout() {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            color: '#fff',
+            color: token.colorText,
             fontWeight: 'bold',
-            fontSize: collapsed ? 14 : 18,
+            fontSize: siderCollapsed ? 14 : 18,
             overflow: 'hidden',
             whiteSpace: 'nowrap',
           }}
         >
-          {collapsed ? '说道' : '说道管理平台'}
+          {siderCollapsed ? '说道' : '说道管理平台'}
         </div>
         <div style={{ display: 'flex', minHeight: 'calc(100vh - 112px)', flexDirection: 'column' }}>
-          <Menu theme="dark" mode="inline" selectedKeys={[selectedKey]} items={menuItems} onClick={({ key }) => navigate(key)} />
+          <Menu theme={resolvedTheme === 'dark' ? 'dark' : 'light'} mode="inline" selectedKeys={[selectedKey]} items={menuItems} onClick={({ key }) => navigate(key)} />
           <div
             style={{
               marginTop: 'auto',
-              padding: collapsed ? '12px 0' : '12px 16px',
-              color: 'rgba(255,255,255,0.45)',
+              padding: siderCollapsed ? '12px 0' : '12px 16px',
+              color: token.colorTextSecondary,
               fontSize: 12,
               lineHeight: 1,
               textAlign: 'center',
               whiteSpace: 'nowrap',
             }}
           >
-            {collapsed ? appVersion : `v${appVersion}`}
+            {siderCollapsed ? appVersion : `v${appVersion}`}
           </div>
         </div>
       </Sider>
-      <Layout>
+      <Layout style={{ minWidth: 0, height: '100vh', background: token.colorBgLayout }}>
         <Header
           style={{
-            background: '#fff',
+            background: token.colorBgContainer,
             padding: '0 24px',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'flex-end',
             gap: 16,
-            boxShadow: '0 1px 4px rgba(0,0,0,0.08)',
+            borderBottom: `1px solid ${token.colorBorderSecondary}`,
           }}
         >
-          <Badge count={notificationCount} onClick={() => setNotificationCount(0)}>
-            <BellOutlined style={{ fontSize: 18, cursor: 'pointer' }} />
-          </Badge>
+          <Segmented<ThemeMode>
+            size="small"
+            value={themeMode}
+            onChange={setThemeMode}
+            options={[
+              { value: 'light', label: <Tooltip title="白天模式"><SunOutlined /></Tooltip> },
+              { value: 'dark', label: <Tooltip title="黑夜模式"><MoonOutlined /></Tooltip> },
+              { value: 'system', label: <Tooltip title="跟随系统"><DesktopOutlined /></Tooltip> },
+            ]}
+            aria-label="主题模式"
+          />
+          <Popover
+            content={notificationPanel}
+            trigger="click"
+            placement={siderCollapsed ? 'bottom' : 'bottomRight'}
+            open={bellOpen}
+            onOpenChange={(open) => {
+              setBellOpen(open);
+              if (open) void loadUnreadNotifications(true);
+            }}
+          >
+            <Badge count={notificationCount} overflowCount={99}>
+              <Button type="text" icon={<BellOutlined style={{ fontSize: 18 }} />} aria-label="查看未读消息" />
+            </Badge>
+          </Popover>
           <span>{user?.username}</span>
           <Button type="text" icon={<LogoutOutlined />} onClick={handleLogout}>
             退出
           </Button>
         </Header>
-        <Content style={{ margin: 24 }}>
+        <Content style={{ margin: isNarrow ? 12 : 24, overflowY: 'auto', overflowX: 'hidden', minWidth: 0 }}>
           <Outlet />
         </Content>
       </Layout>

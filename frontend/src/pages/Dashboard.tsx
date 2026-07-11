@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Card, Col, Row, Space, Statistic, Table, Tag, App } from 'antd';
+import { Button, Card, Col, Row, Space, Statistic, Table, Tag, App } from 'antd';
 import {
   UserOutlined,
   CheckCircleOutlined,
@@ -8,14 +8,24 @@ import {
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useNavigate } from 'react-router-dom';
-import { CACHE_TTL_MS, cacheKeys, getDashboardStats, getRecentMessages, isCachedDataFresh, readCachedData } from '../services/endpoints';
+import {
+  CACHE_TTL_MS,
+  cacheKeys,
+  getDashboardStats,
+  getRecentMessages,
+  isCachedDataFresh,
+  markAllDashboardMessagesRead,
+  readCachedData,
+} from '../services/endpoints';
 import type { DashboardStats, RecentMessage } from '../types';
 import dayjs from 'dayjs';
+import { notifyMessageReadStateChanged } from '../services/ui-events';
 
 export default function Dashboard() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [messages, setMessages] = useState<RecentMessage[]>([]);
   const [loading, setLoading] = useState(true);
+  const [markingRead, setMarkingRead] = useState(false);
   const navigate = useNavigate();
   const { message: msg } = App.useApp();
 
@@ -65,6 +75,21 @@ export default function Dashboard() {
     };
   }, [msg]);
 
+  const handleMarkAllRead = async () => {
+    setMarkingRead(true);
+    try {
+      const result = await markAllDashboardMessagesRead();
+      setMessages((items) => items.map((item) => ({ ...item, is_read: true })));
+      setStats((current) => (current ? { ...current, unreadMessages: 0 } : current));
+      notifyMessageReadStateChanged();
+      msg.success(result.updated > 0 ? `已将 ${result.updated} 条消息标记为已读` : '当前没有未读消息');
+    } catch (err) {
+      msg.error(err instanceof Error ? err.message : '标记已读失败');
+    } finally {
+      setMarkingRead(false);
+    }
+  };
+
   const msgColumns: ColumnsType<RecentMessage> = [
     {
       title: '账户',
@@ -91,8 +116,15 @@ export default function Dashboard() {
       render: (v) => v || '-',
     },
     {
+      title: '接收号码',
+      dataIndex: 'to_number',
+      width: 140,
+      render: (v) => v || '-',
+    },
+    {
       title: '内容',
       dataIndex: 'content',
+      width: 320,
       ellipsis: true,
     },
     {
@@ -165,7 +197,15 @@ export default function Dashboard() {
         </Col>
       </Row>
 
-      <Card title="最近消息" style={{ marginTop: 24 }}>
+      <Card
+        title="最近消息"
+        extra={(
+          <Button size="small" icon={<CheckCircleOutlined />} loading={markingRead} onClick={() => void handleMarkAllRead()}>
+            一键全部已读
+          </Button>
+        )}
+        style={{ marginTop: 24 }}
+      >
         <Table
           columns={msgColumns}
           dataSource={messages}
@@ -173,6 +213,7 @@ export default function Dashboard() {
           loading={loading}
           pagination={false}
           size="small"
+          scroll={{ x: 1020 }}
           onRow={(record) => ({
             onClick: () => navigate(`/accounts/${record.account_id}`),
             style: { cursor: 'pointer' },

@@ -322,7 +322,12 @@ async function shouldMergeHelperSnapshot(loginType: string, snapshot: DingtoneSn
   if (mode !== "direct") {
     return true;
   }
-  return !isPositiveNumber(snapshot.primaryBalance) || snapshot.userGrade === undefined || snapshot.validPoint === undefined;
+  return (
+    !normalizeOptionalString(snapshot.phone) ||
+    !isPositiveNumber(snapshot.primaryBalance) ||
+    snapshot.userGrade === undefined ||
+    snapshot.validPoint === undefined
+  );
 }
 
 async function shouldMergeAdbPointSnapshot(loginType: string, snapshot: DingtoneSnapshot) {

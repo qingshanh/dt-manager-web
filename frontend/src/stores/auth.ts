@@ -1,6 +1,16 @@
 import { create } from 'zustand';
 import type { AdminUser } from '../types';
 import * as api from '../services/endpoints';
+import { isUnauthorizedError } from '../services/api';
+
+function readCachedUser(): AdminUser | null {
+  try {
+    const raw = localStorage.getItem('user');
+    return raw ? JSON.parse(raw) as AdminUser : null;
+  } catch {
+    return null;
+  }
+}
 
 interface AuthState {
   token: string | null;
@@ -13,14 +23,7 @@ interface AuthState {
 
 export const useAuthStore = create<AuthState>((set) => ({
   token: localStorage.getItem('token'),
-  user: (() => {
-    try {
-      const raw = localStorage.getItem('user');
-      return raw ? JSON.parse(raw) : null;
-    } catch {
-      return null;
-    }
-  })(),
+  user: readCachedUser(),
   loading: false,
 
   login: async (username, password) => {
@@ -49,14 +52,22 @@ export const useAuthStore = create<AuthState>((set) => ({
   checkAuth: async () => {
     const token = localStorage.getItem('token');
     if (!token) return false;
+    const cachedUser = readCachedUser();
     try {
       const user = await api.getMe();
       if (user) {
         set({ user, token });
         return true;
       }
-    } catch {
-      // token 已过期
+    } catch (error) {
+      if (isUnauthorizedError(error)) {
+        localStorage.removeItem('token');
+        localStorage.removeItem('user');
+        set({ token: null, user: null });
+        return false;
+      }
+      set({ token, user: cachedUser });
+      return Boolean(cachedUser);
     }
     localStorage.removeItem('token');
     localStorage.removeItem('user');

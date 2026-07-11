@@ -1,0 +1,38 @@
+:root {
+  font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+}
+
+.account-table .ant-table {
+  font-size: 12px;
+}
+
+.account-table .ant-table-cell {
+  padding: 7px 5px !important;
+}
+
+.account-table .ant-table-content {
+  overflow-x: hidden !important;
+}
+
+.account-table table {
+  width: 100% !important;
+  min-width: 0 !important;
+}

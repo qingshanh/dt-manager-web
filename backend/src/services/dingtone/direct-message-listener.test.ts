@@ -164,6 +164,12 @@ test("direct socket destroys remote-ended connections", () => {
   assert.match(source, /this\.socket\?\.destroy\(\)/);
   assert.match(source, /Direct gateway socket ended/);
 });
+test("direct listener reconnects after a closed socket instead of treating it as an empty push wait", () => {
+  const waitForPushes = source.slice(source.indexOf("async waitForPushes("), source.indexOf("async close()", source.indexOf("async waitForPushes(")));
+
+  assert.match(waitForPushes, /if \(isSocketClosedError\(error\)\) \{\s*throw error;\s*\}/);
+  assert.match(source, /if \(!socket \|\| this\.closed \|\| socket\.destroyed \|\| !socket\.writable\) \{/);
+});
 test("direct socket yields while draining large buffered frame batches", () => {
   assert.match(source, /const DIRECT_SOCKET_FRAME_BUDGET_PER_TICK = 20/);
   assert.match(source, /private bufferedConsumeScheduled = false/);

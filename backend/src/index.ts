@@ -11,6 +11,7 @@ import { eventsRouter } from "./routes/events.js";
 import { accountsRouter } from "./routes/accounts.js";
 import { codeReceiverRouter } from "./routes/code-receiver.js";
 import { settingsRouter } from "./routes/settings.js";
+import { versionRouter } from "./routes/version.js";
 import { requireAuth } from "./middleware/auth.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { ensureDefaultAdmin } from "./services/admin.service.js";
@@ -81,6 +82,7 @@ app.use("/api/dashboard", requireAuth, dashboardRouter);
 app.use("/api/accounts", requireAuth, accountsRouter);
 app.use("/api/code-receiver", codeReceiverRouter);
 app.use("/api/settings", requireAuth, settingsRouter);
+app.use("/api/version", requireAuth, versionRouter);
 
 app.use(errorHandler);
 

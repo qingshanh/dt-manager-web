@@ -17,6 +17,7 @@ import {
 import { storeHelperSmsMessages, storeParsedSmsPushes } from "./message-runtime.js";
 import { dumpHelperSmsMessages } from "./helper-bridge.js";
 import { dumpSmsMessagesFromAdb } from "./adb-database.js";
+import { exportSessionFromAdbConfig } from "./adb-session.js";
 import { dumpSmsMessagesFromNotifications } from "./adb-notification-ui.js";
 import { dumpSmsMessagesFromUi, openMessagesInbox } from "./adb-message-ui.js";
 import { getGatewayMode, getSettingsMap } from "./settings.service.js";
@@ -29,10 +30,12 @@ type MonitorConfig = {
   maxConcurrentDirectPolls: number;
   appCatchupEnabled: boolean;
   appCatchupIntervalMs: number;
+  appUiFallbackEnabled: boolean;
 };
 
 type MonitorRunner = {
   accountId: number;
+  adminId: number;
   sessionId: number;
   timer: NodeJS.Timeout | null;
   running: boolean;
@@ -45,6 +48,7 @@ type MonitorRunner = {
   maxConcurrentDirectPolls: number;
   appCatchupEnabled: boolean;
   appCatchupIntervalMs: number;
+  appUiFallbackEnabled: boolean;
   lastRefreshAt: number | null;
   lastCyclePreempted: boolean;
   lastCycleUsedDirectSlot: boolean;
@@ -103,6 +107,7 @@ export class AccountMonitorService {
 
     const runner: MonitorRunner = {
       accountId,
+      adminId: account.adminId,
       sessionId: session.id,
       timer: null,
       running: false,
@@ -115,6 +120,7 @@ export class AccountMonitorService {
       maxConcurrentDirectPolls: monitorConfig.maxConcurrentDirectPolls,
       appCatchupEnabled: monitorConfig.appCatchupEnabled,
       appCatchupIntervalMs: monitorConfig.appCatchupIntervalMs,
+      appUiFallbackEnabled: monitorConfig.appUiFallbackEnabled,
       lastRefreshAt: null,
       lastCyclePreempted: false,
       lastCycleUsedDirectSlot: false,
@@ -133,6 +139,7 @@ export class AccountMonitorService {
 
     this.scheduleNext(runner, 0);
     eventBus.emitEvent({
+      adminId: account.adminId,
       type: "account_status",
       payload: { accountId, status: "online" }
     });
@@ -158,7 +165,7 @@ export class AccountMonitorService {
 
     const account = await prisma.dtAccount.findUnique({
       where: { id: accountId },
-      select: { dtUserId: true, dtDeviceId: true, appVariant: true }
+      select: { adminId: true, dtUserId: true, dtDeviceId: true, appVariant: true }
     });
     if (account?.dtUserId) {
       preemptDirectSessionPushListener({
@@ -194,8 +201,9 @@ export class AccountMonitorService {
       }
     });
 
-    if (emitStatus) {
+    if (emitStatus && account) {
       eventBus.emitEvent({
+        adminId: account.adminId,
         type: "account_status",
         payload: { accountId, status: targetStatus }
       });
@@ -424,6 +432,7 @@ export class AccountMonitorService {
     runner.maxConcurrentDirectPolls = latestConfig.maxConcurrentDirectPolls;
     runner.appCatchupEnabled = latestConfig.appCatchupEnabled;
     runner.appCatchupIntervalMs = latestConfig.appCatchupIntervalMs;
+    runner.appUiFallbackEnabled = latestConfig.appUiFallbackEnabled;
     runner.lastCycleUsedDirectSlot = false;
     runner.lastCycleSkippedDirectSlot = false;
 
@@ -488,10 +497,12 @@ export class AccountMonitorService {
         }
       });
       eventBus.emitEvent({
+        adminId: runner.adminId,
         type: "heartbeat",
         payload: { time: new Date().toISOString(), accountId: runner.accountId }
       });
       eventBus.emitEvent({
+        adminId: runner.adminId,
         type: "account_status",
         payload: { accountId: runner.accountId, status: "online" }
       });
@@ -542,6 +553,7 @@ export class AccountMonitorService {
           }
         });
         eventBus.emitEvent({
+          adminId: runner.adminId,
           type: "account_status",
           payload: { accountId: runner.accountId, status: "expired", message }
         });
@@ -568,6 +580,7 @@ export class AccountMonitorService {
             }
       });
       eventBus.emitEvent({
+        adminId: runner.adminId,
         type: "account_status",
         payload: shouldSurfaceTransientError
           ? {
@@ -606,6 +619,7 @@ export class AccountMonitorService {
     const maxRetryCount = parsePositiveIntSetting(settings.max_retry_count, config.DEFAULT_MAX_RETRY_COUNT);
     const maxConcurrentDirectPolls = parsePositiveIntSetting(settings.direct_monitor_max_concurrent, 10);
     const appCatchupEnabled = parseBooleanSetting(settings.direct_monitor_app_catchup_enabled, true);
+    const appUiFallbackEnabled = parseBooleanSetting(settings.direct_monitor_app_ui_fallback_enabled, false);
     const appCatchupIntervalSeconds = parsePositiveIntSetting(settings.direct_monitor_app_catchup_seconds, 45);
     return {
       pollIntervalMs: Math.max(15_000, pollIntervalSeconds * 1000),
@@ -614,7 +628,8 @@ export class AccountMonitorService {
       maxRetryCount: Math.max(1, maxRetryCount),
       maxConcurrentDirectPolls,
       appCatchupEnabled,
-      appCatchupIntervalMs: Math.max(15_000, appCatchupIntervalSeconds * 1000)
+      appCatchupIntervalMs: Math.max(15_000, appCatchupIntervalSeconds * 1000),
+      appUiFallbackEnabled
     };
   }
 
@@ -703,7 +718,9 @@ export class AccountMonitorService {
       }
       appCatchupInFlight = true;
       try {
-        const result = await this.pollAppFallbackMessages(runner, account.appVariant);
+        const result = await runSerializedAppFallbackScan(() =>
+          this.pollAppFallbackMessages(runner, account)
+        );
         appCatchupScanned += result.scanned;
         appCatchupImported += result.imported;
         appCatchupSource = result.source ?? source;
@@ -781,6 +798,32 @@ export class AccountMonitorService {
           offlineCatchupSendCount = status.sendCount;
           offlineCatchupError = status.error;
           await updateLiveDiagnostic(true);
+        },
+        onWebOfflineMessages: async (rows, status) => {
+          if (rows.length === 0) {
+            if (status.error) {
+              logger.debug("Direct monitor web offline catch-up returned no messages", {
+                accountId: runner.accountId,
+                host: status.host,
+                reason: status.reason,
+                error: status.error
+              });
+            }
+            return;
+          }
+          const imported = await storeHelperSmsMessages(runner.accountId, rows, {
+            collectTeamMessages: true
+          });
+          if (imported > 0) {
+            createdMessages += imported;
+            await updateLiveDiagnostic(true);
+            logger.info("Direct monitor imported web offline team messages", {
+              accountId: runner.accountId,
+              host: status.host,
+              scanned: rows.length,
+              imported
+            });
+          }
         },
         onFrame: async (push, host) => {
           liveState.host = host;
@@ -889,24 +932,16 @@ export class AccountMonitorService {
     return rows.length > 0 ? await storeHelperSmsMessages(runner.accountId, rows) : 0;
   }
 
-  private async pollAppFallbackMessages(runner: MonitorRunner, appVariant: AppVariant) {
-    const limit = Math.max(20, runner.maxRetryCount * 20);
-    const notificationRows = await dumpSmsMessagesFromNotifications(limit, appVariant).catch(() => []);
-    if (notificationRows.length > 0) {
-      const imported = await storeHelperSmsMessages(runner.accountId, notificationRows).catch(() => 0);
-      if (imported > 0) {
-        return { source: "notification-ui", scanned: notificationRows.length, imported };
-      }
+  private async pollAppFallbackMessages(
+    runner: MonitorRunner,
+    account: { dtUserId: string; appVariant: AppVariant }
+  ) {
+    const appVariant = account.appVariant;
+    const session = await exportSessionFromAdbConfig(appVariant).catch(() => null);
+    if (!session || session.dtUserId !== account.dtUserId) {
+      return { source: "app-session-mismatch", scanned: 0, imported: 0 };
     }
-
-    await openMessagesInbox(appVariant).catch((error) => {
-      logger.warn("Direct monitor app fallback failed to open app messages inbox", {
-        accountId: runner.accountId,
-        appVariant,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    });
-
+    const limit = Math.max(20, runner.maxRetryCount * 20);
     const helperRows = await dumpHelperSmsMessages(limit, appVariant, 8_000).catch(() => []);
     if (helperRows.length > 0) {
       const imported = await storeHelperSmsMessages(runner.accountId, helperRows).catch(() => 0);
@@ -922,6 +957,30 @@ export class AccountMonitorService {
         return { source: "adb-db", scanned: adbRows.length, imported };
       }
     }
+
+    if (!runner.appUiFallbackEnabled) {
+      return {
+        source: helperRows.length > 0 ? "helper-db" : adbRows.length > 0 ? "adb-db" : "read-only-empty",
+        scanned: helperRows.length + adbRows.length,
+        imported: 0
+      };
+    }
+
+    const notificationRows = await dumpSmsMessagesFromNotifications(limit, appVariant).catch(() => []);
+    if (notificationRows.length > 0) {
+      const imported = await storeHelperSmsMessages(runner.accountId, notificationRows).catch(() => 0);
+      if (imported > 0) {
+        return { source: "notification-ui", scanned: notificationRows.length, imported };
+      }
+    }
+
+    await openMessagesInbox(appVariant).catch((error) => {
+      logger.warn("Direct monitor app UI fallback failed to open messages inbox", {
+        accountId: runner.accountId,
+        appVariant,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
 
     const uiRows = filterFreshUiSmsRows(await dumpSmsMessagesFromUi(limit, appVariant).catch(() => []));
     if (uiRows.length > 0) {
@@ -947,7 +1006,7 @@ function shouldScheduleAppCatchupForFrame(state: DirectMonitorFrameState) {
   return state.smsPushes === 0 && (state.missedStatus0103Sample !== null || state.nonSmsPushFrames >= 2);
 }
 function filterFreshUiSmsRows(rows: Awaited<ReturnType<typeof dumpSmsMessagesFromUi>>) {
-  const freshSince = Date.now() - 30 * 60_000;
+  const freshSince = Date.now() - 7 * 24 * 60 * 60_000;
   return rows.filter((row) => {
     if (row.data3 !== "adb-ui") {
       return true;

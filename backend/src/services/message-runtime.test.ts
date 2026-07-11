@@ -126,26 +126,26 @@ test("stores direct SMS pushes with the same sender and content when target phon
   const imported = await storeParsedSmsPushes(
     1,
     [
-      { msgType: 25, fromNumber: "SiliconFlow", toNumber: "18188815435", content: "Your code is 1087", rawK3: "k3-a" },
-      { msgType: 25, fromNumber: "SiliconFlow", toNumber: "33755520480", content: "Your code is 1087", rawK3: "k3-b" }
+      { msgType: 25, fromNumber: "SiliconFlow", toNumber: "12025550101", content: "Your code is 1087", rawK3: "k3-a" },
+      { msgType: 25, fromNumber: "SiliconFlow", toNumber: "33199000001", content: "Your code is 1087", rawK3: "k3-b" }
     ],
     { db: runtime.db as any, emitEvents: false, sendTelegram: false }
   );
 
   assert.equal(imported, 2);
-  assert.deepEqual(runtime.messages.map((message) => message.toNumber), ["18188815435", "33755520480"]);
+  assert.deepEqual(runtime.messages.map((message) => message.toNumber), ["12025550101", "33199000001"]);
 });
 
 test("does not treat an unknown helper target as a duplicate of a confirmed target", async () => {
   const runtime = createMessageRuntimeDb();
   runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
-  runtime.phones.set(1, [{ phoneNumber: "18188815435" }, { phoneNumber: "33755520480" }]);
+  runtime.phones.set(1, [{ phoneNumber: "12025550101" }, { phoneNumber: "33199000001" }]);
 
   const imported = await storeHelperSmsMessages(
     1,
     [
       {
-        conversationId: "18188815435|SiliconFlow",
+        conversationId: "12025550101|SiliconFlow",
         senderId: "SiliconFlow",
         msgId: "helper-a",
         content: "Your code is 1087",
@@ -186,6 +186,29 @@ test("stores team messages as read system messages", async () => {
   assert.equal(runtime.messages[0]?.isRead, true);
 });
 
+test("does not classify a regular message as a team message from its content", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+
+  const imported = await storeParsedSmsPushes(
+    1,
+    [
+      {
+        msgType: 561,
+        fromNumber: "Service Notice",
+        toNumber: null,
+        content: "Dingtone Team will perform maintenance tonight.",
+        rawK3: "ordinary-message-mentions-team"
+      }
+    ],
+    { db: runtime.db as any, emitEvents: false, sendTelegram: false }
+  );
+
+  assert.equal(imported, 1);
+  assert.equal(runtime.messages[0]?.msgType, MessageType.sms);
+  assert.equal(runtime.messages[0]?.isRead, false);
+});
+
 test("skips team messages when collection is disabled", async () => {
   const runtime = createMessageRuntimeDb();
   runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
@@ -207,20 +230,116 @@ test("skips team messages when collection is disabled", async () => {
   assert.equal(imported, 0);
   assert.equal(runtime.messages.length, 0);
 });
+
+test("stores the named DingDong team conversation as a system message", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, appVariant: "dingdong", nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+
+  const imported = await storeHelperSmsMessages(
+    1,
+    [
+      {
+        conversationType: 4,
+        conversationId: "10000",
+        senderId: "service-10001",
+        msgId: "secretary-a",
+        content: "A new benefit is available in your account.",
+        time: 1_800_000_000_000
+      }
+    ],
+    { db: runtime.db as any, emitEvents: false, sendTelegram: false, collectTeamMessages: true }
+  );
+
+  assert.equal(imported, 1);
+  assert.equal(runtime.messages[0]?.msgType, MessageType.system);
+  assert.equal(runtime.messages[0]?.fromNumber, "叮咚团队");
+  assert.equal(runtime.messages[0]?.isRead, true);
+});
+
+test("extracts a TalkU team credit message from its real secretary envelope", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, appVariant: "dingtone", nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+
+  const imported = await storeHelperSmsMessages(
+    1,
+    [
+      {
+        conversationType: 4,
+        conversationId: "10000",
+        conversationUserId: "10000",
+        type: 531,
+        senderId: "2684354560",
+        msgId: "talku-credit-envelope",
+        content: "{\"msgContent\":\"\",\"msgTitle\":\"\",\"msgMeta\":\"{\\\"k1\\\":531,\\\"credits\\\":20.0,\\\"bc\\\":20.0,\\\"adType\\\":0,\\\"ex\\\":90,\\\"type\\\":34}\"}",
+        time: 1_800_000_000_000
+      }
+    ],
+    { db: runtime.db as any, emitEvents: false, sendTelegram: false, collectTeamMessages: true }
+  );
+
+  assert.equal(imported, 1);
+  assert.equal(runtime.messages[0]?.msgType, MessageType.system);
+  assert.equal(runtime.messages[0]?.fromNumber, "说道团队");
+  assert.equal(runtime.messages[0]?.content, "积分变动：20");
+});
+
+test("does not import non-team system conversations into the team message list", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, appVariant: "dingdong", nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+
+  const imported = await storeHelperSmsMessages(
+    1,
+    [
+      {
+        conversationType: 11,
+        conversationId: "10001",
+        msgId: "activity-center",
+        content: "You have free credits to receive.",
+        timestamp: 1_800_000_000_000
+      }
+    ],
+    { db: runtime.db as any, emitEvents: false, sendTelegram: false, collectTeamMessages: true }
+  );
+
+  assert.equal(imported, 0);
+  assert.equal(runtime.messages.length, 0);
+});
+
+test("uses timestamp when helper time is zero", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+  const timestamp = 1_800_000_000_000;
+
+  await storeHelperSmsMessages(
+    1,
+    [
+      {
+        conversationType: 3,
+        msgId: "timestamp-fallback",
+        content: "System tips",
+        time: 0,
+        timestamp
+      }
+    ],
+    { db: runtime.db as any, emitEvents: false, sendTelegram: false, collectTeamMessages: true }
+  );
+
+  assert.equal(runtime.messages[0]?.receivedAt.getTime(), timestamp);
+});
 test("infers direct SMS target from owned phones in raw push metadata", async () => {
   const runtime = createMessageRuntimeDb();
   runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
-  runtime.phones.set(1, [{ phoneNumber: "+33755520480" }]);
+  runtime.phones.set(1, [{ phoneNumber: "+33199000001" }]);
 
   const imported = await storeParsedSmsPushes(
     1,
     [
       {
         msgType: 561,
-        fromNumber: "(669) 999-8659",
+        fromNumber: "(202) 555-0102",
         toNumber: null,
         content: "Your verification code is 123456",
-        rawInfo: Buffer.from("target=33755520480 dtId 170530439", "utf8").toString("base64"),
+        rawInfo: Buffer.from("target=33199000001 dtId 170530439", "utf8").toString("base64"),
         rawK3: "direct-target-a"
       }
     ],
@@ -228,7 +347,7 @@ test("infers direct SMS target from owned phones in raw push metadata", async ()
   );
 
   assert.equal(imported, 1);
-  assert.equal(runtime.messages[0]?.toNumber, "+33755520480");
+  assert.equal(runtime.messages[0]?.toNumber, "+33199000001");
 });
 
 test("routes direct SMS pushes to the local account that owns the target phone", async () => {
@@ -253,8 +372,8 @@ test("routes direct SMS pushes to the local account that owns the target phone",
     dtUserId: "shared-user",
     telegramNotify: false
   });
-  runtime.phones.set(1, [{ phoneNumber: "+18188815435" }]);
-  runtime.phones.set(2, [{ phoneNumber: "+33755520480" }]);
+  runtime.phones.set(1, [{ phoneNumber: "+12025550101" }]);
+  runtime.phones.set(2, [{ phoneNumber: "+33199000001" }]);
 
   const imported = await storeParsedSmsPushes(
     1,
@@ -262,7 +381,7 @@ test("routes direct SMS pushes to the local account that owns the target phone",
       {
         msgType: 561,
         fromNumber: "SiliconFlow",
-        toNumber: "33755520480",
+        toNumber: "33199000001",
         content: "Your code is 1087",
         rawK3: "cross-account-target"
       }
@@ -272,22 +391,22 @@ test("routes direct SMS pushes to the local account that owns the target phone",
 
   assert.equal(imported, 1);
   assert.equal(runtime.messages[0]?.accountId, 2);
-  assert.equal(runtime.messages[0]?.toNumber, "+33755520480");
+  assert.equal(runtime.messages[0]?.toNumber, "+33199000001");
 });
 test("does not infer direct SMS target from sender-only raw metadata", async () => {
   const runtime = createMessageRuntimeDb();
   runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
-  runtime.phones.set(1, [{ phoneNumber: "+16699998659" }]);
+  runtime.phones.set(1, [{ phoneNumber: "+16695550102" }]);
 
   const imported = await storeParsedSmsPushes(
     1,
     [
       {
         msgType: 561,
-        fromNumber: "(669) 999-8659",
+        fromNumber: "(669) 555-0102",
         toNumber: null,
         content: "Your verification code is 654321",
-        rawInfo: Buffer.from("who 16699998659", "utf8").toString("base64"),
+        rawInfo: Buffer.from("who 16695550102", "utf8").toString("base64"),
         rawK3: "direct-sender-only-a"
       }
     ],
@@ -300,14 +419,14 @@ test("does not infer direct SMS target from sender-only raw metadata", async () 
 test("does not infer helper SMS target from differently formatted sender", async () => {
   const runtime = createMessageRuntimeDb();
   runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
-  runtime.phones.set(1, [{ phoneNumber: "+16699998659" }]);
+  runtime.phones.set(1, [{ phoneNumber: "+12025550102" }]);
 
   const imported = await storeHelperSmsMessages(
     1,
     [
       {
-        conversationId: "16699998659|(669) 999-8659",
-        senderId: "(669) 999-8659",
+        conversationId: "12025550102|(202) 555-0102",
+        senderId: "(202) 555-0102",
         msgId: "helper-sender-only",
         content: "Your verification code is 246810",
         time: 1_800_000_000_000
@@ -342,8 +461,8 @@ test("routes direct SMS pushes across different dt_user_id accounts when the tar
     dtUserId: "user-two",
     telegramNotify: false
   });
-  runtime.phones.set(1, [{ phoneNumber: "+18188815435" }]);
-  runtime.phones.set(2, [{ phoneNumber: "+33755520480" }]);
+  runtime.phones.set(1, [{ phoneNumber: "+12025550101" }]);
+  runtime.phones.set(2, [{ phoneNumber: "+33199000001" }]);
 
   const imported = await storeParsedSmsPushes(
     1,
@@ -351,7 +470,7 @@ test("routes direct SMS pushes across different dt_user_id accounts when the tar
       {
         msgType: 561,
         fromNumber: "SiliconFlow",
-        toNumber: "33755520480",
+        toNumber: "33199000001",
         content: "Your code is 1087",
         rawK3: "cross-dt-user-target"
       }
@@ -361,7 +480,7 @@ test("routes direct SMS pushes across different dt_user_id accounts when the tar
 
   assert.equal(imported, 1);
   assert.equal(runtime.messages[0]?.accountId, 2);
-  assert.equal(runtime.messages[0]?.toNumber, "+33755520480");
+  assert.equal(runtime.messages[0]?.toNumber, "+33199000001");
 });
 
 test("routes helper SMS messages across different dt_user_id accounts when the target phone is unique", async () => {
@@ -386,14 +505,14 @@ test("routes helper SMS messages across different dt_user_id accounts when the t
     dtUserId: "user-two",
     telegramNotify: false
   });
-  runtime.phones.set(1, [{ phoneNumber: "+61488827125" }]);
-  runtime.phones.set(2, [{ phoneNumber: "+447897075155" }]);
+  runtime.phones.set(1, [{ phoneNumber: "+61491570006" }]);
+  runtime.phones.set(2, [{ phoneNumber: "+447700900123" }]);
 
   const imported = await storeHelperSmsMessages(
     1,
     [
       {
-        conversationId: "447897075155|SiliconFlow",
+        conversationId: "447700900123|SiliconFlow",
         senderId: "SiliconFlow",
         msgId: "helper-cross-dt-user-target",
         content: "Your code is 224466",
@@ -405,7 +524,7 @@ test("routes helper SMS messages across different dt_user_id accounts when the t
 
   assert.equal(imported, 1);
   assert.equal(runtime.messages[0]?.accountId, 2);
-  assert.equal(runtime.messages[0]?.toNumber, "+447897075155");
+  assert.equal(runtime.messages[0]?.toNumber, "+447700900123");
 });
 test("routes UK local-format owned numbers when direct pushes include country code", async () => {
   const runtime = createMessageRuntimeDb();
@@ -429,8 +548,8 @@ test("routes UK local-format owned numbers when direct pushes include country co
     dtUserId: "user-two",
     telegramNotify: false
   });
-  runtime.phones.set(1, [{ phoneNumber: "7897075155" }]);
-  runtime.phones.set(2, [{ phoneNumber: "7441399192" }]);
+  runtime.phones.set(1, [{ phoneNumber: "7700900124" }]);
+  runtime.phones.set(2, [{ phoneNumber: "7700900123" }]);
 
   const imported = await storeParsedSmsPushes(
     1,
@@ -438,7 +557,7 @@ test("routes UK local-format owned numbers when direct pushes include country co
       {
         msgType: 1,
         fromNumber: "SiliconFlow",
-        toNumber: "+447441399192",
+        toNumber: "+447700900123",
         content: "Your code is 118899",
         rawK3: "uk-local-direct"
       }
@@ -448,7 +567,7 @@ test("routes UK local-format owned numbers when direct pushes include country co
 
   assert.equal(imported, 1);
   assert.equal(runtime.messages[0]?.accountId, 2);
-  assert.equal(runtime.messages[0]?.toNumber, "7441399192");
+  assert.equal(runtime.messages[0]?.toNumber, "7700900123");
 });
 
 test("routes UK local-format owned numbers when helper rows include country code", async () => {
@@ -473,14 +592,14 @@ test("routes UK local-format owned numbers when helper rows include country code
     dtUserId: "user-two",
     telegramNotify: false
   });
-  runtime.phones.set(1, [{ phoneNumber: "7897075155" }]);
-  runtime.phones.set(2, [{ phoneNumber: "7441399192" }]);
+  runtime.phones.set(1, [{ phoneNumber: "7700900124" }]);
+  runtime.phones.set(2, [{ phoneNumber: "7700900123" }]);
 
   const imported = await storeHelperSmsMessages(
     1,
     [
       {
-        conversationId: "447441399192|SiliconFlow",
+        conversationId: "447700900123|SiliconFlow",
         senderId: "SiliconFlow",
         msgId: "uk-local-helper",
         content: "Your code is 118899",
@@ -492,7 +611,7 @@ test("routes UK local-format owned numbers when helper rows include country code
 
   assert.equal(imported, 1);
   assert.equal(runtime.messages[0]?.accountId, 2);
-  assert.equal(runtime.messages[0]?.toNumber, "7441399192");
+  assert.equal(runtime.messages[0]?.toNumber, "7700900123");
 });
 test("direct SMS storage emits local events before async telegram delivery", () => {
   const source = readFileSync(new URL("./message-runtime.ts", import.meta.url), "utf8");
@@ -515,7 +634,7 @@ test("repairs mojibake sender labels recovered from direct SMS content", async (
 
   const imported = await storeParsedSmsPushes(
     1,
-    [{ msgType: 25, fromNumber: "纭呭熀娴佸姩", toNumber: "61488827125", content: "[纭呭熀娴佸姩]Verification code is: 306497", rawK3: "k3-mojibake-sender" }],
+    [{ msgType: 25, fromNumber: "纭呭熀娴佸姩", toNumber: "61491570006", content: "[纭呭熀娴佸姩]Verification code is: 306497", rawK3: "k3-mojibake-sender" }],
     { db: runtime.db as any, emitEvents: false, sendTelegram: false }
   );
 

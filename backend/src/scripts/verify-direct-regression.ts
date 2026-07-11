@@ -772,7 +772,7 @@ function checkTelegramBotPhoneActionNotes() {
   return {
     name: "telegram_bot_phone_action_notes",
     ok:
-      renew.includes("merging the returned phone record") &&
+      renew.includes("expiry time advanced") &&
       pause.includes("status became paused") &&
       resume.includes("status became active") &&
       cancel.includes("disappeared or returned cancelled"),
@@ -1753,7 +1753,7 @@ function checkPhoneTelegramNotifications() {
     phone: { ...basePhone, status: "active" },
     action: "renew",
     verificationSource: "remote_phone_list",
-    verificationNote: "Action was confirmed by polling the remote purchased phone list and merging the returned phone record."
+    verificationNote: "Action was confirmed by polling the remote purchased phone list until the expiry time advanced."
   });
   const cancelText = buildPhoneTelegramNotificationText({
     account,
@@ -1776,7 +1776,7 @@ function checkPhoneTelegramNotifications() {
       renewText.includes("缁垂鍙风爜") &&
       renewText.includes("鎵嬫満鍙凤細33700000000") &&
       renewText.includes("鍙风爜鐘舵€侊細active") &&
-      renewText.includes("merging the returned phone record") &&
+      renewText.includes("expiry time advanced") &&
       cancelText.includes("鍙栨秷鍙风爜") &&
       cancelText.includes("鍙风爜鐘舵€侊細cancelled") &&
       cancelText.includes("disappeared or returned cancelled"),

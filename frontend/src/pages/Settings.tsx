@@ -4,20 +4,24 @@ import {
   App,
   Button,
   Card,
+  Collapse,
   Descriptions,
   Divider,
   Form,
   Input,
   InputNumber,
+  List,
   Select,
   Space,
   Switch,
   Tabs,
   Tag,
+  Typography,
+  theme as antdTheme,
 } from 'antd';
-import { ApiOutlined, CloudServerOutlined, RobotOutlined } from '@ant-design/icons';
-import { CACHE_TTL_MS, cacheKeys, getSettings, isCachedDataFresh, readCachedData, testTelegram, updateSettings } from '../services/endpoints';
-import type { SettingItem } from '../types';
+import { ApiOutlined, CloudServerOutlined, ReloadOutlined, RobotOutlined } from '@ant-design/icons';
+import { CACHE_TTL_MS, cacheKeys, getSettings, getVersionInfo, isCachedDataFresh, readCachedData, testTelegram, updateSettings } from '../services/endpoints';
+import type { SettingItem, VersionInfo } from '../types';
 
 type GatewayMode = 'mock' | 'real' | 'bridge' | 'direct';
 
@@ -69,7 +73,10 @@ export default function Settings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
+  const [versionLoading, setVersionLoading] = useState(false);
   const { message } = App.useApp();
+  const { token } = antdTheme.useToken();
 
   const [telegramForm] = Form.useForm();
   const [serverForm] = Form.useForm();
@@ -112,6 +119,23 @@ export default function Settings() {
     };
   }, [generalForm, message, serverForm, telegramForm]);
 
+  const loadVersionInfo = async (force = false) => {
+    setVersionLoading(true);
+    try {
+      setVersionInfo(await getVersionInfo(force));
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '版本检测失败');
+    } finally {
+      setVersionLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadVersionInfo();
+    // Version state is independent from editable settings.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleSave = async (values: Record<string, string | number | boolean>) => {
     setSaving(true);
     try {
@@ -150,18 +174,24 @@ export default function Settings() {
       <h2 style={{ marginBottom: 24 }}>系统设置</h2>
 
       <Tabs
-        defaultActiveKey="server"
+        defaultActiveKey="general"
         items={[
           {
             key: 'server',
-            forceRender: true,
             label: (
               <span>
-                <CloudServerOutlined /> 网关与连接
+                <CloudServerOutlined /> 高级设置
               </span>
             ),
             children: (
-              <Card loading={loading}>
+              <Collapse
+                defaultActiveKey={[]}
+                items={[
+                  {
+                    key: 'advanced-connection',
+                    label: '高级设置：网关、直连与抓包模板',
+                    children: (
+              <Card loading={loading} bordered={false}>
                 <Alert
                   type="info"
                   showIcon
@@ -187,12 +217,12 @@ export default function Settings() {
                     />
                   </Form.Item>
 
-                  <Card size="small" style={{ marginBottom: 16, background: '#fafafa' }}>
+                  <Card size="small" style={{ marginBottom: 16, background: token.colorFillAlter }}>
                     <Space direction="vertical" size={4}>
                       <div>
                         当前模式：<Tag color={activeModeMeta.color}>{activeModeMeta.label}</Tag>
                       </div>
-                      <div style={{ color: '#666' }}>{activeModeMeta.description}</div>
+                      <Typography.Text type="secondary">{activeModeMeta.description}</Typography.Text>
                     </Space>
                   </Card>
 
@@ -330,14 +360,17 @@ export default function Settings() {
                   </Button>
                 </Form>
               </Card>
+                    ),
+                  },
+                ]}
+              />
             ),
           },
           {
             key: 'telegram',
-            forceRender: true,
             label: (
               <span>
-                <RobotOutlined /> Telegram 通知
+                <RobotOutlined /> 电报通知
               </span>
             ),
             children: (
@@ -387,10 +420,9 @@ export default function Settings() {
           },
           {
             key: 'general',
-            forceRender: true,
             label: (
               <span>
-                <ApiOutlined /> 通用设置
+                <ApiOutlined /> 常规设置
               </span>
             ),
             children: (
@@ -408,34 +440,48 @@ export default function Settings() {
                   >
                     <Switch checkedChildren="获取" unCheckedChildren="忽略" />
                   </Form.Item>
-                  <Form.Item label="消息轮询间隔（秒）" name="message_poll_interval">
-                    <InputNumber min={10} max={600} style={{ width: '100%' }} />
-                  </Form.Item>
-                  <Form.Item label="Direct 短信监听窗口（秒）" name="direct_message_listen_seconds">
-                    <InputNumber min={10} max={1800} style={{ width: '100%' }} />
-                  </Form.Item>
-                  <Form.Item label="Direct 手动刷新等待（秒）" name="direct_message_refresh_wait_seconds">
-                    <InputNumber min={10} max={120} style={{ width: '100%' }} />
-                  </Form.Item>
                   <Form.Item label="自动刷新间隔（秒）" name="auto_refresh_interval">
                     <InputNumber min={60} max={3600} style={{ width: '100%' }} />
                   </Form.Item>
-                  <Form.Item label="最大重试次数" name="max_retry_count">
-                    <InputNumber min={1} max={20} style={{ width: '100%' }} />
-                  </Form.Item>
-                  <Form.Item label="启动监听恢复间隔（秒）" name="monitor_restore_delay">
-                    <InputNumber min={1} max={300} style={{ width: '100%' }} />
-                  </Form.Item>
-                  <Form.Item label="日志级别" name="log_level">
-                    <Select
-                      options={[
-                        { value: 'debug', label: 'Debug' },
-                        { value: 'info', label: 'Info' },
-                        { value: 'warn', label: 'Warn' },
-                        { value: 'error', label: 'Error' },
-                      ]}
-                    />
-                  </Form.Item>
+                  <Collapse
+                    defaultActiveKey={[]}
+                    style={{ marginBottom: 16 }}
+                    items={[
+                      {
+                        key: 'advanced-monitor',
+                        label: '高级监听参数',
+                        children: (
+                          <>
+                            <Form.Item label="消息轮询间隔（秒）" name="message_poll_interval">
+                              <InputNumber min={10} max={600} style={{ width: '100%' }} />
+                            </Form.Item>
+                            <Form.Item label="Direct 短信监听窗口（秒）" name="direct_message_listen_seconds">
+                              <InputNumber min={10} max={1800} style={{ width: '100%' }} />
+                            </Form.Item>
+                            <Form.Item label="Direct 手动刷新等待（秒）" name="direct_message_refresh_wait_seconds">
+                              <InputNumber min={8} max={120} style={{ width: '100%' }} />
+                            </Form.Item>
+                            <Form.Item label="最大重试次数" name="max_retry_count">
+                              <InputNumber min={1} max={20} style={{ width: '100%' }} />
+                            </Form.Item>
+                            <Form.Item label="启动监听恢复间隔（秒）" name="monitor_restore_delay">
+                              <InputNumber min={1} max={300} style={{ width: '100%' }} />
+                            </Form.Item>
+                            <Form.Item label="日志级别" name="log_level">
+                              <Select
+                                options={[
+                                  { value: 'debug', label: 'Debug' },
+                                  { value: 'info', label: 'Info' },
+                                  { value: 'warn', label: 'Warn' },
+                                  { value: 'error', label: 'Error' },
+                                ]}
+                              />
+                            </Form.Item>
+                          </>
+                        ),
+                      },
+                    ]}
+                  />
                   <Button type="primary" htmlType="submit" loading={saving}>
                     保存
                   </Button>
@@ -457,7 +503,42 @@ export default function Settings() {
                   </Descriptions.Item>
                   <Descriptions.Item label="模式说明">{activeModeMeta.description}</Descriptions.Item>
                   <Descriptions.Item label="API 端口">{settingsMap.PORT || '5174'}</Descriptions.Item>
+                  <Descriptions.Item label="当前版本">{versionInfo?.build_version || __APP_VERSION__}</Descriptions.Item>
+                  <Descriptions.Item label="当前提交">{versionInfo?.commit_sha || '-'}</Descriptions.Item>
+                  <Descriptions.Item label="最新远端提交">
+                    {versionInfo?.latest_version ? (
+                      <Space wrap>
+                        <Typography.Text code>{versionInfo.latest_version.short_sha}</Typography.Text>
+                        <span>{versionInfo.latest_version.title}</span>
+                        <Typography.Text type="secondary">
+                          {versionInfo.latest_version.committed_at ? new Date(versionInfo.latest_version.committed_at).toLocaleString() : '-'}
+                        </Typography.Text>
+                      </Space>
+                    ) : '-'}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="更新分支">{versionInfo ? `${versionInfo.repository}@${versionInfo.update_branch}` : '-'}</Descriptions.Item>
+                  <Descriptions.Item label="更新状态">
+                    {versionInfo?.update_available === true ? <Tag color="orange">发现更新</Tag> : versionInfo?.update_available === false ? <Tag color="green">已是最新</Tag> : <Tag>无法比较</Tag>}
+                  </Descriptions.Item>
                 </Descriptions>
+                <Space style={{ marginTop: 16 }}>
+                  <Button icon={<ReloadOutlined />} loading={versionLoading} onClick={() => void loadVersionInfo(true)}>检测更新</Button>
+                  {versionInfo?.check_error ? <Typography.Text type="warning">{versionInfo.check_error}</Typography.Text> : null}
+                </Space>
+                <List
+                  style={{ marginTop: 16 }}
+                  header={<Typography.Text strong>最近版本</Typography.Text>}
+                  dataSource={versionInfo?.recent_versions ?? []}
+                  locale={{ emptyText: '暂无版本记录' }}
+                  renderItem={(item) => (
+                    <List.Item>
+                      <List.Item.Meta
+                        title={<Space><Typography.Text code>{item.short_sha}</Typography.Text><span>{item.title}</span></Space>}
+                        description={item.committed_at ? new Date(item.committed_at).toLocaleString() : '-'}
+                      />
+                    </List.Item>
+                  )}
+                />
               </Card>
             ),
           },

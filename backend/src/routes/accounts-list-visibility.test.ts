@@ -45,7 +45,8 @@ test("retries verification-code send with the other app on app ownership failure
 test("message list filters can isolate and exclude system messages", () => {
   assert.deepEqual(buildMessagesWhereForTest(7, { page: 1, pageSize: 20, msg_type: MessageType.system }), {
     accountId: 7,
-    msgType: MessageType.system
+    msgType: MessageType.system,
+    fromNumber: { in: ["叮咚团队", "说道团队"] }
   });
   assert.deepEqual(buildMessagesWhereForTest(7, { page: 1, pageSize: 20, exclude_system: true }), {
     accountId: 7,

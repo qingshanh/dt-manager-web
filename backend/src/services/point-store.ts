@@ -1,8 +1,10 @@
-import type { AccountSnapshot, DtAccount } from "@prisma/client";
+import type { AccountSnapshot, DtAccount, PointStoreOrder } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { AppError, assertFound } from "../utils/errors.js";
+import { logger } from "../utils/logger.js";
 import { serializeSnapshot } from "../utils/serializers.js";
 import { fetchPublicJson } from "./public-account-enrichment.js";
+import { sendPointStoreTelegramNotification } from "./telegram-notifier.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -66,9 +68,9 @@ export async function getAccountPointStore(accountId: number): Promise<AccountPo
   };
 }
 
-export async function orderAccountPointStoreProduct(accountId: number, productId: string) {
+export async function orderAccountPointStoreProduct(accountId: number, productId: string, emailOverride?: string | null) {
   const account = await getAccountWithSnapshot(accountId);
-  const email = normalizeOptionalString(account.email ?? account.snapshot?.email);
+  const email = normalizeOptionalString(emailOverride) ?? normalizeOptionalString(account.email ?? account.snapshot?.email);
   if (!email) {
     throw new AppError("当前账户没有邮箱，无法作为积分商城兑换地址。", 400, 400);
   }
@@ -88,10 +90,40 @@ export async function orderAccountPointStoreProduct(accountId: number, productId
     throw new AppError("当前有效积分不足，无法兑换该商品。", 400, 400);
   }
 
-  const orderResponse = await fetchPublicJson(
-    `/pointstore/order?uid=${encodeURIComponent(pointStore.pointUid)}&productId=${encodeURIComponent(product.productId)}&address=${encodeURIComponent(email)}&key=${Date.now()}`
-  );
+  const orderAttempt = await prisma.pointStoreOrder.create({
+    data: {
+      accountId,
+      productId: product.productId,
+      productName: product.name,
+      productPrice: product.price,
+      email,
+      status: "submitting"
+    }
+  });
+
+  let orderResponse: JsonRecord;
+  try {
+    orderResponse = await fetchPublicJson(
+      `/pointstore/order?uid=${encodeURIComponent(pointStore.pointUid)}&productId=${encodeURIComponent(product.productId)}&address=${encodeURIComponent(email)}&key=${Date.now()}`
+    );
+  } catch (error) {
+    await prisma.pointStoreOrder.update({
+      where: { id: orderAttempt.id },
+      data: {
+        status: "failed",
+        rawOrderJson: safeJsonStringify({ error: error instanceof Error ? error.message : String(error) })
+      }
+    }).catch(() => undefined);
+    throw error;
+  }
   if (pickNumber(orderResponse, ["Result"]) !== 1) {
+    await prisma.pointStoreOrder.update({
+      where: { id: orderAttempt.id },
+      data: {
+        status: "failed",
+        rawOrderJson: safeJsonStringify(orderResponse)
+      }
+    });
     throw new AppError(`兑换失败：${pickString(orderResponse, ["Reason", "reason", "message"]) ?? "接口未返回成功"}`, 400, 400);
   }
 
@@ -101,6 +133,35 @@ export async function orderAccountPointStoreProduct(accountId: number, productId
     ? await fetchPublicJson(`/pointstore/order/info?orderId=${encodeURIComponent(orderId)}&uid=${encodeURIComponent(pointStore.pointUid)}`).catch(() => null)
     : null;
   const orderInfo = unwrapData(orderInfoResponse);
+  const status = normalizeOrderStatus(orderInfo ?? order);
+  const orderTime = pickString(orderInfo, ["orderTime", "order_time", "createdAt", "created_at"]) ??
+    pickString(order, ["orderTime", "order_time", "createdAt", "created_at"]);
+  const storedOrder = await prisma.pointStoreOrder.update({
+    where: { id: orderAttempt.id },
+    data: {
+      remoteOrderId: orderId || null,
+      status,
+      orderTime,
+      rawOrderJson: safeJsonStringify(orderResponse),
+      rawInfoJson: orderInfo ? safeJsonStringify(orderInfo) : null
+    }
+  });
+  void sendPointStoreTelegramNotification({
+    account,
+    email,
+    productName: product.name,
+    productId: product.productId,
+    productPrice: product.price,
+    orderId: orderId || null,
+    status,
+    orderTime: orderTime ?? storedOrder.createdAt
+  }).catch((error) => {
+    logger.warn("Failed to send Telegram notification for point-store order", {
+      accountId,
+      orderId: orderId || null,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
   const refreshedPointStore = await getAccountPointStore(accountId).catch(() => pointStore);
 
   return {
@@ -109,7 +170,59 @@ export async function orderAccountPointStoreProduct(accountId: number, productId
     orderId: orderId || null,
     order,
     orderInfo,
+    storedOrder,
     pointStore: refreshedPointStore
+  };
+}
+
+export async function listAccountPointStoreOrders(accountId: number) {
+  await getAccountWithSnapshot(accountId);
+  return prisma.pointStoreOrder.findMany({
+    where: { accountId },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }]
+  });
+}
+
+export async function refreshAccountPointStoreOrder(accountId: number, orderId: number) {
+  const [account, storedOrder] = await Promise.all([
+    getAccountWithSnapshot(accountId),
+    prisma.pointStoreOrder.findFirst({ where: { id: orderId, accountId } })
+  ]);
+  const found = assertFound(storedOrder, "Point-store order not found");
+  if (!found.remoteOrderId) {
+    return found;
+  }
+  const pointUid = resolvePointUid(account);
+  const response = await fetchPublicJson(
+    `/pointstore/order/info?orderId=${encodeURIComponent(found.remoteOrderId)}&uid=${encodeURIComponent(pointUid)}`
+  );
+  if (pickNumber(response, ["Result"]) !== 1) {
+    throw new AppError(`查询订单失败：${pickString(response, ["Reason", "reason", "message"]) ?? "接口未返回成功"}`, 400, 400);
+  }
+  const info = unwrapData(response) ?? {};
+  return prisma.pointStoreOrder.update({
+    where: { id: found.id },
+    data: {
+      status: normalizeOrderStatus(info),
+      orderTime: pickString(info, ["orderTime", "order_time", "createdAt", "created_at"]) ?? found.orderTime,
+      rawInfoJson: safeJsonStringify(info)
+    }
+  });
+}
+
+export function serializeStoredPointStoreOrder(order: PointStoreOrder) {
+  return {
+    id: order.id,
+    account_id: order.accountId,
+    remote_order_id: order.remoteOrderId,
+    product_id: order.productId,
+    product_name: order.productName,
+    product_price: order.productPrice,
+    email: order.email,
+    status: order.status,
+    order_time: order.orderTime,
+    created_at: order.createdAt,
+    updated_at: order.updatedAt
   };
 }
 
@@ -299,6 +412,18 @@ function normalizeMemberPoint(value: number | null) {
     return null;
   }
   return value;
+}
+
+function normalizeOrderStatus(value: JsonRecord | null | undefined) {
+  const text = pickString(value, ["status", "orderStatus", "order_status", "state"]);
+  if (text) {
+    return text;
+  }
+  const numeric = pickNumber(value, ["status", "orderStatus", "order_status", "state"]);
+  if (numeric === null) {
+    return "pending";
+  }
+  return ({ 0: "pending", 1: "completed", 2: "failed", 3: "processing" } as Record<number, string>)[numeric] ?? String(numeric);
 }
 
 function normalizeOptionalString(value: string | null | undefined) {
