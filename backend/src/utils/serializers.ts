@@ -1,4 +1,5 @@
 import type { AccountSnapshot, Message, PhoneNumber, Setting } from "@prisma/client";
+import iconv from "iconv-lite";
 
 const DEFAULT_CREDIT_EXCHANGE_RATIO = 0.02;
 
@@ -212,6 +213,10 @@ export function repairUtf8Mojibake(value: string | null) {
   }
 
   let best = repairKnownReplacementText(decodeNumericHtmlEntities(value));
+  const gbkDecoded = decodeGbkUtf8Mojibake(best);
+  if (gbkDecoded) {
+    best = repairKnownReplacementText(decodeNumericHtmlEntities(gbkDecoded));
+  }
   let bestScore = mojibakeScore(best);
   if (best !== value && containsHanText(best)) {
     return best;
@@ -243,6 +248,26 @@ export function repairUtf8Mojibake(value: string | null) {
   }
 
   return best;
+}
+
+function decodeGbkUtf8Mojibake(value: string) {
+  const sourceScore = gbkMojibakeHintScore(value);
+  if (sourceScore < 2) {
+    return null;
+  }
+  try {
+    const decoded = iconv.decode(iconv.encode(value, "gb18030"), "utf8");
+    if (!decoded || decoded === value || decoded.includes("\uFFFD") || !containsHanText(decoded)) {
+      return null;
+    }
+    return gbkMojibakeHintScore(decoded) < sourceScore ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function gbkMojibakeHintScore(value: string) {
+  return (value.match(/[璇撮亾鍥㈤槦绯荤粺娑堟伅纭呭熀娴佸姩鎮ㄧ殑鍙风爜鍗冲皢鍒版湡绉垎]/g) ?? []).length;
 }
 
 function repairKnownReplacementText(value: string) {

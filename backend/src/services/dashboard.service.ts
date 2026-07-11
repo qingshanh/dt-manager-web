@@ -1,3 +1,4 @@
+import { MessageType } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { serializeMessage } from "../utils/serializers.js";
 
@@ -12,7 +13,9 @@ export async function getDashboardStats(adminId: number) {
     prisma.dtAccount.count({ where: activeAccountFilter }),
     prisma.dtAccount.count({ where: { ...activeAccountFilter, status: "online" } }),
     prisma.message.count({ where: { account: { adminId } } }),
-    prisma.message.count({ where: { account: { adminId }, isRead: false } }),
+    prisma.message.count({
+      where: { account: { adminId }, isRead: false, msgType: { not: MessageType.system } }
+    }),
     prisma.phoneNumber.count({ where: { account: { adminId } } }),
     prisma.phoneNumber.count({ where: { account: { adminId }, status: "active" } })
   ]);
@@ -29,7 +32,10 @@ export async function getDashboardStats(adminId: number) {
 
 export async function getRecentMessages(limit = 20, adminId?: number) {
   const messages = await prisma.message.findMany({
-    where: adminId ? { account: { adminId } } : undefined,
+    where: {
+      msgType: { not: MessageType.system },
+      ...(adminId ? { account: { adminId } } : {})
+    },
     take: limit,
     orderBy: [{ receivedAt: "desc" }, { id: "desc" }],
     include: {
@@ -49,10 +55,15 @@ export async function getRecentMessages(limit = 20, adminId?: number) {
 }
 
 export async function getUnreadNotifications(adminId: number, limit = 20) {
+  const unreadWhere = {
+    account: { adminId },
+    isRead: false,
+    msgType: { not: MessageType.system }
+  };
   const [unreadCount, messages] = await Promise.all([
-    prisma.message.count({ where: { account: { adminId }, isRead: false } }),
+    prisma.message.count({ where: unreadWhere }),
     prisma.message.findMany({
-      where: { account: { adminId }, isRead: false },
+      where: unreadWhere,
       take: limit,
       orderBy: [{ receivedAt: "desc" }, { id: "desc" }],
       include: {

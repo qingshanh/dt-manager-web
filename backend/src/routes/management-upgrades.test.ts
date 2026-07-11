@@ -69,6 +69,19 @@ test("SSE message events carry the target phone number", () => {
   assert.match(types, /export interface SSENewMessageEvent[\s\S]*toNumber: string \| null;/);
 });
 
+test("team messages stay inside account history instead of dashboard notifications", () => {
+  const dashboard = readProjectFile("backend/src/services/dashboard.service.ts");
+  const detail = readProjectFile("frontend/src/pages/AccountDetail.tsx");
+
+  assert.match(dashboard, /getRecentMessages[\s\S]*msgType:\s*\{ not: MessageType\.system \}/);
+  assert.match(dashboard, /getUnreadNotifications[\s\S]*msgType:\s*\{ not: MessageType\.system \}/);
+  assert.match(detail, /teamMessageModalOpen/);
+  assert.match(detail, /消息历史/);
+  assert.match(detail, /teamMsgTotal/);
+  assert.match(detail, /fetchTeamMessages\(page/);
+  assert.match(detail, /msg_type:\s*'system'/);
+});
+
 test("point store supports email override, persisted history, status refresh, and Telegram notification", () => {
   const routes = readProjectFile("backend/src/routes/accounts.ts");
   const store = readProjectFile("backend/src/services/point-store.ts");

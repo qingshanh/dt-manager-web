@@ -28,7 +28,7 @@ test("fallback polling is slower than direct page navigation and SSE carries fre
 });
 test("message list refreshes bypass cached pages", () => {
   assert.match(accountDetailSource, /fetchMessages\(msgPage, \{ silent: true, suppressError: true, force: true \}\)/);
-  assert.match(accountDetailSource, /fetchTeamMessages\(\{ silent: true, force: true \}\)/);
+  assert.match(accountDetailSource, /fetchTeamMessages\(teamMessageModalOpen \? teamMsgPage : 1, \{ silent: true, force: true \}\)/);
   assert.match(accountDetailSource, /fetchMessages\(msgPage, \{ force: true \}\)/);
   assert.match(accountDetailSource, /fetchMessages\(page, \{ force: true \}\)/);
 });

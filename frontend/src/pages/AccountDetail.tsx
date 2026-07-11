@@ -9,6 +9,7 @@ import {
   Descriptions,
   Input,
   InputNumber,
+  Modal,
   Popconfirm,
   Row,
   Select,
@@ -1036,6 +1037,9 @@ export default function AccountDetail() {
   const [loading, setLoading] = useState(true);
   const [messages, setMessages] = useState<Message[]>([]);
   const [teamMessages, setTeamMessages] = useState<Message[]>([]);
+  const [teamMsgTotal, setTeamMsgTotal] = useState(0);
+  const [teamMsgPage, setTeamMsgPage] = useState(1);
+  const [teamMessageModalOpen, setTeamMessageModalOpen] = useState(false);
   const [msgTotal, setMsgTotal] = useState(0);
   const [msgPage, setMsgPage] = useState(1);
   const [msgLoading, setMsgLoading] = useState(false);
@@ -1174,13 +1178,15 @@ export default function AccountDetail() {
     }
   }, [accountId, message]);
   const fetchTeamMessages = useCallback(
-    async (options?: { silent?: boolean; force?: boolean }) => {
-      const params = { page: 1, pageSize: 100, msg_type: 'system' as const };
+    async (page = 1, options?: { silent?: boolean; force?: boolean }) => {
+      const params = { page, pageSize: 20, msg_type: 'system' as const };
       const cacheKey = cacheKeys.accountMessages(accountId, params);
       const cached = !options?.force ? readCachedData<PagedData<Message>>(cacheKey) : null;
 
       if (cached) {
         setTeamMessages(cached.list);
+        setTeamMsgTotal(cached.total);
+        setTeamMsgPage(cached.page);
         if (isCachedDataFresh(cacheKey, CACHE_TTL_MS.accountMessages)) {
           return;
         }
@@ -1191,8 +1197,10 @@ export default function AccountDetail() {
       try {
         const data = await getAccountMessages(accountId, params, { force: options?.force });
         setTeamMessages(data.list);
+        setTeamMsgTotal(data.total);
+        setTeamMsgPage(data.page);
       } catch (err) {
-        if (!options?.silent) message.error(err instanceof Error ? err.message : '鑾峰彇鍥㈤槦娑堟伅澶辫触');
+        if (!options?.silent) message.error(err instanceof Error ? err.message : '获取团队消息失败');
       } finally {
         if (!options?.silent) setTeamMsgLoading(false);
       }
@@ -1263,7 +1271,7 @@ export default function AccountDetail() {
       inFlight = true;
       try {
         await fetchMessages(msgPage, { silent: true, suppressError: true, force: true });
-        await fetchTeamMessages({ silent: true, force: true });
+        await fetchTeamMessages(teamMessageModalOpen ? teamMsgPage : 1, { silent: true, force: true });
       } finally {
         inFlight = false;
       }
@@ -1276,7 +1284,7 @@ export default function AccountDetail() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [activeTab, fetchMessages, fetchTeamMessages, msgPage]);
+  }, [activeTab, fetchMessages, fetchTeamMessages, msgPage, teamMessageModalOpen, teamMsgPage]);
 
   const syncLatestMessages = useCallback(async () => {
     setSyncingLatestMessages(true);
@@ -1284,7 +1292,7 @@ export default function AccountDetail() {
       const result = await refreshAccountMessages(accountId, 50, false);
       setLastRefreshDiagnostics(result.diagnostics ?? null);
       setMsgPage(1);
-      await Promise.all([fetchMessages(1, { force: true }), fetchTeamMessages({ force: true }), fetchAccount({ force: true })]);
+      await Promise.all([fetchMessages(1, { force: true }), fetchTeamMessages(1, { force: true }), fetchAccount({ force: true })]);
       if (result.background) {
         const diagnosticsSummary = buildRefreshDiagnosticsSummary(result.diagnostics);
         message.info(diagnosticsSummary ? `Background SMS refresh started\n${diagnosticsSummary}` : 'Background SMS refresh started; messages will appear after import');
@@ -1318,7 +1326,7 @@ export default function AccountDetail() {
         },
       ]);
       setMsgPage(1);
-      await Promise.all([fetchMessages(1, { force: true }), fetchTeamMessages({ force: true }), fetchAccount({ force: true })]);
+      await Promise.all([fetchMessages(1, { force: true }), fetchTeamMessages(1, { force: true }), fetchAccount({ force: true })]);
       message.success(result.imported > 0 ? `已从 app 同步 ${result.imported} 条消息` : 'app 消息同步完成，暂无新增');
     } catch (err) {
       message.error(err instanceof Error ? err.message : 'app 消息同步失败');
@@ -1330,11 +1338,14 @@ export default function AccountDetail() {
   const refreshLocalMessages = useCallback(async () => {
     setRefreshingLocalMessages(true);
     try {
-      await Promise.all([fetchMessages(msgPage, { force: true }), fetchTeamMessages({ force: true })]);
+      await Promise.all([
+        fetchMessages(msgPage, { force: true }),
+        fetchTeamMessages(teamMessageModalOpen ? teamMsgPage : 1, { force: true }),
+      ]);
     } finally {
       setRefreshingLocalMessages(false);
     }
-  }, [fetchMessages, fetchTeamMessages, msgPage]);
+  }, [fetchMessages, fetchTeamMessages, msgPage, teamMessageModalOpen, teamMsgPage]);
 
   const fetchPhones = useCallback(async (options?: { force?: boolean }) => {
     const cacheKey = cacheKeys.phoneNumbers(accountId);
@@ -1402,7 +1413,7 @@ export default function AccountDetail() {
     setActiveTab(key);
     if (key === 'messages') {
       fetchMessages(msgPage, { force: true });
-      fetchTeamMessages({ force: true });
+      fetchTeamMessages(1, { force: true });
     }
     if (key === 'phone-numbers') {
       fetchPhones();
@@ -1875,6 +1886,31 @@ export default function AccountDetail() {
     });
   };
 
+  const openTeamMessageHistory = () => {
+    setTeamMessageModalOpen(true);
+    void fetchTeamMessages(1, { force: true });
+  };
+
+  const teamMsgColumns: ColumnsType<Message> = [
+    {
+      title: '发送方',
+      dataIndex: 'from_number',
+      width: 140,
+      render: (value) => value || (account?.app_variant === 'dingdong' ? '叮咚团队' : '说道团队'),
+    },
+    {
+      title: '消息内容',
+      dataIndex: 'content',
+      render: (value: string) => <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{value}</div>,
+    },
+    {
+      title: '接收时间',
+      dataIndex: 'received_at',
+      width: 180,
+      render: (value) => (value ? dayjs(value).format('YYYY-MM-DD HH:mm:ss') : '-'),
+    },
+  ];
+
   const msgColumns: ColumnsType<Message> = [
     { title: '类型', dataIndex: 'msg_type', width: 100, render: (value) => <Tag>{value}</Tag> },
     { title: '来源', dataIndex: 'from_number', width: 140, render: (value) => value || '-' },
@@ -2342,12 +2378,26 @@ export default function AccountDetail() {
                     </div>
                   </Card>
                 ) : null}
-                {teamMessages.length > 0 ? (
-                  <Card size="small" style={{ marginBottom: 12 }} loading={teamMsgLoading}>
+                {teamMsgTotal > 0 ? (
+                  <Card
+                    size="small"
+                    hoverable
+                    role="button"
+                    tabIndex={0}
+                    style={{ marginBottom: 12, cursor: 'pointer' }}
+                    loading={teamMsgLoading}
+                    onClick={openTeamMessageHistory}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        openTeamMessageHistory();
+                      }
+                    }}
+                  >
                     <Space>
                       <Tag color="default">系统</Tag>
-                      <strong>团队消息</strong>
-                      <span style={{ color: '#666' }}>共 {teamMessages.length} 条</span>
+                      <strong>{account?.app_variant === 'dingdong' ? '叮咚团队' : '说道团队'}</strong>
+                      <span style={{ color: '#666' }}>共 {teamMsgTotal} 条，点击查看历史</span>
                     </Space>
                     <div style={{ marginTop: 8, color: '#666' }}>{teamMessages[0]?.content}</div>
                   </Card>
@@ -2406,6 +2456,32 @@ export default function AccountDetail() {
           },
         ]}
       />
+      <Modal
+        title={`${account?.app_variant === 'dingdong' ? '叮咚团队' : '说道团队'}消息历史`}
+        open={teamMessageModalOpen}
+        onCancel={() => setTeamMessageModalOpen(false)}
+        footer={null}
+        width={900}
+        destroyOnClose
+      >
+        <Table
+          columns={teamMsgColumns}
+          dataSource={teamMessages}
+          rowKey="id"
+          loading={teamMsgLoading}
+          size="small"
+          tableLayout="fixed"
+          pagination={{
+            current: teamMsgPage,
+            total: teamMsgTotal,
+            pageSize: 20,
+            showTotal: (total) => `共 ${total} 条`,
+            onChange: (page) => {
+              void fetchTeamMessages(page, { force: true });
+            },
+          }}
+        />
+      </Modal>
     </div>
   );
 }

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { MessageDirection, MessageType } from "@prisma/client";
+import { eventBus, type AppEvent } from "./event-bus.js";
 import { storeHelperSmsMessages, storeParsedSmsPushes } from "./message-runtime.js";
 
 function createMessageRuntimeDb() {
@@ -184,6 +185,49 @@ test("stores team messages as read system messages", async () => {
   assert.equal(imported, 1);
   assert.equal(runtime.messages[0]?.msgType, MessageType.system);
   assert.equal(runtime.messages[0]?.isRead, true);
+});
+
+test("repairs garbled team pushes and keeps them out of panel and Telegram notifications", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    adminId: 1,
+    appVariant: "dingdong",
+    nickname: "Team account",
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: true
+  });
+  const events: AppEvent[] = [];
+  const listener = (event: AppEvent) => events.push(event);
+  eventBus.on("event", listener);
+
+  try {
+    const imported = await storeParsedSmsPushes(
+      1,
+      [
+        {
+          msgType: 561,
+          fromNumber: "璇撮亾鍥㈤槦",
+          toNumber: null,
+          content: "璇撮亾鍥㈤槦绯荤粺娑堟伅 team-example-7433",
+          rawK3: "garbled-team-push"
+        }
+      ],
+      { db: runtime.db as any, emitEvents: true, sendTelegram: true }
+    );
+
+    assert.equal(imported, 1);
+    assert.equal(runtime.messages[0]?.msgType, MessageType.system);
+    assert.equal(runtime.messages[0]?.fromNumber, "说道团队");
+    assert.equal(runtime.messages[0]?.content, "说道团队系统消息 team-example-7433");
+    assert.equal(runtime.messages[0]?.isRead, true);
+    assert.equal(runtime.messages[0]?.telegramSent, false);
+    assert.equal(events.filter((event) => event.type === "new_message").length, 0);
+  } finally {
+    eventBus.off("event", listener);
+  }
 });
 
 test("does not classify a regular message as a team message from its content", async () => {

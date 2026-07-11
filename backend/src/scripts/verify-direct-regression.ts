@@ -2239,8 +2239,8 @@ async function checkTeamMessagesPerAccountNoTelegram() {
       rawK3: `${tag}-cn`
     };
     const [talkuCreated, dingdongCreated] = await Promise.all([
-      storeParsedSmsPushes(talku.id, [push, chinesePush], { emitEvents: false }),
-      storeParsedSmsPushes(dingdong.id, [push, chinesePush], { emitEvents: false })
+      storeParsedSmsPushes(talku.id, [push, chinesePush], { emitEvents: false, sendTelegram: false }),
+      storeParsedSmsPushes(dingdong.id, [push, chinesePush], { emitEvents: false, sendTelegram: false })
     ]);
     const stored = await prisma.message.findMany({
       where: {
