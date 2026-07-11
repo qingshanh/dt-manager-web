@@ -39,7 +39,7 @@ const schema = z.object({
   DT_ADB_DINGDONG_PACKAGE: z.string().default("me.dingtone.app.im"),
   DT_ADB_DINGDONG_MAIN_ACTIVITY: z.string().default(".activity.SplashActivity"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
-  APP_VERSION: z.string().default("0.1.0"),
+  APP_VERSION: z.string().default("0.2.0"),
   APP_COMMIT_SHA: z.string().optional().default(""),
   APP_REPOSITORY: z.string().default("qingshanh/dt-manager-web"),
   APP_UPDATE_BRANCH: z.string().default("main"),
