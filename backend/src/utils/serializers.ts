@@ -102,11 +102,52 @@ export function serializePhoneNumber(phone: PhoneNumber) {
     auto_renew: phone.autoRenew,
     is_primary: phone.isPrimary,
     is_good_number: phone.isGoodNumber,
+    allow_receive_sms: derivePhoneAllowReceiveSms(raw),
     portout_info: repairUtf8Mojibake(phone.portoutInfo),
     raw_json: phone.rawJson,
     created_at: phone.createdAt,
     updated_at: phone.updatedAt
   };
+}
+
+function derivePhoneAllowReceiveSms(raw: Record<string, unknown> | null) {
+  if (!raw) {
+    return null;
+  }
+  const keys = ["allowReceiveSMS", "allowReceiveSms", "allow_receive_sms"];
+  const direct = pickBooleanValue(raw, keys);
+  if (direct !== null) {
+    return direct;
+  }
+  const filterSetting = raw.filterSetting ?? raw.filter_setting;
+  if (isRecord(filterSetting)) {
+    return pickBooleanValue(filterSetting, keys);
+  }
+  if (typeof filterSetting !== "string" || !filterSetting.trim()) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(filterSetting) as unknown;
+    return isRecord(parsed) ? pickBooleanValue(parsed, keys) : null;
+  } catch {
+    return null;
+  }
+}
+
+function pickBooleanValue(record: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (value === 1 || value === "1" || value === "true") {
+      return true;
+    }
+    if (value === 0 || value === -1 || value === "0" || value === "-1" || value === "false") {
+      return false;
+    }
+  }
+  return null;
 }
 
 function derivePhoneValidPeriodDays(gainTime: string | null, expiredTime: string | null, fallback: number | null) {
@@ -172,7 +213,10 @@ function roundTo(value: number, digits: number) {
 export function serializeMessage(message: Message) {
   const fromNumber = repairUtf8Mojibake(message.fromNumber);
   const toNumber = repairUtf8Mojibake(message.toNumber);
-  const content = cleanSerializedMessageContent(repairUtf8Mojibake(message.content) ?? "");
+  const content = recoverSerializedVerificationContent(
+    cleanSerializedMessageContent(repairUtf8Mojibake(message.content) ?? ""),
+    fromNumber
+  );
   const rawInfo = repairUtf8Mojibake(message.rawInfo);
   const rawK3 = repairUtf8Mojibake(message.rawK3);
   return {
@@ -205,7 +249,26 @@ export function serializeSetting(setting: Setting) {
 }
 
 function cleanSerializedMessageContent(value: string) {
-  return value.replace(/^[A-Za-z](?=(?:\?|<|\[硅基流动\]|\[SiliconFlow\]|\[Dingtone\]|\[TalkU\]))/, "");
+  return value
+    .replace(/^[A-Za-z](?=(?:\?|<|\[硅基流动\]|\[SiliconFlow\]|\[Dingtone\]|\[TalkU\]))/, "")
+    .replace(/^\?<SiliconFlow\?>\s*/i, "[硅基流动] ");
+}
+
+function recoverSerializedVerificationContent(content: string, fromNumber: string | null) {
+  if (!content.includes("�")) {
+    return content;
+  }
+  const code = content.match(/\d{4,8}/)?.[0];
+  if (!code) {
+    return content;
+  }
+  if (/^twverify$/i.test(fromNumber ?? "")) {
+    return `您的验证代码是：${code}`;
+  }
+  if (/^openai$/i.test(fromNumber ?? "")) {
+    return `您的 OpenAI 验证代码是：${code}`;
+  }
+  return content;
 }
 export function repairUtf8Mojibake(value: string | null) {
   if (!value) {

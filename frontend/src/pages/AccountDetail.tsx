@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   App,
   Alert,
@@ -29,6 +29,7 @@ import {
   PlayCircleOutlined,
   PlusOutlined,
   ReloadOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
@@ -39,7 +40,9 @@ import {
   cancelPhoneNumber,
   deleteMessage,
   deletePhoneNumber,
+  enablePhoneSmsReception,
   getAccount,
+  getAccountMessage,
   getAccountMessages,
   getAccountPointStore,
   getPhoneNumberCountries,
@@ -1031,6 +1034,7 @@ export default function AccountDetail() {
   const { id } = useParams<{ id: string }>();
   const accountId = Number(id);
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { message, modal } = App.useApp();
 
   const [account, setAccount] = useState<DtAccountDetail | null>(null);
@@ -1044,7 +1048,13 @@ export default function AccountDetail() {
   const [msgPage, setMsgPage] = useState(1);
   const [msgLoading, setMsgLoading] = useState(false);
   const [teamMsgLoading, setTeamMsgLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState('info');
+  const messageRequestIdRef = useRef(0);
+  const teamMessageRequestIdRef = useRef(0);
+  const [activeTab, setActiveTab] = useState(() => searchParams.get('tab') === 'messages' ? 'messages' : 'info');
+  const focusedMessageId = useMemo(() => {
+    const value = Number(searchParams.get('messageId'));
+    return Number.isInteger(value) && value > 0 ? value : null;
+  }, [searchParams]);
   const [syncingLatestMessages, setSyncingLatestMessages] = useState(false);
   const [syncingAppMessages, setSyncingAppMessages] = useState(false);
   const [refreshingAccountData, setRefreshingAccountData] = useState(false);
@@ -1118,7 +1128,7 @@ export default function AccountDetail() {
       setAccount(data);
       setNickname(data.nickname);
     } catch (err) {
-      message.error(err instanceof Error ? err.message : '鑾峰彇璐︽埛璇︽儏澶辫触');
+      message.error(err instanceof Error ? err.message : '获取账户详情失败');
     } finally {
       setLoading(false);
     }
@@ -1126,6 +1136,7 @@ export default function AccountDetail() {
 
   const fetchMessages = useCallback(
     async (page = 1, options?: { silent?: boolean; suppressError?: boolean; force?: boolean }) => {
+      const requestId = ++messageRequestIdRef.current;
       const params = { page, pageSize: 10, exclude_system: true };
       const cacheKey = cacheKeys.accountMessages(accountId, params);
       const cached = !options?.force ? readCachedData<PagedData<Message>>(cacheKey) : null;
@@ -1142,14 +1153,17 @@ export default function AccountDetail() {
 
       try {
         const data = await getAccountMessages(accountId, params, { force: options?.force });
+        if (requestId !== messageRequestIdRef.current) {
+          return;
+        }
         setMessages(data.list);
         setMsgTotal(data.total);
       } catch (err) {
-        if (!options?.suppressError) {
+        if (requestId === messageRequestIdRef.current && !options?.suppressError) {
           message.error(err instanceof Error ? err.message : '鑾峰彇娑堟伅澶辫触');
         }
       } finally {
-        if (!options?.silent) {
+        if (requestId === messageRequestIdRef.current && !options?.silent) {
           setMsgLoading(false);
         }
       }
@@ -1177,8 +1191,27 @@ export default function AccountDetail() {
       }
     }
   }, [accountId, message]);
+
+  const fetchFocusedMessage = useCallback(async () => {
+    if (!focusedMessageId) {
+      return;
+    }
+    try {
+      const item = await getAccountMessage(accountId, focusedMessageId);
+      if (item.msg_type === 'system') {
+        return;
+      }
+      setMessages((current) => current.some((messageItem) => messageItem.id === item.id)
+        ? current
+        : [item, ...current].slice(0, 10));
+    } catch (err) {
+      message.warning(err instanceof Error ? err.message : '未找到所选消息');
+    }
+  }, [accountId, focusedMessageId, message]);
+
   const fetchTeamMessages = useCallback(
     async (page = 1, options?: { silent?: boolean; force?: boolean }) => {
+      const requestId = ++teamMessageRequestIdRef.current;
       const params = { page, pageSize: 20, msg_type: 'system' as const };
       const cacheKey = cacheKeys.accountMessages(accountId, params);
       const cached = !options?.force ? readCachedData<PagedData<Message>>(cacheKey) : null;
@@ -1196,13 +1229,20 @@ export default function AccountDetail() {
 
       try {
         const data = await getAccountMessages(accountId, params, { force: options?.force });
+        if (requestId !== teamMessageRequestIdRef.current) {
+          return;
+        }
         setTeamMessages(data.list);
         setTeamMsgTotal(data.total);
         setTeamMsgPage(data.page);
       } catch (err) {
-        if (!options?.silent) message.error(err instanceof Error ? err.message : '获取团队消息失败');
+        if (requestId === teamMessageRequestIdRef.current && !options?.silent) {
+          message.error(err instanceof Error ? err.message : '获取团队消息失败');
+        }
       } finally {
-        if (!options?.silent) setTeamMsgLoading(false);
+        if (requestId === teamMessageRequestIdRef.current && !options?.silent) {
+          setTeamMsgLoading(false);
+        }
       }
     },
     [accountId, message],
@@ -1234,7 +1274,10 @@ export default function AccountDetail() {
         created_at: receivedAt,
       };
       if (detail.msgType === 'system') {
+        teamMessageRequestIdRef.current += 1;
+        setTeamMsgLoading(false);
         setTeamMessages((current) => [nextMessage, ...current.filter((item) => item.id !== nextMessage.id)].slice(0, 100));
+        setTeamMsgTotal((current) => current + 1);
         setAccount((current) => current ? {
           ...current,
           total_messages: current.total_messages + 1,
@@ -1242,6 +1285,8 @@ export default function AccountDetail() {
         } : current);
         return;
       }
+      messageRequestIdRef.current += 1;
+      setMsgLoading(false);
       if (msgPage === 1) {
         setMessages((current) => [nextMessage, ...current.filter((item) => item.id !== nextMessage.id)].slice(0, 10));
       }
@@ -1264,19 +1309,23 @@ export default function AccountDetail() {
     }
 
     let inFlight = false;
-    const pollLocalMessages = async () => {
+    const pollLocalMessages = async (silent = true) => {
       if (inFlight) {
         return;
       }
       inFlight = true;
       try {
-        await fetchMessages(msgPage, { silent: true, suppressError: true, force: true });
+        await fetchMessages(msgPage, { silent, suppressError: silent, force: true });
+        if (!silent) {
+          await fetchFocusedMessage();
+        }
         await fetchTeamMessages(teamMessageModalOpen ? teamMsgPage : 1, { silent: true, force: true });
       } finally {
         inFlight = false;
       }
     };
 
+    void pollLocalMessages(false);
     const timer = window.setInterval(() => {
       void pollLocalMessages();
     }, LOCAL_MESSAGE_POLL_MS);
@@ -1284,7 +1333,7 @@ export default function AccountDetail() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [activeTab, fetchMessages, fetchTeamMessages, msgPage, teamMessageModalOpen, teamMsgPage]);
+  }, [activeTab, fetchFocusedMessage, fetchMessages, fetchTeamMessages, msgPage, teamMessageModalOpen, teamMsgPage]);
 
   const syncLatestMessages = useCallback(async () => {
     setSyncingLatestMessages(true);
@@ -1398,6 +1447,26 @@ export default function AccountDetail() {
     }
   }, [accountId, fetchAccount, message]);
 
+  const repairSmsReception = useCallback(async () => {
+    setPhoneLoading(true);
+    try {
+      const result = await enablePhoneSmsReception(accountId);
+      setPhones(result.phone_numbers);
+      await fetchAccount();
+      if (result.failed.length > 0) {
+        message.warning(`已修复 ${result.repaired} 个号码，${result.failed.length} 个号码未确认成功`);
+      } else if (result.repaired > 0) {
+        message.success(`已开启 ${result.repaired} 个号码的短信接收`);
+      } else {
+        message.success('没有发现短信接收已关闭的号码');
+      }
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '修复短信接收失败');
+    } finally {
+      setPhoneLoading(false);
+    }
+  }, [accountId, fetchAccount, message]);
+
   useEffect(() => {
     if (!Number.isFinite(accountId) || accountId <= 0) {
       return;
@@ -1409,12 +1478,12 @@ export default function AccountDetail() {
     return () => window.clearTimeout(pointStoreTimer);
   }, [accountId, fetchAccount, fetchPointStore]);
 
+  useEffect(() => {
+    setActiveTab(searchParams.get('tab') === 'messages' ? 'messages' : 'info');
+  }, [accountId, searchParams]);
+
   const handleTabChange = (key: string) => {
     setActiveTab(key);
-    if (key === 'messages') {
-      fetchMessages(msgPage, { force: true });
-      fetchTeamMessages(1, { force: true });
-    }
     if (key === 'phone-numbers') {
       fetchPhones();
     }
@@ -1968,20 +2037,24 @@ export default function AccountDetail() {
     {
       title: '号码',
       dataIndex: 'phone_number',
-      width: 170,
+      width: 190,
       render: (value, record) => {
         const displayPhone = formatPhoneWithCountryCode(value, record.country_code);
         const copyPhone = formatPhoneForClipboard(value, record.country_code);
         return (
-          <Tooltip title={`点击复制 ${copyPhone || displayPhone}`}>
-            <Tag
-              color="green"
-              onClick={() => copyText(copyPhone || displayPhone, `号码 ${copyPhone || displayPhone} 已复制`)}
-              style={{ cursor: 'pointer', userSelect: 'none' }}
-            >
-              {displayPhone}
-            </Tag>
-          </Tooltip>
+          <Space direction="vertical" size={2}>
+            <Tooltip title={`点击复制 ${copyPhone || displayPhone}`}>
+              <Tag
+                color="green"
+                onClick={() => copyText(copyPhone || displayPhone, `号码 ${copyPhone || displayPhone} 已复制`)}
+                style={{ cursor: 'pointer', userSelect: 'none' }}
+              >
+                {displayPhone}
+              </Tag>
+            </Tooltip>
+            {record.allow_receive_sms === false && <Tag color="red">短信接收关闭</Tag>}
+            {record.allow_receive_sms === true && <Tag color="success">短信接收开启</Tag>}
+          </Space>
         );
       },
     },
@@ -2222,7 +2295,7 @@ export default function AccountDetail() {
       ) : null}
 
       <Tabs
-        defaultActiveKey="info"
+        activeKey={activeTab}
         onChange={handleTabChange}
         items={[
           {
@@ -2414,9 +2487,9 @@ export default function AccountDetail() {
                     pageSize: 10,
                     onChange: (page) => {
                       setMsgPage(page);
-                      fetchMessages(page, { force: true });
                     },
                   }}
+                  rowClassName={(record) => record.id === focusedMessageId ? 'message-row-focused' : ''}
                   scroll={{ x: 860 }}
                 />
               </div>
@@ -2432,6 +2505,13 @@ export default function AccountDetail() {
                     <Button icon={<ReloadOutlined />} onClick={syncOwnedPhones}>
                       刷新已购号码
                     </Button>
+                    <Popconfirm
+                      title="确认修复当前账户中短信接收已关闭的号码？"
+                      description="只会修改服务端明确标记为关闭的号码，并保留号码现有设置。"
+                      onConfirm={repairSmsReception}
+                    >
+                      <Button icon={<SafetyCertificateOutlined />}>修复短信接收</Button>
+                    </Popconfirm>
                     <Button type="primary" icon={<PlusOutlined />} onClick={handleRequestNumber}>
                       获取新号码
                     </Button>
@@ -2462,7 +2542,7 @@ export default function AccountDetail() {
         onCancel={() => setTeamMessageModalOpen(false)}
         footer={null}
         width={900}
-        destroyOnClose
+        destroyOnHidden
       >
         <Table
           columns={teamMsgColumns}

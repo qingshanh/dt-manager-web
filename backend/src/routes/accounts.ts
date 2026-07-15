@@ -416,7 +416,7 @@ accountsRouter.get("/", async (req, res, next) => {
       ? await Promise.all([
           prisma.message.groupBy({
             by: ["accountId"],
-            where: { accountId: { in: accountIds }, isRead: false },
+            where: { accountId: { in: accountIds }, isRead: false, msgType: { not: MessageType.system } },
             _count: { _all: true }
           }),
           prisma.phoneNumber.groupBy({
@@ -479,7 +479,7 @@ accountsRouter.post("/bulk-action", async (req, res, next) => {
 
     if (body.action === "mark_read" || body.action === "mark_unread") {
       const updated = await prisma.message.updateMany({
-        where: { accountId: { in: body.account_ids } },
+        where: { accountId: { in: body.account_ids }, msgType: { not: MessageType.system } },
         data: { isRead: body.action === "mark_read" }
       });
       return ok(res, {
@@ -1406,6 +1406,21 @@ accountsRouter.get("/:id/messages", async (req, res, next) => {
   }
 });
 
+accountsRouter.get("/:id/messages/:messageId", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const messageId = Number(req.params.messageId);
+    await assertAccount(accountId);
+    const item = assertFound(
+      await prisma.message.findFirst({ where: { id: messageId, accountId } }),
+      "Message not found"
+    );
+    ok(res, serializeMessage(item));
+  } catch (error) {
+    next(error);
+  }
+});
+
 accountsRouter.post("/:id/messages/sync-helper", async (req, res, next) => {
   try {
     const account = await assertAccount(Number(req.params.id));
@@ -1550,6 +1565,67 @@ accountsRouter.post("/:id/phone-numbers/sync", async (req, res, next) => {
     const accountId = Number(req.params.id);
     const phoneNumbers = await syncPhoneNumbersFromRemote(accountId);
     ok(res, phoneNumbers.map(serializePhoneNumber));
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.post("/:id/phone-numbers/enable-sms-reception", async (req, res, next) => {
+  try {
+    const body = phoneActionConfirmSchema.parse(req.body ?? {});
+    if (!body.confirm) {
+      throw new AppError("Enabling SMS reception requires confirm=true", 400, 400);
+    }
+    const account = await assertAccount(Number(req.params.id));
+    if (!(await shouldUseDirectAccountFlow(account))) {
+      throw new AppError("SMS reception repair currently requires a direct account session.", 501, 501);
+    }
+    const directAccount = {
+      dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+      token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+      deviceId: account.dtDeviceId
+    };
+    const before = await directRefreshGateway.listPhoneNumbers(directAccount);
+    const targets = before.filter((phone) => phone.allowReceiveSms !== true && phone.status !== "cancelled" && phone.status !== "expired");
+    const requestErrors = new Map<string, string>();
+
+    for (const phone of targets) {
+      try {
+        await directRefreshGateway.enablePhoneNumberSmsReception(directAccount, phone.phoneNumber, phone);
+      } catch (error) {
+        requestErrors.set(phone.phoneNumber, error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    const after = await refreshDirectPhoneSmsSettings(
+      directAccount,
+      new Set(targets.map((phone) => normalizePhoneDigits(phone.phoneNumber))),
+      before
+    );
+    await syncPhoneNumbers(account.id, after);
+    const repaired = targets.filter((target) => {
+      const digits = normalizePhoneDigits(target.phoneNumber);
+      return after.some((phone) => normalizePhoneDigits(phone.phoneNumber) === digits && phone.allowReceiveSms === true);
+    });
+    const failed = targets
+      .filter((target) => !repaired.some((phone) => normalizePhoneDigits(phone.phoneNumber) === normalizePhoneDigits(target.phoneNumber)))
+      .map((target) => ({
+        phone_number: target.phoneNumber,
+        error: requestErrors.get(target.phoneNumber) ?? "服务端未确认短信接收开关已开启"
+      }));
+    const stored = await prisma.phoneNumber.findMany({
+      where: { accountId: account.id },
+      orderBy: [{ isPrimary: "desc" }, { createdAt: "desc" }]
+    });
+
+    ok(res, {
+      checked: before.length,
+      repaired: repaired.length,
+      already_enabled: before.filter((phone) => phone.allowReceiveSms === true).length,
+      unknown: before.filter((phone) => phone.allowReceiveSms === undefined).length,
+      failed,
+      phone_numbers: stored.map(serializePhoneNumber)
+    });
   } catch (error) {
     next(error);
   }
@@ -1979,7 +2055,8 @@ async function finalizeSuccessfulLogin(input: {
   const accountId = await persistAuthenticatedSession(input.accountId, {
     dtUserId: input.loginResult.dtUserId,
     token: input.loginResult.token,
-    deviceId: input.loginResult.deviceId ?? null
+    deviceId: input.loginResult.deviceId ?? null,
+    dingtoneId: input.loginResult.dingtoneId ?? null
   });
 
   try {
@@ -2491,6 +2568,7 @@ async function persistAuthenticatedSession(
     dtUserId: string;
     token: string;
     deviceId?: string | null;
+    dingtoneId?: string | null;
   }
 ) {
   await prisma.dtAccount.update({
@@ -2499,6 +2577,7 @@ async function persistAuthenticatedSession(
       dtUserId: session.dtUserId,
       dtToken: encryptText(session.token),
       ...(session.deviceId ? { dtDeviceId: session.deviceId } : {}),
+      ...(session.dingtoneId ? { dtDingtoneId: session.dingtoneId } : {}),
       lastLoginAt: new Date(),
       status: AccountStatus.offline,
       lastError: null
@@ -2794,6 +2873,37 @@ async function verifyDirectPhoneAction(
     502,
     502
   );
+}
+
+async function refreshDirectPhoneSmsSettings(
+  account: { dtUserId: string; token: string; deviceId?: string | null },
+  targetNumbers: Set<string>,
+  fallback: DingtonePhoneNumber[]
+) {
+  let latest = fallback;
+  for (const waitMs of [0, 1_500, 3_000, 5_000]) {
+    if (waitMs > 0) {
+      await delayResult(waitMs, null);
+    }
+    try {
+      latest = await directRefreshGateway.listPhoneNumbers(account);
+    } catch (error) {
+      logger.warn("Failed to verify SMS reception switch after privateNumberSetting", {
+        error: error instanceof Error ? error.message : String(error),
+        targetCount: targetNumbers.size
+      });
+      continue;
+    }
+    if (
+      targetNumbers.size === 0 ||
+      [...targetNumbers].every((target) =>
+        latest.some((phone) => normalizePhoneDigits(phone.phoneNumber) === target && phone.allowReceiveSms === true)
+      )
+    ) {
+      return latest;
+    }
+  }
+  return latest;
 }
 
 async function getDirectPhoneBaseline(
@@ -3152,6 +3262,7 @@ async function importFullBackupAccount(adminId: number, item: Record<string, unk
   const incomingTrackCode = normalizeOptionalString(item.track_code);
   const incomingLastLoginAt = normalizeBackupDate(item.last_login_at);
   const incomingLastError = normalizeOptionalString(item.last_error);
+  const incomingSortOrder = pickNumber(item, ["sort_order", "sortOrder"]);
   const accountData = {
     nickname:
       normalizeOptionalString(item.nickname) ??
@@ -3173,6 +3284,7 @@ async function importFullBackupAccount(adminId: number, item: Record<string, unk
     monitorEnabled: Boolean(item.monitor_enabled),
     telegramNotify: Boolean(item.telegram_notify),
     proxyEnabled: Boolean(item.proxy_enabled),
+    sortOrder: incomingSortOrder !== null ? Math.max(0, Math.trunc(incomingSortOrder)) : existing?.sortOrder ?? 0,
     lastLoginAt: incomingLastLoginAt ?? existing?.lastLoginAt ?? null,
     lastError: incomingLastError ?? existing?.lastError ?? null
   };
@@ -3523,6 +3635,7 @@ async function buildFullBackupPayload(_requestAdminId: number): Promise<FullBack
       monitor_enabled: account.monitorEnabled,
       telegram_notify: account.telegramNotify,
       proxy_enabled: account.proxyEnabled,
+      sort_order: account.sortOrder,
       last_login_at: account.lastLoginAt,
       last_error: account.lastError,
       created_at: account.createdAt,

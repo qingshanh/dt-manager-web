@@ -16,7 +16,7 @@ import { requireAuth } from "./middleware/auth.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { ensureDefaultAdmin } from "./services/admin.service.js";
 import { accountMonitorService } from "./services/account-monitor.js";
-import { ensureDefaultSettings, getSettingsMap } from "./services/settings.service.js";
+import { ensureDefaultSettings, getGatewayMode, getSettingsMap } from "./services/settings.service.js";
 import { telegramBotService } from "./services/telegram-bot.js";
 import { accountAutoRefreshService } from "./services/account-auto-refresh.js";
 import { phoneExpiryReminderService } from "./services/phone-expiry-reminder.js";
@@ -67,13 +67,17 @@ app.use(
   })
 );
 
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    version: config.APP_VERSION,
-    now: new Date().toISOString(),
-    gatewayMode: config.DT_GATEWAY_MODE
-  });
+app.get("/health", async (_req, res, next) => {
+  try {
+    res.json({
+      ok: true,
+      version: config.APP_VERSION,
+      now: new Date().toISOString(),
+      gatewayMode: await getGatewayMode()
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.use("/api/auth", authRouter);

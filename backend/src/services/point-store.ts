@@ -4,9 +4,13 @@ import { AppError, assertFound } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { serializeSnapshot } from "../utils/serializers.js";
 import { fetchPublicJson } from "./public-account-enrichment.js";
-import { sendPointStoreTelegramNotification } from "./telegram-notifier.js";
+import { pointStoreNotificationTitle, sendPointStoreTelegramNotification } from "./telegram-notifier.js";
 
 type JsonRecord = Record<string, unknown>;
+
+const POINT_STORE_ORDER_GUARD_MS = 15 * 60_000;
+const POINT_STORE_ORDER_UNCERTAIN_MESSAGE = "兑换请求结果未知，系统已阻止重复提交。请先检查历史订单、当前积分和收件邮箱，确认未兑换后再重试。";
+const activePointStoreOrderKeys = new Set<string>();
 
 export type PointStoreProduct = {
   productId: string;
@@ -40,6 +44,8 @@ export async function getAccountPointStore(accountId: number): Promise<AccountPo
     fetchPublicJson(`/point/userinfo?uid=${encodeURIComponent(pointUid)}&zone=800`),
     fetchPublicJson(`/pointstore/entrance?uid=${encodeURIComponent(pointUid)}&lang=cn&osType=2`)
   ]);
+  validatePointStoreBusinessResult(userInfoResponse, "获取积分信息失败");
+  validatePointStoreBusinessResult(storeResponse, "获取积分商城失败");
   const userInfo = unwrapData(userInfoResponse);
   const store = unwrapData(storeResponse);
   const products = normalizeProducts(store);
@@ -75,6 +81,13 @@ export async function orderAccountPointStoreProduct(accountId: number, productId
     throw new AppError("当前账户没有邮箱，无法作为积分商城兑换地址。", 400, 400);
   }
 
+  const orderGuardKey = `${accountId}:${productId}`;
+  if (activePointStoreOrderKeys.has(orderGuardKey)) {
+    throw new AppError("相同商品正在兑换，请等待当前请求完成，不要重复提交。", 409, 409);
+  }
+  activePointStoreOrderKeys.add(orderGuardKey);
+
+  try {
   const pointStore = await getAccountPointStore(accountId);
   const product = pointStore.products.find((item) => item.productId === productId);
   if (!product) {
@@ -88,6 +101,24 @@ export async function orderAccountPointStoreProduct(accountId: number, productId
   }
   if (pointStore.validPoint === null || pointStore.validPoint < product.price) {
     throw new AppError("当前有效积分不足，无法兑换该商品。", 400, 400);
+  }
+
+  const recentUnconfirmedOrder = await prisma.pointStoreOrder.findFirst({
+    where: {
+      accountId,
+      productId: product.productId,
+      OR: [
+        { status: "unknown" },
+        {
+          status: "submitting",
+          createdAt: { gte: new Date(Date.now() - POINT_STORE_ORDER_GUARD_MS) }
+        }
+      ]
+    },
+    orderBy: { createdAt: "desc" }
+  });
+  if (recentUnconfirmedOrder) {
+    throw new AppError(POINT_STORE_ORDER_UNCERTAIN_MESSAGE, 409, 409);
   }
 
   const orderAttempt = await prisma.pointStoreOrder.create({
@@ -110,11 +141,15 @@ export async function orderAccountPointStoreProduct(accountId: number, productId
     await prisma.pointStoreOrder.update({
       where: { id: orderAttempt.id },
       data: {
-        status: "failed",
-        rawOrderJson: safeJsonStringify({ error: error instanceof Error ? error.message : String(error) })
+        status: "unknown",
+        rawOrderJson: safeJsonStringify({
+          error: error instanceof Error ? error.message : String(error),
+          validPointBefore: pointStore.validPoint,
+          productPrice: product.price
+        })
       }
     }).catch(() => undefined);
-    throw error;
+    throw new AppError(POINT_STORE_ORDER_UNCERTAIN_MESSAGE, 504, 504);
   }
   if (pickNumber(orderResponse, ["Result"]) !== 1) {
     await prisma.pointStoreOrder.update({
@@ -132,8 +167,10 @@ export async function orderAccountPointStoreProduct(accountId: number, productId
   const orderInfoResponse = orderId
     ? await fetchPublicJson(`/pointstore/order/info?orderId=${encodeURIComponent(orderId)}&uid=${encodeURIComponent(pointStore.pointUid)}`).catch(() => null)
     : null;
-  const orderInfo = unwrapData(orderInfoResponse);
-  const status = normalizeOrderStatus(orderInfo ?? order);
+  const orderInfo = orderInfoResponse && isSuccessfulPointStoreBusinessResult(orderInfoResponse)
+    ? unwrapData(orderInfoResponse)
+    : null;
+  const status = resolveSuccessfulPointStoreOrderStatus(orderInfo, order);
   const orderTime = pickString(orderInfo, ["orderTime", "order_time", "createdAt", "created_at"]) ??
     pickString(order, ["orderTime", "order_time", "createdAt", "created_at"]);
   const storedOrder = await prisma.pointStoreOrder.update({
@@ -173,6 +210,9 @@ export async function orderAccountPointStoreProduct(accountId: number, productId
     storedOrder,
     pointStore: refreshedPointStore
   };
+  } finally {
+    activePointStoreOrderKeys.delete(orderGuardKey);
+  }
 }
 
 export async function listAccountPointStoreOrders(accountId: number) {
@@ -200,14 +240,35 @@ export async function refreshAccountPointStoreOrder(accountId: number, orderId: 
     throw new AppError(`查询订单失败：${pickString(response, ["Reason", "reason", "message"]) ?? "接口未返回成功"}`, 400, 400);
   }
   const info = unwrapData(response) ?? {};
-  return prisma.pointStoreOrder.update({
+  const nextStatus = normalizeOrderStatus(info, found.status);
+  const updated = await prisma.pointStoreOrder.update({
     where: { id: found.id },
     data: {
-      status: normalizeOrderStatus(info),
+      status: nextStatus,
       orderTime: pickString(info, ["orderTime", "order_time", "createdAt", "created_at"]) ?? found.orderTime,
       rawInfoJson: safeJsonStringify(info)
     }
   });
+  if (found.status !== nextStatus && isTerminalPointStoreStatus(nextStatus)) {
+    void sendPointStoreTelegramNotification({
+      account,
+      email: found.email,
+      productName: found.productName,
+      productId: found.productId,
+      productPrice: found.productPrice,
+      orderId: found.remoteOrderId,
+      status: nextStatus,
+      orderTime: updated.orderTime ?? updated.updatedAt
+    }).catch((error) => {
+      logger.warn("Failed to send Telegram notification for refreshed point-store order", {
+        accountId,
+        orderId: found.remoteOrderId,
+        title: pointStoreNotificationTitle(nextStatus),
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+  }
+  return updated;
 }
 
 export function serializeStoredPointStoreOrder(order: PointStoreOrder) {
@@ -414,16 +475,42 @@ function normalizeMemberPoint(value: number | null) {
   return value;
 }
 
-function normalizeOrderStatus(value: JsonRecord | null | undefined) {
+export function validatePointStoreBusinessResult(value: JsonRecord, action: string) {
+  const result = pickNumber(value, ["Result", "result"]);
+  if (result === null || result === 1) {
+    return;
+  }
+  const reason = pickString(value, ["Reason", "reason", "message", "Message"]);
+  throw new AppError(`${action}：${reason ?? "接口未返回成功"}`, 400, 400);
+}
+
+export function resolveSuccessfulPointStoreOrderStatus(orderInfo: JsonRecord | null, order: JsonRecord) {
+  return readOrderStatus(orderInfo) ?? readOrderStatus(order) ?? "completed";
+}
+
+function isSuccessfulPointStoreBusinessResult(value: JsonRecord) {
+  const result = pickNumber(value, ["Result", "result"]);
+  return result === null || result === 1;
+}
+
+function normalizeOrderStatus(value: JsonRecord | null | undefined, fallback = "pending") {
+  return readOrderStatus(value) ?? fallback;
+}
+
+function readOrderStatus(value: JsonRecord | null | undefined) {
   const text = pickString(value, ["status", "orderStatus", "order_status", "state"]);
   if (text) {
     return text;
   }
   const numeric = pickNumber(value, ["status", "orderStatus", "order_status", "state"]);
   if (numeric === null) {
-    return "pending";
+    return null;
   }
   return ({ 0: "pending", 1: "completed", 2: "failed", 3: "processing" } as Record<number, string>)[numeric] ?? String(numeric);
+}
+
+function isTerminalPointStoreStatus(status: string) {
+  return /complete|success|done|fulfilled|fail|cancel|error|reject|^1$|^2$/i.test(status.trim());
 }
 
 function normalizeOptionalString(value: string | null | undefined) {

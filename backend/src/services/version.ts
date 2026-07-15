@@ -19,13 +19,16 @@ type VersionCommit = {
   url: string | null;
 };
 
+export type VersionRelation = "current" | "behind" | "ahead" | "diverged" | "unknown";
+
 let cachedRemote: { expiresAt: number; commits: VersionCommit[]; error: string | null } | null = null;
 
 export async function getVersionInfo(force = false) {
   const [version, commit] = await Promise.all([readVersion(), readLocalCommit()]);
   const remote = await readRemoteVersions(force);
   const latest = remote.commits[0] ?? null;
-  const updateAvailable = commit.sha && latest?.sha ? !sameCommitSha(commit.sha, latest.sha) : null;
+  const updateStatus = await resolveVersionRelation(commit.sha, latest?.sha ?? "", remote.commits);
+  const updateAvailable = updateStatus === "behind" ? true : updateStatus === "current" || updateStatus === "ahead" ? false : null;
   const buildVersion = commit.shortSha ? `${version}+${commit.shortSha}` : version;
   return {
     version,
@@ -37,10 +40,46 @@ export async function getVersionInfo(force = false) {
     update_branch: config.APP_UPDATE_BRANCH,
     latest_version: latest,
     update_available: updateAvailable,
+    update_status: updateStatus,
     check_error: remote.error,
     checked_at: new Date().toISOString(),
     recent_versions: remote.commits.length > 0 ? remote.commits : commit.recent
   };
+}
+
+async function resolveVersionRelation(localSha: string, latestSha: string, remoteCommits: VersionCommit[]): Promise<VersionRelation> {
+  if (!localSha || !latestSha) {
+    return "unknown";
+  }
+  const sameCommit = sameCommitSha(localSha, latestSha);
+  const localFoundInRemoteHistory = remoteCommits.some((item) => sameCommitSha(localSha, item.sha));
+  if (sameCommit || localFoundInRemoteHistory) {
+    return classifyVersionRelation({
+      sameCommit,
+      localFoundInRemoteHistory,
+      localIsAncestor: null,
+      latestIsAncestor: null
+    });
+  }
+
+  const [localIsAncestor, latestIsAncestor] = await Promise.all([
+    gitIsAncestor(localSha, latestSha),
+    gitIsAncestor(latestSha, localSha)
+  ]);
+  return classifyVersionRelation({ sameCommit, localFoundInRemoteHistory, localIsAncestor, latestIsAncestor });
+}
+
+export function classifyVersionRelation(input: {
+  sameCommit: boolean;
+  localFoundInRemoteHistory: boolean;
+  localIsAncestor: boolean | null;
+  latestIsAncestor: boolean | null;
+}): VersionRelation {
+  if (input.sameCommit) return "current";
+  if (input.localFoundInRemoteHistory || input.localIsAncestor === true) return "behind";
+  if (input.latestIsAncestor === true) return "ahead";
+  if (input.localIsAncestor === false && input.latestIsAncestor === false) return "diverged";
+  return "unknown";
 }
 
 function sameCommitSha(left: string, right: string) {
@@ -68,7 +107,7 @@ async function readLocalCommit() {
   const sha = envSha || await gitValue(["rev-parse", "HEAD"]) || fileHead.sha;
   const shortSha = sha ? sha.slice(0, 8) : "";
   const branch = await gitValue(["rev-parse", "--abbrev-ref", "HEAD"]) || fileHead.branch;
-  const log = await gitValue(["log", "-10", "--pretty=format:%H%x1f%h%x1f%aI%x1f%s%x1e"]);
+  const log = await gitValue(["log", "-100", "--pretty=format:%H%x1f%h%x1f%aI%x1f%s%x1e"]);
   return {
     sha,
     shortSha,
@@ -118,13 +157,33 @@ async function gitValue(args: string[]) {
   }
 }
 
+async function gitIsAncestor(ancestorSha: string, descendantSha: string): Promise<boolean | null> {
+  try {
+    await execFileAsync("git", ["merge-base", "--is-ancestor", ancestorSha, descendantSha], {
+      cwd: projectRoot,
+      timeout: 3_000,
+      windowsHide: true
+    });
+    return true;
+  } catch (error) {
+    if (isExecExitCode(error, 1)) {
+      return false;
+    }
+    return null;
+  }
+}
+
+function isExecExitCode(error: unknown, expected: number) {
+  return typeof error === "object" && error !== null && "code" in error && Number((error as { code?: unknown }).code) === expected;
+}
+
 async function readRemoteVersions(force: boolean) {
   if (!force && cachedRemote && cachedRemote.expiresAt > Date.now()) {
     return cachedRemote;
   }
   try {
     const response = await fetch(
-      `https://api.github.com/repos/${config.APP_REPOSITORY}/commits?sha=${encodeURIComponent(config.APP_UPDATE_BRANCH)}&per_page=10`,
+      `https://api.github.com/repos/${config.APP_REPOSITORY}/commits?sha=${encodeURIComponent(config.APP_UPDATE_BRANCH)}&per_page=100`,
       {
         headers: { accept: "application/vnd.github+json", "user-agent": "dt-manager-version-check" },
         signal: AbortSignal.timeout(UPDATE_TIMEOUT_MS)

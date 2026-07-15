@@ -8,7 +8,7 @@ import { AppError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
 import { getSettingsMap } from "../settings.service.js";
 import { parseDirectActionTemplate, type DirectActionTemplate, type DirectTemplateParams } from "./direct-template.js";
-import { parseSmsPush, type ParsedSmsPush } from "./message-parser.js";
+import { isOfflineMessageIndexPush, parseSmsPush, type ParsedSmsPush } from "./message-parser.js";
 import type {
   DingtoneGateway,
   DingtoneLoginInput,
@@ -35,7 +35,6 @@ type DirectRuntimeConfig = {
   appVersion: string;
   dingdongAppVersion: string;
   apkCertificateSign: string;
-  listenHostConcurrency: number;
   proxyUrl: string;
 };
 
@@ -243,6 +242,7 @@ type DirectPhoneActionLabel =
   | "cancelPhone"
   | "pausePhone"
   | "resumePhone"
+  | "enableSmsReceive"
   | "updatePhoneLabel"
   | "clearPhoneLabel";
 
@@ -251,11 +251,19 @@ type ActiveDirectPushListener = {
   preempted: boolean;
   session?: DirectSession;
   sessions?: Set<DirectSession>;
+  done: Promise<void>;
+  resolveDone: () => void;
 };
 
 const CONNECT_REQUEST = Buffer.from("01070000000e820100000000c88d", "hex");
 const MAX_DIRECT_TRACE_FRAMES = 80;
 const APP_DIRECT_PUSH_HOSTS = [
+  // These hosts delivered real SMS frames in production monitor sessions.
+  "20.97.117.109",
+  "206.189.228.89",
+  "44.199.32.84",
+  "44.198.131.100",
+  "157.230.90.253",
   "13.232.238.50",
   // Observed in TalkU foreground RTC/SMS captures and queryRtcServersEx responses.
   "13.115.134.59",
@@ -289,20 +297,29 @@ const DIRECT_ACTIVATION_CLIENT_VERSION = 1023;
 const DIRECT_ACTIVATE_EMAIL_CLIENT_VERSION = -1610218240;
 const DIRECT_ACTIVATION_EMAIL_CRYPTO_IV = Buffer.from("5875b9f15ed445239539cb455cdcbed7", "hex");
 const DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS = 4_000;
-const DIRECT_OFFLINE_CATCHUP_INTERVAL_MS = 5 * 60_000;
+const DIRECT_OFFLINE_CATCHUP_INTERVAL_MS = 30_000;
 const DIRECT_OFFLINE_CATCHUP_RETRY_MS = 30_000;
 const DIRECT_NOTIFY_ONLY_CATCHUP_THROTTLE_MS = 60_000;
+const DIRECT_WEB_OFFLINE_POLL_INTERVAL_MS = 60_000;
+const DIRECT_RECONNECT_BACKOFF_MAX_MS = 1_000;
+const DIRECT_SESSION_OPERATION_IDLE_WAIT_MS = 5_000;
+const DIRECT_PUSH_HOST_CONCURRENCY = 2;
 const DIRECT_PUSH_NON_SMS_FRAME_BATCH_LIMIT = 5;
 const DIRECT_PUSH_NON_SMS_FRAME_PAUSE_MS = 1_000;
 const DIRECT_IDLE_NON_SMS_FRAME_PAUSE_BATCH = 3;
 const DIRECT_IDLE_NON_SMS_FRAME_PAUSE_MS = 750;
 const DIRECT_SOCKET_FRAME_BUDGET_PER_TICK = 20;
+const DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS = 5_000;
+const DIRECT_SESSION_KEEPALIVE_INTERVAL_MS = 5_000;
+const DINGDONG_SESSION_KEEPALIVE_INTERVAL_MS = 2_000;
 const CAPTURED_OFFLINE_FIELDS = {
   deviceId: "And.11111111111111111111111111111111.dttalk"
 } as const;
 const activeDirectPushListeners = new Map<string, ActiveDirectPushListener>();
 const directSessionOperationLocks = new Map<string, Promise<void>>();
 const directAccountPhoneCountryKeyCache = new Map<string, Set<string>>();
+const directWebOfflineDeliveryTrackers = new Map<string, DirectWebOfflineDeliveryTracker>();
+const directSmsHostAffinity = new Map<string, string[]>();
 const LOGIN_INIT_PACKET = Buffer.from(
   "010700000399810727c6004700000389010200000389d33d000300502788000000000000000108010000000001000000010000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e3031000000090000032a0000002b416e642e30303030303030303030303030303030303030303030303030303030303030302e647474616c6b0000000f3130303030303030303030303030300000002030303030303030303030303030303030303030303030303030303030303030300000000932303334303431393700000016706c616365686f6c646572406578616d706c652e696fd33d0003005027880000000002000000117b227374617475734f6666223a2230227d0000027764657669636549643d416e642e30303030303030303030303030303030303030303030303030303030303030302e647474616c6b267573657249643d31303030303030303030303030303026746f6b656e3d3030303030303030303030303030303030303030303030303030303030303030266d616769633d35343037372677536974653d33266477486f73743d3532353330303026616464724368616e67653d3026547261636b436f64653d343030353131383533303132393130313126634150494c6576656c3d31264c433d7a68266a736f6e3d253762253232436c69656e7456657273696f6e2532322533612d31363130323138373531253263253232436f6e6e65637456657273696f6e253232253361313638343533313425326325323250726573656e63654d6573736167652532322533612532322537622535632532327374617475734f66662535632532322533612535632532323025356325323225376425323225326325323250726573656e63655374617475732532322533613225326325323274696d657a6f6e65253232253361253232474d542532623038253361303025323225376426636c69656e74496e666f3d25376225323270696e6754696d65253232253361253232313030303030253362313030303030253232253263253232636f6e6e65637465645625323225336130253263253232686173562532322533613025326325323261707049642532322533612532326d652e74616c6b796f752e6170702e696d2532322532632532327369676e4d643525323225336125323263333830656335626638383731626164646133383764343137396262376134312532322537642641736b41636b3d310107000000fa810727c60047000000ea0102000000ead33d000300502788000000000000000101010000000001000000020000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e3031000000080000008b0000000000000012676574496e666f4265666f72654c6f67696e0000006600000065789c0dccb10a84300c00d0bfe9589268aeedd0419cdce5f6d0e4a02855b4dcf7ebf2c6a7f6afc516cd53531fc9e49388852c618c2fe9c71858690802685e7b977d73eb25659b0fb53c023062e4019012230427e7f96eaeecd55affda75d7a3e5071a051edd00000000",
   "hex"
@@ -334,6 +351,10 @@ const TEMPLATES = {
   ),
   getPrivateNumber: Buffer.from(
     "010700000152810727c6004700000142010200000142d33d0003005027880000000000000001010100000000010000001c0000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e303100000008000000e300000001320000001c2f7073746e2f73686172652f676574507269766174654e756d626572000000e7000000b2789c5d8e3d6fc3300c44ff8d464324f5c5c1439029738bee2c45058203db70d4fefe6aee72c33d1cde55fbed6a8fbadef6ba1434498c51d0184a99c12d428e15298b075bea18f2dadce725badd8f6a6bf03e0294481e422c1cb2d357b77d7cd9f5eec7bea6851670729eff8bed6ed7e8adab0cfbe8cf7dd5e699c45bfaf6b9aa9116f3b1e51a841513a8fb79db357f4e0f502164f41c08dc38369b6bb490724ecc1430a5493443442c020dada53faa1b442e00000000",
+    "hex"
+  ),
+  getWebOfflineMessage: Buffer.from(
+    "0107000000eb81078656004e000000db0102000000dbe7e9000300508372000000000000000101010000000001000000150000001765372e65392e30302e30332e30302e35302e38332e37320000001730302e30302e30302e30302e30302e30302e30302e3031000000080000007c000000013200000011676574557365724f66666c696e654d73670000009800000056789c4b492dcb4c4ef54cb175cc4bd1332000f4524a4a1273b2d54a8b538b3c536c0d5165d54af2b353f36c0919a2165294989ced9c9f926a6b6260606a6868616a6c60686469686068a896e402768fad21006f6125e500000000",
     "hex"
   ),
   getUserSetting: Buffer.from(
@@ -874,6 +895,29 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     };
   }
 
+  async enablePhoneNumberSmsReception(
+    account: { dtUserId: string; token: string; deviceId?: string | null },
+    phoneNumber: string,
+    phone?: DirectPhoneActionContext
+  ): Promise<Partial<DingtonePhoneNumber>> {
+    const context = { ...phone, phoneNumber };
+    const suspendFlag = context.status === "paused" ? 1 : 0;
+    const result = await this.callDirectPhoneAction(
+      "enableSmsReceive",
+      account,
+      () => buildPrivateNumberSettingQuery(account, context, suspendFlag),
+      "dt_direct_template_phone_setting",
+      buildPhoneTemplateParams(context, { phoneNumber, action: "enable-sms", allowReceiveSMS: 1, suspendFlag }),
+      { acceptSocketCloseAfterWrite: true }
+    );
+    assertDirectApiSuccess(result, "enableSmsReceive");
+    return {
+      phoneNumber,
+      allowReceiveSms: true,
+      status: context.status
+    };
+  }
+
   async buildPhoneActionDryRuns(
     account: { dtUserId: string; token: string; deviceId?: string | null },
     options: {
@@ -1046,7 +1090,7 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     handler: (session: DirectSession) => Promise<T>,
     maxAttempts = 2
   ): Promise<T> {
-    if (preemptActiveDirectPushListener(account)) {
+    if (await preemptActiveDirectPushListener(account)) {
       await delay(750);
     }
     return runWithDirectSessionOperationLock(account, async () => {
@@ -1144,6 +1188,7 @@ export async function listenDirectSessionPushes(input: {
   maxPushFrames?: number;
   onPush?: (push: DirectProbePushResult) => Promise<void> | void;
   onFrame?: (push: DirectProbePushResult, host: string) => Promise<void> | void;
+  onWebOfflineMessages?: (messages: DirectWebOfflineMessage[], host: string) => Promise<void> | void;
   onOfflineCatchup?: (status: {
     host: string;
     reason: "startup" | "interval" | "notify-only";
@@ -1152,16 +1197,36 @@ export async function listenDirectSessionPushes(input: {
     sendCount: number;
     error: string | null;
   }) => Promise<void> | void;
-  onWebOfflineMessages?: (messages: DirectWebOfflineMessage[], status: {
+  onHostStatus?: (status: {
     host: string;
-    reason: "startup" | "interval" | "notify-only";
+    state: "connecting" | "connected" | "failed";
     error: string | null;
   }) => Promise<void> | void;
+  shouldContinue?: () => boolean;
+  onListenWindowExtended?: () => Promise<void> | void;
 }) {
   const runtime = await getDirectRuntimeConfig();
-  const baseHosts = uniqueHosts([runtime.primaryHost, runtime.backupHost, ...APP_DIRECT_PUSH_HOSTS]);
+  const baseHosts = getPrioritizedDirectPushHosts(runtime, input.account);
   const maxPushFrames = input.maxPushFrames ?? Number.MAX_SAFE_INTEGER;
-  const deadline = Date.now() + Math.max(1, input.listenSeconds) * 1000;
+  const listenWindowMs = Math.max(1, input.listenSeconds) * 1000;
+  let deadline = Date.now() + listenWindowMs;
+  const hasRemainingListenWindow = () => {
+    const previousDeadline = deadline;
+    const nextDeadline = extendDirectListenDeadlineForTest(deadline, listenWindowMs, input.shouldContinue);
+    if (nextDeadline === null) {
+      return false;
+    }
+    deadline = nextDeadline;
+    if (nextDeadline > previousDeadline) {
+      void Promise.resolve(input.onListenWindowExtended?.()).catch((error) => {
+        logger.warn("Direct listen window extension callback failed", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+    }
+    return true;
+  };
+  const isWithinCurrentListenWindow = () => Date.now() < deadline;
   const pushes: DirectProbePushResult[] = [];
   const trace: DirectProbeFrameTrace[] = [];
   let offlineTemplateSent = false;
@@ -1169,20 +1234,45 @@ export async function listenDirectSessionPushes(input: {
   let offlineTemplateAttempted = false;
   let offlineTemplateSendCount = 0;
   let offlineCatchupInFlight: Promise<void> | null = null;
+  let webOfflinePollInFlight: Promise<void> | null = null;
   const calls: DirectProbeCallResult[] = [];
+  let resolveListenerDone!: () => void;
+  const listenerDone = new Promise<void>((resolve) => {
+    resolveListenerDone = resolve;
+  });
   const listener: ActiveDirectPushListener = {
     key: directSessionAccountKey(input.account),
     preempted: false,
-    sessions: new Set()
+    sessions: new Set(),
+    done: listenerDone,
+    resolveDone: resolveListenerDone
   };
   let lastError: unknown;
   let selectedHost = baseHosts[0] ?? runtime.primaryHost;
   let attempts = 0;
+  let successfulPairs = 0;
   let nextOfflineCatchupAt = 0;
   let nextNotifyOnlyCatchupAt = 0;
+  let nextWebOfflinePollAt = 0;
 
-  preemptActiveDirectPushListener(input.account);
+  await preemptActiveDirectPushListener(input.account);
   activeDirectPushListeners.set(listener.key, listener);
+
+  const reportHostStatus = async (
+    host: string,
+    state: "connecting" | "connected" | "failed",
+    error: string | null
+  ) => {
+    try {
+      await input.onHostStatus?.({ host, state, error });
+    } catch (callbackError) {
+      logger.warn("Direct host status callback failed", {
+        host,
+        state,
+        error: callbackError instanceof Error ? callbackError.message : String(callbackError)
+      });
+    }
+  };
 
   const requestOfflineCatchup = async (session: DirectSession, host: string, reason: "startup" | "interval" | "notify-only") => {
     if (offlineCatchupInFlight) {
@@ -1215,45 +1305,7 @@ export async function listenDirectSessionPushes(input: {
           error: offlineTemplateError
         });
       } finally {
-        let webOfflineError: string | null = null;
-        let webOfflineMessages: DirectWebOfflineMessage[] = [];
-        try {
-          const payload = await session.callCommonRestJson(
-            "getWebOfflineMessage",
-            "getWebOfflineMessage",
-            buildGetWebOfflineMessageQuery(input.account, runtime, session.nextTrackCode()),
-            Math.min(5_000, runtime.ioTimeoutMs)
-          );
-          webOfflineMessages = normalizeDirectWebOfflineMessages(payload);
-          if (webOfflineMessages.length > 0) {
-            logger.info("Direct web offline messages fetched", {
-              host,
-              reason,
-              count: webOfflineMessages.length
-            });
-          }
-        } catch (error) {
-          webOfflineError = error instanceof Error ? error.message : String(error);
-          logger.debug("Direct getWebOfflineMessage did not return usable data", {
-            host,
-            reason,
-            error: webOfflineError
-          });
-        }
-        try {
-          await input.onWebOfflineMessages?.(webOfflineMessages, {
-            host,
-            reason,
-            error: webOfflineError
-          });
-        } catch (error) {
-          logger.warn("Direct web offline message callback failed", {
-            host,
-            reason,
-            error: error instanceof Error ? error.message : String(error)
-          });
-        }
-        nextOfflineCatchupAt = Date.now() + (offlineTemplateError ? DIRECT_OFFLINE_CATCHUP_RETRY_MS : DIRECT_OFFLINE_CATCHUP_INTERVAL_MS);
+        nextOfflineCatchupAt = offlineTemplateError ? Date.now() + DIRECT_OFFLINE_CATCHUP_RETRY_MS : deadline;
         try {
           await input.onOfflineCatchup?.({
             host,
@@ -1276,105 +1328,352 @@ export async function listenDirectSessionPushes(input: {
     await offlineCatchupInFlight;
   };
 
+  const requestWebOfflineMessages = async (session: DirectSession, host: string) => {
+    if (webOfflinePollInFlight) {
+      await webOfflinePollInFlight;
+      return;
+    }
+    webOfflinePollInFlight = (async () => {
+      const payload = await session.callJsonFromTemplate("getWebOfflineMessage", TEMPLATES.getWebOfflineMessage, {
+        deviceId: accountDeviceId(input.account),
+        userId: input.account.dtUserId,
+        token: input.account.token,
+        TrackCode: session.nextTrackCode(),
+        bDevice: 1
+      });
+      const messages = normalizeDirectWebOfflineMessages(payload, input.account.appVariant);
+      await deliverDirectWebOfflineMessages(
+        messages,
+        host,
+        input.onWebOfflineMessages,
+        getDirectWebOfflineDeliveryTracker(input.account)
+      );
+    })()
+      .catch((error) => {
+        logger.warn("Direct web-offline message poll failed", {
+          host,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      })
+      .finally(() => {
+        nextWebOfflinePollAt = Date.now() + DIRECT_WEB_OFFLINE_POLL_INTERVAL_MS;
+        webOfflinePollInFlight = null;
+      });
+    await webOfflinePollInFlight;
+  };
+
   const hostErrors: unknown[] = [];
 
   try {
-    const hosts = baseHosts;
-    let hostCursor = 0;
-    const nextListenHost = () => hosts[hostCursor++ % hosts.length] ?? runtime.primaryHost;
-    const workerCount = Math.max(1, Math.min(runtime.listenHostConcurrency, hosts.length));
-    const assignedHosts = hosts.slice(0, workerCount);
-    hostCursor = assignedHosts.length;
-    await Promise.all(
-      assignedHosts.map(async (initialHost) => {
-        let preferredHost = initialHost;
-        while (!listener.preempted && Date.now() < deadline && pushes.length < maxPushFrames) {
-          const host = preferredHost;
-          preferredHost = nextListenHost();
-          await waitForDirectSessionOperationIdle(input.account);
-          if (listener.preempted || Date.now() >= deadline || pushes.length >= maxPushFrames) {
-            break;
-          }
-
-          const session = new DirectSession(runtime, host);
-          listener.session = session;
-          listener.sessions?.add(session);
-          attempts += 1;
-          selectedHost = host;
+    const discoveredHosts = input.shouldContinue
+      ? await (async () => {
+          const discoverySession = new DirectSession(runtime, baseHosts[0] ?? runtime.primaryHost);
+          listener.sessions?.add(discoverySession);
           try {
-            let tracedFrameCount = 0;
-            await session.open(input.account);
-            calls.push(...(await runPushListenPrimeCalls(session, runtime, input.account)));
-            if (!offlineTemplateAttempted || Date.now() >= nextOfflineCatchupAt) {
-              await requestOfflineCatchup(session, host, offlineTemplateAttempted ? "interval" : "startup");
-            }
-            while (!listener.preempted && Date.now() < deadline && pushes.length < maxPushFrames) {
-              const remainingFrames = Math.max(0, maxPushFrames - pushes.length);
-              if (remainingFrames <= 0) {
-                break;
-              }
-              const waitUntil = nextOfflineCatchupAt > 0 ? Math.min(deadline, nextOfflineCatchupAt) : deadline;
-              const waitMs = Math.max(250, Math.min(5_000, waitUntil - Date.now()));
-              const nextPushes = await session.waitForPushes(
-                waitMs,
-                remainingFrames,
-                input.onPush,
-                async (push, frameHost) => {
-                  if (isNotifyOnlyMessageIndexPush(push) && Date.now() >= nextNotifyOnlyCatchupAt) {
-                    nextNotifyOnlyCatchupAt = Date.now() + DIRECT_NOTIFY_ONLY_CATCHUP_THROTTLE_MS;
-                    await requestOfflineCatchup(session, host, "notify-only");
-                  }
-                  await input.onFrame?.(push, frameHost);
-                }
-              );
-              pushes.push(...nextPushes);
-              const sessionTrace = session.getTrace();
-              trace.push(...sessionTrace.slice(tracedFrameCount));
-              tracedFrameCount = sessionTrace.length;
-              lastError = undefined;
-              if (listener.preempted || Date.now() >= deadline || pushes.length >= maxPushFrames) {
-                break;
-              }
-              if (Date.now() >= nextOfflineCatchupAt) {
-                await requestOfflineCatchup(session, host, "interval");
-              }
-            }
-            await session.close();
+            return await discoverDirectPushHostsForListener(discoverySession, runtime, input.account);
+          } catch (error) {
+            logger.warn("Direct account gateway discovery failed; using known SMS gateways", {
+              dtUserId: input.account.dtUserId,
+              error: error instanceof Error ? error.message : String(error)
+            });
+            return [];
+          } finally {
+            listener.sessions?.delete(discoverySession);
+            await discoverySession.close().catch(() => undefined);
+          }
+        })()
+      : [];
+    if (input.shouldContinue) {
+      deadline = Date.now() + listenWindowMs;
+    }
+    const hosts = uniqueHosts([baseHosts[0] ?? runtime.primaryHost, ...discoveredHosts, ...baseHosts]);
+    const workerHosts = hosts.slice(0, DIRECT_PUSH_HOST_CONCURRENCY);
+    const registrationOwnerHost = workerHosts[0] ?? runtime.primaryHost;
+    const routeCoordinator = createDirectRouteCoordinator(registrationOwnerHost);
+    const runPairedHostWorker = async (host: string) => {
+      while (!listener.preempted && hasRemainingListenWindow() && pushes.length < maxPushFrames) {
+      const operationIdle = await waitForDirectSessionOperationIdle(input.account, DIRECT_SESSION_OPERATION_IDLE_WAIT_MS);
+      if (!operationIdle) {
+        logger.warn("Direct session operation remained busy; starting SMS listener anyway", {
+          dtUserId: input.account.dtUserId,
+          waitMs: DIRECT_SESSION_OPERATION_IDLE_WAIT_MS
+        });
+      }
+      if (listener.preempted || !isWithinCurrentListenWindow() || pushes.length >= maxPushFrames) {
+        break;
+      }
+
+      const pushSession = new DirectSession(runtime, host);
+      let linkSession: DirectSession | null = null;
+      let linkRegistrationEpoch: number | null = null;
+      listener.session = pushSession;
+      listener.sessions?.add(pushSession);
+      if (!isActiveDirectPushListener(listener)) {
+        await pushSession.close().catch(() => undefined);
+        listener.sessions?.delete(pushSession);
+        break;
+      }
+      attempts += 1;
+      selectedHost = host;
+      await reportHostStatus(host, "connecting", null);
+      let pushTraceCount = 0;
+      let linkTraceCount = 0;
+      const collectPairTrace = () => {
+        const pushTrace = pushSession.getTrace();
+        trace.push(...pushTrace.slice(pushTraceCount));
+        pushTraceCount = pushTrace.length;
+        if (linkSession) {
+          const linkTrace = linkSession.getTrace();
+          trace.push(...linkTrace.slice(linkTraceCount));
+          linkTraceCount = linkTrace.length;
+        }
+      };
+      const closeLinkSession = async () => {
+        if (!linkSession) {
+          return;
+        }
+        collectPairTrace();
+        const closingSession = linkSession;
+        linkSession = null;
+        linkTraceCount = 0;
+        if (linkRegistrationEpoch !== null) {
+          linkRegistrationEpoch = null;
+        }
+        listener.sessions?.delete(closingSession);
+        await closingSession.close().catch(() => undefined);
+      };
+      const ensureRouteRegistration = async (currentLinkSession: DirectSession) => {
+        if (linkRegistrationEpoch !== null && routeCoordinator.isOwner(host, linkRegistrationEpoch)) {
+          return true;
+        }
+        if (!routeCoordinator.shouldClaim(host)) {
+          logger.info("Direct secondary paired workers stay authenticated without replacing the primary SMS route", {
+            host,
+            registrationOwnerHost,
+            routeOwnerHost: routeCoordinator.ownerHost()
+          });
+          return false;
+        }
+        if (!isActiveDirectPushListener(listener)) {
+          throw new Error("Direct listener was preempted before route registration");
+        }
+        const reservedEpoch = routeCoordinator.claim(host);
+        try {
+          if (!isActiveDirectPushListener(listener)) {
+            throw new Error("Direct listener was preempted before route registration");
+          }
+          calls.push(await runPushLinkRegistration(currentLinkSession, runtime, input.account));
+          const registration = calls[calls.length - 1];
+          if (!registration?.ok) {
+            throw new Error(registration?.error ?? "Direct paired link registration failed");
+          }
+          if (!isActiveDirectPushListener(listener)) {
+            throw new Error("Direct listener was preempted during route registration");
+          }
+          linkRegistrationEpoch = reservedEpoch;
+          logger.info("Direct paired worker owns the SMS route", {
+            host,
+            registrationOwnerHost
+          });
+          return true;
+        } catch (error) {
+          routeCoordinator.release(host, reservedEpoch);
+          if (host === registrationOwnerHost) {
+            routeCoordinator.markPrimaryUnavailable();
+          }
+          throw error;
+        }
+      };
+      const ensureLinkSession = async () => {
+        if (linkSession?.isOpen()) {
+          return linkSession;
+        }
+        if (!isActiveDirectPushListener(listener)) {
+          throw new Error("Direct listener was preempted before link session creation");
+        }
+        await closeLinkSession();
+        linkSession = new DirectSession(runtime, host);
+        listener.sessions?.add(linkSession);
+        try {
+          await linkSession.openLink(input.account);
+          if (!isActiveDirectPushListener(listener)) {
+            throw new Error("Direct listener was preempted after link authentication");
+          }
+          calls.push(...(await runPushMaintenanceCalls(linkSession, runtime, input.account)));
+          if (!isActiveDirectPushListener(listener)) {
+            throw new Error("Direct listener was preempted during private-number refresh");
+          }
+          await ensureRouteRegistration(linkSession);
+          successfulPairs += 1;
+          await reportHostStatus(host, "connected", null);
+          offlineTemplateAttempted = true;
+          offlineTemplateSent = true;
+          offlineTemplateSendCount += 1;
+          offlineTemplateError = null;
+          nextOfflineCatchupAt = deadline;
+          if (nextWebOfflinePollAt <= 0) {
+            nextWebOfflinePollAt = Date.now() + DIRECT_WEB_OFFLINE_POLL_INTERVAL_MS;
+          }
+          try {
+            await input.onOfflineCatchup?.({
+              host,
+              reason: "startup",
+              attempted: true,
+              sent: true,
+              sendCount: offlineTemplateSendCount,
+              error: null
+            });
+          } catch (error) {
+            logger.warn("Direct offline catch-up status callback failed", {
+              host,
+              reason: "startup",
+              error: error instanceof Error ? error.message : String(error)
+            });
+          }
+          return linkSession;
+        } catch (error) {
+          collectPairTrace();
+          await closeLinkSession();
+          throw error;
+        }
+      };
+      const handlePairedFrame = async (push: DirectProbePushResult, frameHost: string) => {
+        if (push.sms) {
+          rememberDirectSmsHost(input.account, frameHost);
+        }
+        if (isNotifyOnlyMessageIndexPush(push) && Date.now() >= nextNotifyOnlyCatchupAt) {
+          nextNotifyOnlyCatchupAt = Date.now() + DIRECT_NOTIFY_ONLY_CATCHUP_THROTTLE_MS;
+          try {
+            const currentLinkSession = await ensureLinkSession();
+            await requestOfflineCatchup(currentLinkSession, host, "notify-only");
+          } catch (error) {
+            logger.warn("Direct notify-only catch-up could not refresh the paired link", {
+              host,
+              error: error instanceof Error ? error.message : String(error)
+            });
+          }
+        }
+        await input.onFrame?.(push, frameHost);
+      };
+
+      try {
+        await pushSession.openPush(input.account);
+
+        while (!listener.preempted && isWithinCurrentListenWindow() && pushes.length < maxPushFrames) {
+          let currentLinkSession: DirectSession;
+          try {
+            currentLinkSession = await ensureLinkSession();
+            await ensureRouteRegistration(currentLinkSession);
+            lastError = undefined;
           } catch (error) {
             lastError = error;
             hostErrors.push(error);
-            trace.push(...session.getTrace());
-            await session.close().catch(() => undefined);
-            if (!listener.preempted) {
-              logger.warn("Direct Dingtone push listen failed, reconnecting inside listen window", {
-                host,
-                attempt: attempts,
-                error: error instanceof Error ? error.message : String(error)
-              });
-
-              if (isFatalDirectSessionError(error)) {
-                throw normalizeDirectError(error);
-              }
-              const backoffMs = Math.min(10_000, 1_000 + Math.min(attempts, 6) * 1_000);
-              if (Date.now() + backoffMs < deadline) {
-                await delay(backoffMs);
-              }
+            logger.warn("Direct paired link registration failed; keeping push socket open", {
+              host,
+              pushAttempt: attempts,
+              error: error instanceof Error ? error.message : String(error)
+            });
+            if (isFatalDirectSessionError(error)) {
+              throw normalizeDirectError(error);
             }
-          } finally {
-            listener.sessions?.delete(session);
-            if (listener.session === session) {
-              listener.session = undefined;
+            await delay(Math.min(DIRECT_RECONNECT_BACKOFF_MAX_MS, 500));
+            continue;
+          }
+          const remainingFrames = Math.max(0, maxPushFrames - pushes.length);
+          if (remainingFrames <= 0) {
+            break;
+          }
+          const waitUntil = Math.min(
+            deadline,
+            nextOfflineCatchupAt > 0 ? nextOfflineCatchupAt : deadline,
+            nextWebOfflinePollAt > 0 ? nextWebOfflinePollAt : deadline
+          );
+          const waitMs = Math.max(250, Math.min(5_000, waitUntil - Date.now()));
+          const linkWaitMs = Math.max(250, Math.ceil(waitMs / 2));
+          const nextPushes: DirectProbePushResult[] = [];
+          try {
+            nextPushes.push(
+              ...(await currentLinkSession.waitForPushes(
+                linkWaitMs,
+                remainingFrames,
+                input.onPush,
+                handlePairedFrame
+              ))
+            );
+          } catch (error) {
+            lastError = error;
+            hostErrors.push(error);
+            logger.warn("Direct registered link read failed; keeping prelogin socket open", {
+              host,
+              pushAttempt: attempts,
+              error: error instanceof Error ? error.message : String(error)
+            });
+            if (linkSession === currentLinkSession) {
+              await closeLinkSession();
+            }
+            if (isFatalDirectSessionError(error)) {
+              throw normalizeDirectError(error);
             }
           }
+          const remainingAfterLink = Math.max(0, remainingFrames - nextPushes.length);
+          if (remainingAfterLink > 0) {
+            const pushWaitMs = Math.max(250, waitMs - linkWaitMs);
+            nextPushes.push(
+              ...(await pushSession.waitForPushes(pushWaitMs, remainingAfterLink, input.onPush, handlePairedFrame))
+            );
+          }
+          pushes.push(...nextPushes);
+          collectPairTrace();
+          lastError = undefined;
+          if (listener.preempted || !isWithinCurrentListenWindow() || pushes.length >= maxPushFrames) {
+            break;
+          }
+          if (Date.now() >= nextOfflineCatchupAt) {
+            const currentLinkSession = await ensureLinkSession();
+            await requestOfflineCatchup(currentLinkSession, host, "interval");
+          }
+          if (Date.now() >= nextWebOfflinePollAt) {
+            const currentLinkSession = await ensureLinkSession();
+            await requestWebOfflineMessages(currentLinkSession, host);
+          }
         }
-      })
-    ).catch((error) => {
-      lastError = error;
-      hostErrors.push(error);
-    });
+      } catch (error) {
+        lastError = error;
+        hostErrors.push(error);
+        if (host === registrationOwnerHost) {
+          routeCoordinator.markPrimaryUnavailable();
+        }
+        await reportHostStatus(host, "failed", error instanceof Error ? error.message : String(error));
+        collectPairTrace();
+        if (!listener.preempted) {
+          logger.warn("Direct paired push listen failed, reconnecting inside listen window", {
+            host,
+            attempt: attempts,
+            error: error instanceof Error ? error.message : String(error)
+          });
+          if (isFatalDirectSessionError(error)) {
+            throw normalizeDirectError(error);
+          }
+          const backoffMs = Math.min(DIRECT_RECONNECT_BACKOFF_MAX_MS, 250 + Math.min(attempts, 3) * 250);
+          if (isWithinCurrentListenWindow() && Date.now() + backoffMs < deadline) {
+            await delay(backoffMs);
+          }
+        }
+      } finally {
+        await closeLinkSession();
+        await pushSession.close().catch(() => undefined);
+        listener.sessions?.delete(pushSession);
+        if (listener.session === pushSession) {
+          listener.session = undefined;
+        }
+      }
+      }
+    };
+
+    await Promise.allSettled(workerHosts.map(runPairedHostWorker));
 
     const fatalError = hostErrors.find((error) => isFatalDirectSessionError(error));
-    if (fatalError) {
+    if (fatalError && successfulPairs === 0) {
       throw normalizeDirectError(fatalError);
     }
   } finally {
@@ -1384,13 +1683,14 @@ export async function listenDirectSessionPushes(input: {
     if (listener.preempted && !offlineTemplateAttempted && !offlineTemplateError) {
       offlineTemplateError = "direct listener was preempted before offline template could be sent";
     }
-  }
-
-  if (!listener.preempted && attempts > 0 && trace.length === 0 && pushes.length === 0 && !offlineTemplateAttempted && hostErrors.length > 0) {
-    throw normalizeDirectError(lastError ?? hostErrors[hostErrors.length - 1]);
+    listener.resolveDone();
   }
 
   if (attempts === 0 && lastError) {
+    throw normalizeDirectError(lastError);
+  }
+
+  if (!listener.preempted && successfulPairs === 0 && lastError) {
     throw normalizeDirectError(lastError);
   }
 
@@ -1410,92 +1710,256 @@ export async function listenDirectSessionPushes(input: {
   };
 }
 
-async function discoverDirectPushHosts(
-  runtime: DirectRuntimeConfig,
-  account: {
-    dtUserId: string;
-    token: string;
-    deviceId?: string | null;
-    email?: string | null;
-    phone?: string | null;
-    appVariant?: "dingtone" | "dingdong";
-  },
-  hosts: string[],
-  listener: ActiveDirectPushListener,
-  calls: DirectProbeCallResult[],
-  deadline: number
+export function extendDirectListenDeadlineForTest(
+  deadline: number,
+  listenWindowMs: number,
+  shouldContinue?: () => boolean,
+  now = Date.now()
 ) {
-  const appVersion = resolveDirectAppVersion(account, runtime);
-  const shared = {
-    deviceId: accountDeviceId(account),
-    userId: account.dtUserId,
-    token: account.token,
-    clientVersion: appVersion,
-    appVersion,
-    apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
-  };
-  const discovered: string[] = [];
-  const visited = new Set<string>();
-  const pending = uniqueHosts(hosts);
-  const maxDiscoveryHosts = Math.max(1, Math.min(runtime.listenHostConcurrency, 4));
-  const batchSize = maxDiscoveryHosts;
-
-  while (!listener.preempted && Date.now() < deadline && pending.length > 0 && visited.size < maxDiscoveryHosts) {
-    const batch = pending.splice(0, batchSize).filter((host) => {
-      if (visited.has(host)) {
-        return false;
-      }
-      visited.add(host);
-      return true;
-    });
-    if (batch.length === 0) {
-      continue;
-    }
-
-    await Promise.all(
-      batch.map(async (host) => {
-      if (listener.preempted || Date.now() >= deadline) {
-        return;
-      }
-      await waitForDirectSessionOperationIdle(account);
-      if (listener.preempted || Date.now() >= deadline) {
-        return;
-      }
-
-      const session = new DirectSession(runtime, host);
-      listener.sessions?.add(session);
-      try {
-        await session.open(account);
-        const call = await timeProbeCall(session, `discover.queryRtcServersEx@${host}`, () =>
-          session.callJson("queryRtcServersEx", { ...shared, trackCode: session.nextTrackCode() })
-        );
-        calls.push(call);
-        if (call.payload) {
-          const nextHosts = extractRtcServerHosts(call.payload);
-          discovered.push(...nextHosts);
-          for (const nextHost of nextHosts) {
-            if (!visited.has(nextHost) && !pending.includes(nextHost)) {
-              pending.push(nextHost);
-            }
-          }
-        }
-      } catch (error) {
-        logger.warn("Direct queryRtcServersEx discovery failed", {
-          host,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      } finally {
-        listener.sessions?.delete(session);
-        await session.close().catch(() => undefined);
-      }
-      })
-    );
+  if (now < deadline) {
+    return deadline;
   }
-
-  return uniqueHosts(discovered).filter((host) => !hosts.includes(host));
+  return shouldContinue?.() ? now + Math.max(1, listenWindowMs) : null;
 }
 
-async function runPushListenPrimeCalls(
+async function pollWebOfflineMessagesOnGatewayHosts(
+  runtime: DirectRuntimeConfig,
+  account: DirectSessionAccount,
+  onMessages?: (messages: DirectWebOfflineMessage[], host: string) => Promise<void> | void,
+  deliveryTracker?: DirectWebOfflineDeliveryTracker
+) {
+  let lastError: unknown;
+  for (const host of uniqueHosts([runtime.primaryHost, runtime.backupHost])) {
+    const session = new DirectSession(runtime, host);
+    try {
+      await session.open(account);
+      const payload = await session.callJsonFromTemplate("getWebOfflineMessage", TEMPLATES.getWebOfflineMessage, {
+        deviceId: accountDeviceId(account),
+        userId: account.dtUserId,
+        token: account.token,
+        TrackCode: session.nextTrackCode(),
+        bDevice: 1
+      });
+      const messages = normalizeDirectWebOfflineMessages(payload, account.appVariant);
+      await deliverDirectWebOfflineMessages(messages, host, onMessages, deliveryTracker);
+      await session.close();
+      return;
+    } catch (error) {
+      lastError = error;
+      await session.close().catch(() => undefined);
+    }
+  }
+  throw normalizeDirectError(lastError ?? new Error("No direct gateway host accepted getUserOfflineMsg"));
+}
+
+export async function probeDirectPushSocket(input: {
+  account: DirectSessionAccount;
+  host?: string;
+  listenSeconds: number;
+  maxPushFrames?: number;
+  onPush?: (push: DirectProbePushResult) => Promise<void> | void;
+  onFrame?: (push: DirectProbePushResult, host: string) => Promise<void> | void;
+}) {
+  const runtime = await getDirectRuntimeConfig();
+  const host = input.host ?? getPrioritizedDirectPushHosts(runtime, input.account)[0] ?? runtime.primaryHost;
+  const maxPushFrames = input.maxPushFrames ?? Number.MAX_SAFE_INTEGER;
+  const deadline = Date.now() + Math.max(1, input.listenSeconds) * 1_000;
+  const startedAt = Date.now();
+  const pushSession = new DirectSession(runtime, host);
+  const linkSession = new DirectSession(runtime, host);
+  const calls: DirectProbeCallResult[] = [];
+  const pushes: DirectProbePushResult[] = [];
+  let error: string | null = null;
+
+  const onPush = async (push: DirectProbePushResult) => {
+    await input.onPush?.(push);
+  };
+  const onFrame = async (push: DirectProbePushResult, frameHost: string) => {
+    if (push.sms) {
+      rememberDirectSmsHost(input.account, frameHost);
+    }
+    await input.onFrame?.(push, frameHost);
+  };
+
+  try {
+    await pushSession.openPush(input.account);
+    await linkSession.openLink(input.account);
+    calls.push(await runPushLinkRegistration(linkSession, runtime, input.account));
+    while (Date.now() < deadline && pushes.length < maxPushFrames) {
+      const waitMs = Math.max(250, Math.min(5_000, deadline - Date.now()));
+      const batchLimit = Math.max(1, maxPushFrames - pushes.length);
+      const linkWaitMs = Math.max(250, Math.ceil(waitMs / 2));
+      const linkSocketFrames = await linkSession.waitForPushes(linkWaitMs, batchLimit, onPush, onFrame).catch((caught) => {
+        throw annotatePairedSocketError("link", caught);
+      });
+      pushes.push(...linkSocketFrames);
+      const remainingFrames = Math.max(0, maxPushFrames - pushes.length);
+      if (remainingFrames <= 0) {
+        break;
+      }
+      const pushWaitMs = Math.max(250, waitMs - linkWaitMs);
+      const pushSocketFrames = await pushSession.waitForPushes(pushWaitMs, remainingFrames, onPush, onFrame).catch((caught) => {
+        throw annotatePairedSocketError("push", caught);
+      });
+      pushes.push(...pushSocketFrames);
+    }
+  } catch (caught) {
+    error = caught instanceof Error ? caught.message : String(caught);
+  } finally {
+    await Promise.all([
+      pushSession.close().catch(() => undefined),
+      linkSession.close().catch(() => undefined)
+    ]);
+  }
+
+  return {
+    ok: error === null,
+    host,
+    durationMs: Date.now() - startedAt,
+    endedEarly: error !== null && Date.now() < deadline,
+    error,
+    calls,
+    pushes,
+    trace: [...pushSession.getTrace(), ...linkSession.getTrace()],
+    pushTrace: pushSession.getTrace(),
+    linkTrace: linkSession.getTrace()
+  };
+}
+
+function annotatePairedSocketError(role: "push" | "link", caught: unknown) {
+  const message = caught instanceof Error ? caught.message : String(caught);
+  return new Error(`${role} socket: ${message}`);
+}
+
+export async function fetchDirectWebOfflineMessages(account: DirectSessionAccount) {
+  const runtime = await getDirectRuntimeConfig();
+  let collected: DirectWebOfflineMessage[] = [];
+  await pollWebOfflineMessagesOnGatewayHosts(runtime, account, (messages) => {
+    collected = messages;
+  });
+  return collected;
+}
+
+type DirectWebOfflineDeliveryCandidate = {
+  msgId?: string | null;
+  conversationId?: string | null;
+  type?: number | null;
+  senderId?: string | null;
+  content: string;
+  timestamp?: number | null;
+};
+
+class DirectWebOfflineDeliveryTracker {
+  private readonly seen = new Set<string>();
+
+  constructor(private readonly maxEntries = 1_000) {}
+
+  selectUnseen<T extends DirectWebOfflineDeliveryCandidate>(messages: T[]) {
+    const batchKeys = new Set<string>();
+    return messages.filter((message) => {
+      const key = directWebOfflineDeliveryKey(message);
+      if (this.seen.has(key) || batchKeys.has(key)) {
+        return false;
+      }
+      batchKeys.add(key);
+      return true;
+    });
+  }
+
+  remember(messages: DirectWebOfflineDeliveryCandidate[]) {
+    for (const message of messages) {
+      const key = directWebOfflineDeliveryKey(message);
+      this.seen.delete(key);
+      this.seen.add(key);
+    }
+    while (this.seen.size > Math.max(1, this.maxEntries)) {
+      const oldest = this.seen.values().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.seen.delete(oldest);
+    }
+  }
+}
+
+function directWebOfflineDeliveryKey(message: DirectWebOfflineDeliveryCandidate) {
+  const msgId = message.msgId?.trim();
+  if (msgId) {
+    return `id:${msgId}`;
+  }
+  return `signature:${JSON.stringify([
+    message.conversationId ?? null,
+    message.type ?? null,
+    message.senderId ?? null,
+    message.timestamp ?? null,
+    message.content
+  ])}`;
+}
+
+function getDirectWebOfflineDeliveryTracker(account: DirectSessionAccount) {
+  const key = directSessionAccountKey(account);
+  let tracker = directWebOfflineDeliveryTrackers.get(key);
+  if (!tracker) {
+    tracker = new DirectWebOfflineDeliveryTracker();
+    directWebOfflineDeliveryTrackers.set(key, tracker);
+  }
+  return tracker;
+}
+
+async function deliverDirectWebOfflineMessages<T extends DirectWebOfflineDeliveryCandidate>(
+  messages: T[],
+  host: string,
+  onMessages?: (messages: T[], host: string) => Promise<void> | void,
+  deliveryTracker?: DirectWebOfflineDeliveryTracker
+) {
+  if (!onMessages || messages.length === 0) {
+    return;
+  }
+  const unseen = deliveryTracker?.selectUnseen(messages) ?? messages;
+  if (unseen.length === 0) {
+    return;
+  }
+  await onMessages(unseen, host);
+  deliveryTracker?.remember(unseen);
+}
+
+export function createDirectWebOfflineDeliveryTrackerForTest(maxEntries?: number) {
+  return new DirectWebOfflineDeliveryTracker(maxEntries);
+}
+
+export async function deliverDirectWebOfflineMessagesForTest<T extends DirectWebOfflineDeliveryCandidate>(
+  messages: T[],
+  host: string,
+  onMessages: (messages: T[], host: string) => Promise<void> | void,
+  deliveryTracker: DirectWebOfflineDeliveryTracker
+) {
+  await deliverDirectWebOfflineMessages(messages, host, onMessages, deliveryTracker);
+}
+
+async function discoverDirectPushHostsForListener(
+  session: DirectSession,
+  runtime: DirectRuntimeConfig,
+  account: DirectSessionAccount
+) {
+  await session.openLink(account);
+  const payload = await session.callJsonFromTemplate(
+    "queryRtcServersEx",
+    TEMPLATES.queryRtcServersEx,
+    {
+      ...buildSharedTemplateParams(account, runtime),
+      trackCode: session.nextTrackCode()
+    },
+    Math.min(runtime.ioTimeoutMs, 5_000)
+  );
+  const hosts = extractRtcServerHosts(payload);
+  logger.info("Direct account gateway discovery completed", {
+    dtUserId: account.dtUserId,
+    hosts
+  });
+  return hosts;
+}
+
+async function runPushMaintenanceCalls(
   session: DirectSession,
   runtime: DirectRuntimeConfig,
   account: {
@@ -1505,8 +1969,12 @@ async function runPushListenPrimeCalls(
     email?: string | null;
     phone?: string | null;
     appVariant?: "dingtone" | "dingdong";
-  }
+  },
+  fullPrime = true
 ) {
+  if (!fullPrime || account.appVariant !== "dingtone") {
+    return [];
+  }
   const appVersion = resolveDirectAppVersion(account, runtime);
   const shared = {
     deviceId: accountDeviceId(account),
@@ -1518,38 +1986,68 @@ async function runPushListenPrimeCalls(
   };
   const nextTrackCode = () => session.nextTrackCode();
   const calls: DirectProbeCallResult[] = [];
-
-  // Keep the push listener prime path short so sockets enter the read loop quickly.
-  const primeCalls: Array<{ name: string; templateName: keyof typeof TEMPLATES; params?: DirectTemplateParams }> = [
-    { name: "listenPrime.queryRtcServersEx#flags9" as const, templateName: "queryRtcServersEx" as const, params: { flags: 9 } },
-    { name: "listenPrime.queryRtcServersEx#flags5" as const, templateName: "queryRtcServersEx" as const, params: { flags: 5 } },
-    { name: "listenPrime.updateClientLink" as const, templateName: "updateClientLink" as const }
-  ];
-  if (account.appVariant === "dingtone") {
-    primeCalls.unshift({ name: "listenPrime.getPrivateNumber" as const, templateName: "getPrivateNumber" as const, params: {} });
-  }
-
-  for (const item of primeCalls) {
-    const startedAt = Date.now();
-    try {
-      await session.sendJson(item.templateName, { ...shared, ...(item.params ?? {}), trackCode: nextTrackCode() });
-      calls.push({
-        name: item.name,
-        ok: true,
-        durationMs: Date.now() - startedAt,
-        payload: { sent: true }
-      });
-    } catch (error) {
-      calls.push({
-        name: item.name,
-        ok: false,
-        durationMs: Date.now() - startedAt,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-  }
-
+  calls.push(
+    await sendPushTemplateCall(
+      session,
+      "listenPrime.getPrivateNumber",
+      "getPrivateNumber",
+      { ...shared, trackCode: nextTrackCode() }
+    )
+  );
   return calls;
+}
+
+async function runPushLinkRegistration(
+  session: DirectSession,
+  runtime: DirectRuntimeConfig,
+  account: DirectSessionAccount
+) {
+  const appVersion = resolveDirectAppVersion(account, runtime);
+  return sendPushTemplateCall(session, "listenPrime.updateClientLink", "updateClientLink", {
+    deviceId: accountDeviceId(account),
+    userId: account.dtUserId,
+    token: account.token,
+    clientVersion: appVersion,
+    appVersion,
+    apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign),
+    trackCode: session.nextTrackCode()
+  });
+}
+
+async function sendPushTemplateCall(
+  session: DirectSession,
+  name: string,
+  templateName: keyof typeof TEMPLATES,
+  params: DirectTemplateParams
+): Promise<DirectProbeCallResult> {
+  const startedAt = Date.now();
+  try {
+    await session.sendJson(templateName, params);
+    return {
+      name,
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      payload: { sent: true }
+    };
+  } catch (error) {
+    return {
+      name,
+      ok: false,
+      durationMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+async function runPushListenPrimeCalls(
+  session: DirectSession,
+  runtime: DirectRuntimeConfig,
+  account: DirectSessionAccount,
+  fullPrime = true
+) {
+  const maintenanceCalls = await runPushMaintenanceCalls(session, runtime, account, fullPrime);
+  const linkRegistration = await runPushLinkRegistration(session, runtime, account);
+  return [...maintenanceCalls, linkRegistration];
 }
 
 function extractRtcServerHosts(payload: ApiResult) {
@@ -1561,6 +2059,10 @@ function extractRtcServerHosts(payload: ApiResult) {
     }
   }
   return uniqueHosts(hosts);
+}
+
+export function extractRtcServerHostsForTest(payload: ApiResult) {
+  return extractRtcServerHosts(payload);
 }
 
 function isLikelyIpv4Host(value: string) {
@@ -1577,7 +2079,7 @@ function isLikelyIpv4Host(value: string) {
   });
 }
 
-export function preemptDirectSessionPushListener(account: { dtUserId: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" }) {
+export async function preemptDirectSessionPushListener(account: { dtUserId: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" }) {
   return preemptActiveDirectPushListener(account);
 }
 
@@ -2005,6 +2507,21 @@ function normalizeAccountCountryKey(value: string) {
   return item;
 }
 
+function buildDirectSessionKeepaliveFrame(session: Buffer) {
+  if (session.length < 4) {
+    throw new Error("Direct session keepalive requires a 4-byte session id");
+  }
+  const frame = Buffer.alloc(17);
+  frame[0] = 0x01;
+  frame[1] = 0x07;
+  frame.writeUInt32BE(17, 2);
+  frame.writeUInt16BE(0x8107, 6);
+  session.copy(frame, 8, 0, 4);
+  frame.writeUInt32BE(1, 12);
+  frame[16] = 0xff;
+  return frame;
+}
+
 class DirectSession {
   private socket: net.Socket | tls.TLSSocket | null = null;
   private buffer = Buffer.alloc(0);
@@ -2019,6 +2536,10 @@ class DirectSession {
   private idleDroppedNonSmsFrameCount = 0;
   private idleSocketPaused = false;
   private idleSocketPauseTimer: NodeJS.Timeout | null = null;
+  private keepaliveTimer: NodeJS.Timeout | null = null;
+  private keepaliveWriteInFlight = false;
+  private keepaliveWriteCount = 0;
+  private socketConnectedAt = 0;
   private bufferedConsumeScheduled = false;
   private pendingPushes: DirectProbePushResult[] = [];
   private accountPhoneCountryKeys?: Set<string>;
@@ -2034,9 +2555,69 @@ class DirectSession {
   constructor(private runtime: DirectRuntimeConfig, private host: string) {}
 
   async open(account: DirectSessionAccount) {
+    await this.openPrelogin(account);
+    await this.startSocketKeepalive();
+    await this.bootstrapAuthenticatedSession(account);
+  }
+
+  async openPush(account: DirectSessionAccount) {
+    await this.openPrelogin(account);
+    this.startPairedKeepalive();
+  }
+
+  async openLink(account: DirectSessionAccount) {
+    await this.openPrelogin(account);
+    await this.bootstrapAuthenticatedSession(account);
+    await this.primeLinkRegistration(account);
+    this.startPairedKeepalive();
+  }
+
+  private async primeLinkRegistration(account: DirectSessionAccount) {
+    const appVersion = resolveDirectAppVersion(account, this.runtime);
+    const shared = {
+      deviceId: accountDeviceId(account),
+      userId: account.dtUserId,
+      token: account.token,
+      clientVersion: appVersion,
+      appVersion,
+      apkCertificateSign: resolveDirectApiApkCertificateSign(account, this.runtime.apkCertificateSign)
+    };
+    const nextTrackCode = () => this.nextTrackCode();
+
+    await this.sendJson("followerListInfo", { ...shared, trackCode: nextTrackCode() });
+    await this.sendJson("getFriendList", { ...shared, trackCode: nextTrackCode() });
+    await this.sendJson("infoBus", { ...shared, trackCode: nextTrackCode() });
+    const offlineTemplateSent = await this.sendConfiguredTemplate("dt_direct_template_offline_messages", account, {
+      action: "requestAllOfflineMessage"
+    });
+    if (!offlineTemplateSent) {
+      throw new Error("Direct offline message template is unavailable");
+    }
+    await this.sendJson("getBalance", { ...shared, trackCode: nextTrackCode() });
+    await this.sendCommonRestJson(
+      "glbUserPropertites",
+      "glb/userPropertites",
+      buildGlbUserPropertiesQuery(account, this.runtime, nextTrackCode())
+    );
+    await this.sendCommonRestJson(
+      "gwebInfoBus",
+      "gwebsvr/infoBus",
+      buildGwebInfoBusQuery(account, this.runtime, nextTrackCode())
+    );
+    await this.sendJson("queryRtcServersEx", { ...shared, trackCode: nextTrackCode() });
+    await this.sendJson("queryRtcServersEx", { ...shared, trackCode: nextTrackCode() });
+    await this.sendCommonRestJson(
+      "clientInfo",
+      "clientInfo",
+      buildDirectSessionClientInfoQuery(account, this.runtime, nextTrackCode())
+    );
+  }
+
+  private async openPrelogin(account: DirectSessionAccount) {
     this.account = account;
     this.trackCodeGenerator = createDirectTrackCodeGenerator(account.dtUserId);
     this.socket = await this.connectSocket(this.host, this.runtime.port, this.runtime.connectTimeoutMs);
+    this.socketConnectedAt = Date.now();
     this.attachSocketEvents();
     await this.write(CONNECT_REQUEST);
 
@@ -2062,13 +2643,13 @@ class DirectSession {
       "getInfoBeforeLogin response"
     );
     this.route = Buffer.from(preloginResp.body.subarray(8, 16));
-    await this.bootstrapAuthenticatedSession(account);
   }
 
   async openActivation(identity: DirectActivationIdentity) {
     const deviceId = activationDeviceId(identity);
     this.trackCodeGenerator = createDirectTrackCodeGenerator(deviceId);
     this.socket = await this.connectSocket(this.host, this.runtime.port, this.runtime.connectTimeoutMs);
+    this.socketConnectedAt = Date.now();
     this.attachSocketEvents();
     await this.write(CONNECT_REQUEST);
 
@@ -2096,8 +2677,12 @@ class DirectSession {
     this.route = Buffer.from(preloginResp.body.subarray(8, 16));
   }
 
-  async callJson(templateName: keyof typeof TEMPLATES, params: DirectTemplateParams) {
-    return this.callJsonFromTemplate(String(templateName), TEMPLATES[templateName], params);
+  async callJson(
+    templateName: keyof typeof TEMPLATES,
+    params: DirectTemplateParams,
+    timeoutMs = this.runtime.ioTimeoutMs
+  ) {
+    return this.callJsonFromTemplate(String(templateName), TEMPLATES[templateName], params, timeoutMs);
   }
 
   nextTrackCode() {
@@ -2120,6 +2705,7 @@ class DirectSession {
         apkCertificateSign: params.apkCertificateSign ?? this.runtime.apkCertificateSign
       }
     });
+    dumpDirectDebugFrame(String(templateName), request);
     await this.write(request);
   }
 
@@ -2287,7 +2873,12 @@ class DirectSession {
     return [...this.bootstrapPayloads];
   }
 
-  async callJsonFromTemplate(label: string, template: Buffer, params: DirectTemplateParams) {
+  async callJsonFromTemplate(
+    label: string,
+    template: Buffer,
+    params: DirectTemplateParams,
+    timeoutMs = this.runtime.ioTimeoutMs
+  ) {
     const request = buildRequestFrame({
       template,
       session: this.sessionId,
@@ -2301,10 +2892,11 @@ class DirectSession {
       }
     });
 
+    dumpDirectDebugFrame(label, request);
     this.clearJsonQueue();
-    this.beginJsonCapture(this.runtime.ioTimeoutMs);
+    this.beginJsonCapture(timeoutMs);
     await this.write(request);
-    return this.waitForJsonPayload(this.runtime.ioTimeoutMs, `${label} JSON response`, (payload) => {
+    return this.waitForJsonPayload(timeoutMs, `${label} JSON response`, (payload) => {
       const expected = isExpectedTemplateJsonPayload(label, payload);
       return expected && (matchesExpectedTrackCode(payload, stringifyPrimitive(params.trackCode ?? params.TrackCode)) || hasStrongExpectedTemplateShape(label, payload));
     });
@@ -2366,41 +2958,30 @@ class DirectSession {
           Math.max(250, deadline - Date.now()),
           "direct push frame"
         );
-        if (frame.status !== 0x0103) {
-          nonSmsPushFrameCount += 1;
-          if (this.shouldLogSkippedNonSmsFrame()) {
-            logger.info("Direct push frame skipped because it did not contain an SMS payload", {
-              host: this.host,
-              status: frame.status,
-              bodyLength: frame.body.length,
-              hasJsonPayload: false,
-              jsonPayload: undefined
-            });
-          }
-          if (nonSmsPushFrameCount >= DIRECT_PUSH_NON_SMS_FRAME_BATCH_LIMIT) {
-            await delay(DIRECT_PUSH_NON_SMS_FRAME_PAUSE_MS);
-            return pushes;
-          }
-          await yieldToEventLoop();
+        const candidatePush = frameToDirectPush(frame);
+        if (candidatePush.sms) {
+          await onFrame?.(candidatePush, this.host);
+          pushes.push(candidatePush);
+          await onPush?.(candidatePush);
           continue;
         }
-        const push = frameToDirectPush(frame);
-        await onFrame?.(push, this.host);
-        if (!push.sms) {
-          nonSmsPushFrameCount += 1;
-          if (this.shouldLogSkippedNonSmsFrame()) {
-            logger.info("Direct push frame skipped because it did not contain an SMS payload", {
-              host: this.host,
-              status: push.status,
-              bodyLength: push.bodyLength,
-              hasJsonPayload: Boolean(push.jsonPayload),
-              jsonPayload: summarizeJsonPayload(push.jsonPayload)
-            });
-          }
-          continue;
+        const nonSmsFrame = frame.status === 0x0103 ? candidatePush : frameToDirectFrameSummary(frame);
+        await onFrame?.(nonSmsFrame, this.host);
+        nonSmsPushFrameCount += 1;
+        if (this.shouldLogSkippedNonSmsFrame()) {
+          logger.info("Direct push frame skipped because it did not contain an SMS payload", {
+            host: this.host,
+            status: nonSmsFrame.status,
+            bodyLength: nonSmsFrame.bodyLength,
+            hasJsonPayload: Boolean(nonSmsFrame.jsonPayload),
+            jsonPayload: summarizeJsonPayload(nonSmsFrame.jsonPayload)
+          });
         }
-        pushes.push(push);
-        await onPush?.(push);
+        if (nonSmsPushFrameCount >= DIRECT_PUSH_NON_SMS_FRAME_BATCH_LIMIT) {
+          await delay(DIRECT_PUSH_NON_SMS_FRAME_PAUSE_MS);
+          return pushes;
+        }
+        await yieldToEventLoop();
       } catch (error) {
         if (isSocketClosedError(error)) {
           throw error;
@@ -2417,6 +2998,7 @@ class DirectSession {
 
   async close() {
     this.closed = true;
+    this.stopSocketKeepalive();
     if (this.idleSocketPauseTimer) {
       clearTimeout(this.idleSocketPauseTimer);
       this.idleSocketPauseTimer = null;
@@ -2425,6 +3007,10 @@ class DirectSession {
       this.socket.destroy();
     }
     this.socket = null;
+  }
+
+  isOpen() {
+    return Boolean(this.socket && !this.closed && !this.socket.destroyed && this.socket.readable && this.socket.writable);
   }
 
   getTrace() {
@@ -2471,22 +3057,36 @@ class DirectSession {
     }
     this.socket.on("data", (chunk) => this.consume(chunk));
     this.socket.on("error", (error) => {
+      this.stopSocketKeepalive();
       this.failWaiters(error instanceof Error ? error : new Error(String(error)));
     });
     this.socket.on("end", () => {
       this.closed = true;
+      this.stopSocketKeepalive();
       this.socket?.destroy();
-      this.failWaiters(new Error("Direct gateway socket ended"));
+      this.failWaiters(
+        new Error(
+          `Direct gateway socket ended after ${Math.max(0, Date.now() - this.socketConnectedAt)}ms (keepaliveWrites=${this.keepaliveWriteCount})`
+        )
+      );
     });
     this.socket.on("close", () => {
       this.closed = true;
-      this.failWaiters(new Error("Direct gateway socket closed"));
+      this.stopSocketKeepalive();
+      this.failWaiters(
+        new Error(
+          `Direct gateway socket closed after ${Math.max(0, Date.now() - this.socketConnectedAt)}ms (keepaliveWrites=${this.keepaliveWriteCount})`
+        )
+      );
     });
   }
 
   private consume(chunk: Buffer) {
     if (chunk.length > 0) {
       this.buffer = Buffer.concat([this.buffer, chunk]);
+    }
+    while (this.buffer[0] === 0xff) {
+      this.buffer = this.buffer.subarray(1);
     }
     let processedFrames = 0;
 
@@ -2551,9 +3151,12 @@ class DirectSession {
         this.jsonQueue.push(jsonPayload);
         this.flushJsonWaiters();
       }
-      const smsPush = parsed.type === 0x8107 && parsed.status === 0x0103 ? tryParseSmsPush(parsed.raw) ?? tryParseSmsPush(parsed.body) : null;
-      if (parsed.type === 0x8107 && parsed.status === 0x0103) {
-        void this.acknowledgePushFrame(parsed, true).catch((error) => {
+        const smsPush = parsed.type === 0x8107 && parsed.status === 0x0103 ? tryParseSmsPush(parsed.raw) ?? tryParseSmsPush(parsed.body) : null;
+        const offlineMessageIndexPush = parsed.type === 0x8107 && parsed.status === 0x0103
+          ? isOfflineMessageIndexPush(parsed.raw) || isOfflineMessageIndexPush(parsed.body)
+          : false;
+        if (parsed.type === 0x8107 && parsed.status === 0x0103) {
+          void this.acknowledgePushFrame(parsed, Boolean(smsPush) || offlineMessageIndexPush).catch((error) => {
           logger.warn("Direct push ACK failed", {
             host: this.host,
             error: error instanceof Error ? error.message : String(error)
@@ -2622,6 +3225,70 @@ class DirectSession {
     });
   }
 
+  private startPairedKeepalive() {
+    this.stopSocketKeepalive();
+    this.keepaliveTimer = setInterval(() => {
+      if (this.keepaliveWriteInFlight || this.closed) {
+        return;
+      }
+      this.keepaliveWriteInFlight = true;
+      void this.write(buildDirectSessionKeepaliveFrame(this.sessionId))
+        .then(() => {
+          this.keepaliveWriteCount += 1;
+        })
+        .catch((error) => {
+          if (!this.closed) {
+            logger.warn("Direct push keepalive write failed", {
+              host: this.host,
+              error: error instanceof Error ? error.message : String(error)
+            });
+            this.socket?.destroy();
+          }
+        })
+        .finally(() => {
+          this.keepaliveWriteInFlight = false;
+        });
+    }, DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS);
+    this.keepaliveTimer.unref?.();
+  }
+
+  private async startSocketKeepalive() {
+    this.stopSocketKeepalive();
+    await this.write(buildDirectSessionKeepaliveFrame(this.sessionId));
+    this.keepaliveWriteCount += 1;
+    this.keepaliveTimer = setInterval(() => {
+      if (this.keepaliveWriteInFlight || this.closed) {
+        return;
+      }
+      this.keepaliveWriteInFlight = true;
+      void this.write(buildDirectSessionKeepaliveFrame(this.sessionId))
+        .then(() => {
+          this.keepaliveWriteCount += 1;
+        })
+        .catch((error) => {
+          if (!this.closed) {
+            logger.warn("Direct gateway keepalive write failed", {
+              host: this.host,
+              error: error instanceof Error ? error.message : String(error)
+            });
+            this.socket?.destroy();
+          }
+        })
+        .finally(() => {
+          this.keepaliveWriteInFlight = false;
+        });
+    }, directSessionKeepaliveIntervalMs(this.account));
+    this.keepaliveTimer.unref?.();
+  }
+
+  private stopSocketKeepalive() {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
+    this.keepaliveWriteInFlight = false;
+  }
+
   private async acknowledgePushFrame(frame: ParsedFrame, shouldConfirmDelivery: boolean) {
     const ack = buildPushAckFrame(frame);
     if (!ack) {
@@ -2631,13 +3298,9 @@ class DirectSession {
     if (!shouldConfirmDelivery || !this.account) {
       return;
     }
-    const notifyMessageIds = extractNotifyMessageIds(frame);
-    const deliveryMessageIds = notifyMessageIds.length > 0 ? notifyMessageIds : [undefined];
-    for (const messageId of deliveryMessageIds) {
-      const confirm = buildPushDeliveryConfirmFrame(frame, this.account, this.nextPushDeliveryConfirmSerial(), messageId);
-      if (confirm) {
-        await this.write(confirm);
-      }
+    const confirm = buildPushDeliveryConfirmFrame(frame, this.account, this.nextPushDeliveryConfirmSerial());
+    if (confirm) {
+      await this.write(confirm);
     }
   }
 
@@ -2928,6 +3591,9 @@ class DirectSession {
 
 function isExpectedTemplateJsonPayload(label: string, payload: ApiResult) {
   const normalized = label.toLowerCase();
+  if (normalized.includes("queryrtcservers")) {
+    return isRtcServerListPayload(payload);
+  }
   if (normalized.includes("getbalance")) {
     return isBalancePayload(payload);
   }
@@ -2937,7 +3603,14 @@ function isExpectedTemplateJsonPayload(label: string, payload: ApiResult) {
   if (normalized.includes("getprivatenumber")) {
     return hasPhoneListPayload(payload);
   }
+  if (normalized.includes("getwebofflinemessage")) {
+    return hasWebOfflineMessagePayload(payload);
+  }
   return true;
+}
+
+export function isExpectedTemplateJsonPayloadForTest(label: string, payload: ApiResult) {
+  return isExpectedTemplateJsonPayload(label, payload);
 }
 
 function isExpectedCommonRestJsonPayload(apiName: string, payload: ApiResult) {
@@ -2963,7 +3636,7 @@ function isExpectedCommonRestJsonPayload(apiName: string, payload: ApiResult) {
   if (normalized.includes("pstn/share/getprivatenumber")) {
     return hasPhoneListPayload(payload) || hasErrCode(payload, 7001);
   }
-  if (normalized.includes("getwebofflinemessage")) {
+  if (normalized.includes("getwebofflinemessage") || normalized.includes("getuserofflinemsg")) {
     return hasWebOfflineMessagePayload(payload) || hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]);
   }
   if (normalized.includes("checkactivated") || normalized.includes("checkuseractivate")) {
@@ -3026,7 +3699,7 @@ function hasStrongExpectedCommonRestShape(apiName: string, payload: ApiResult) {
   if (normalized.includes("pstn/share/getprivatenumber")) {
     return hasPhoneListPayload(payload);
   }
-  if (normalized.includes("getwebofflinemessage")) {
+  if (normalized.includes("getwebofflinemessage") || normalized.includes("getuserofflinemsg")) {
     return hasWebOfflineMessagePayload(payload);
   }
   if (normalized.includes("checkactivated") || normalized.includes("checkuseractivate")) {
@@ -3035,49 +3708,123 @@ function hasStrongExpectedCommonRestShape(apiName: string, payload: ApiResult) {
   return false;
 }
 
+function directSessionKeepaliveIntervalMs(account: DirectSessionAccount | undefined) {
+  return account?.appVariant === "dingdong"
+    ? DINGDONG_SESSION_KEEPALIVE_INTERVAL_MS
+    : DIRECT_SESSION_KEEPALIVE_INTERVAL_MS;
+}
+
 function hasWebOfflineMessagePayload(payload: ApiResult) {
   return (
     hasNestedOwnKey(payload, "aOfflineMessagse") ||
     hasNestedOwnKey(payload, "aOfflineMessages") ||
-    hasNestedOwnKey(payload, "offlineMessages")
+    hasNestedOwnKey(payload, "offlineMessages") ||
+    hasNestedOwnKey(payload, "Message")
   );
 }
 
-export function normalizeDirectWebOfflineMessages(payload: unknown): DirectWebOfflineMessage[] {
+export function normalizeDirectWebOfflineMessages(payload: unknown, appVariant?: "dingtone" | "dingdong"): DirectWebOfflineMessage[] {
   const rows: DirectWebOfflineMessage[] = [];
   const seen = new Set<string>();
   for (const record of collectDirectWebOfflineRecords(payload)) {
     const title = pickString(record, ["msgTitle", "title"]);
-    const body = pickString(record, ["msgContent", "content", "message", "body"]);
+    const rawBody = pickString(record, ["msgContent", "content", "message", "body"]);
+    const messageType = pickNumber(record, ["msgType", "type"]) ?? null;
+    const originalSenderId = pickString(record, ["msgSenderID", "msgSenderId", "senderId", "sender", "from"]) ?? null;
+    const teamName = resolveDirectWebOfflineTeamName(messageType, title, originalSenderId, appVariant);
+    if (!teamName) {
+      continue;
+    }
+    const commonEvent = messageType === 3300 ? parseDirectSecretaryCommonEvent(rawBody) : null;
+    const body = commonEvent?.content ?? rawBody;
     const content = title && body && title !== body ? `${title}\n${body}` : title ?? body;
     if (!content) {
       continue;
     }
     const msgId = pickString(record, ["msgId", "messageId", "id"]) ?? null;
-    const senderId = pickString(record, ["msgSenderID", "msgSenderId", "senderId", "sender", "from"]) ?? null;
     const timestamp = pickNumber(record, ["msgTimeStamp", "timestamp", "time", "createdAt"]) ?? null;
-    const messageType = pickNumber(record, ["msgType", "type"]) ?? null;
-    const meta = normalizeDirectWebOfflineMeta(record.msgMeta ?? record.meta);
-    const dedupeKey = msgId ?? `${senderId ?? ""}|${timestamp ?? ""}|${content}`;
+    const meta = normalizeDirectWebOfflineMeta(record.msgMeta ?? record.meta ?? commonEvent?.args);
+    const dedupeKey = msgId ?? `${teamName}|${timestamp ?? ""}|${content}`;
     if (seen.has(dedupeKey)) {
       continue;
     }
     seen.add(dedupeKey);
     rows.push({
       conversationType: 4,
-      conversationId: pickString(record, ["conversationId", "threadId"]) ?? `web-offline:${senderId ?? "team"}`,
+      conversationId: "10000",
       type: messageType,
-      senderId,
+      senderId: teamName,
       msgId,
       content,
       timestamp,
       isRead: 0,
-      data1: title ?? null,
+      data1: teamName,
       data2: meta,
       data3: "direct-web-offline"
     });
   }
   return rows;
+}
+
+function resolveDirectWebOfflineTeamName(
+  messageType: number | null,
+  title: string | null | undefined,
+  senderId: string | null | undefined,
+  appVariant?: "dingtone" | "dingdong"
+) {
+  if (messageType === 3300) {
+    return appVariant === "dingdong" ? "叮咚团队" : "说道团队";
+  }
+  for (const value of [title, senderId]) {
+    if (/^(?:叮咚团队|dingtone\s+team|dingdong\s+team)$/i.test(value ?? "")) {
+      return "叮咚团队";
+    }
+    if (/^(?:说道团队|talku\s+team|talkyou\s+team)$/i.test(value ?? "")) {
+      return "说道团队";
+    }
+  }
+  return null;
+}
+
+function parseDirectSecretaryCommonEvent(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!isRecord(parsed)) {
+      return null;
+    }
+    return {
+      content: pickString(parsed, ["content", "message", "body"]),
+      args: parsed.args
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function buildGetWebOfflineMessageQuery(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  trackCode: string
+) {
+  return [
+    queryPair("deviceId", accountDeviceId(account)),
+    queryPair("userId", account.dtUserId),
+    queryPair("token", account.token),
+    queryPair("TrackCode", trackCode),
+    queryPair("bDevice", 1)
+  ].join("&");
+}
+
+export function buildGetWebOfflineMessageFrameForTest(params: DirectTemplateParams) {
+  return buildRequestFrame({
+    template: TEMPLATES.getWebOfflineMessage,
+    session: Buffer.alloc(4),
+    route: Buffer.from("d33d000300502788", "hex"),
+    status: 0x0102,
+    params
+  });
 }
 
 function collectDirectWebOfflineRecords(value: unknown, depth = 0): Record<string, unknown>[] {
@@ -3101,6 +3848,7 @@ function collectDirectWebOfflineRecords(value: unknown, depth = 0): Record<strin
       normalizedKey === "aofflinemessagse" ||
       normalizedKey === "aofflinemessages" ||
       normalizedKey === "offlinemessages" ||
+      normalizedKey === "message" ||
       normalizedKey === "messages" ||
       normalizedKey === "list" ||
       normalizedKey === "data" ||
@@ -3130,6 +3878,9 @@ function normalizeDirectWebOfflineMeta(value: unknown) {
 
 function hasStrongExpectedTemplateShape(label: string, payload: ApiResult) {
   const normalized = label.toLowerCase();
+  if (normalized.includes("queryrtcservers")) {
+    return isRtcServerListPayload(payload);
+  }
   if (normalized.includes("getbalance")) {
     return isBalancePayload(payload);
   }
@@ -3139,10 +3890,23 @@ function hasStrongExpectedTemplateShape(label: string, payload: ApiResult) {
   if (normalized.includes("getprivatenumber")) {
     return hasPhoneListPayload(payload);
   }
+  if (normalized.includes("getwebofflinemessage")) {
+    return hasWebOfflineMessagePayload(payload);
+  }
   if (normalized.includes("infobus") || normalized.includes("userpropertites") || normalized.includes("userproperties")) {
     return hasUserProfileOrPropertyPayload(payload);
   }
   return false;
+}
+
+function isRtcServerListPayload(payload: ApiResult) {
+  const apiName = stringifyPrimitive(payload.api_name ?? payload.apiName)?.toLowerCase() ?? "";
+  return (
+    apiName === "query_rtc_servers_ex" ||
+    apiName === "queryrtcserversex" ||
+    hasNestedOwnKey(payload, "server_list") ||
+    hasNestedOwnKey(payload, "rtcServerList")
+  );
 }
 
 function isActivationCommonRestResult(apiName: string, payload: ApiResult) {
@@ -3306,6 +4070,7 @@ function buildRequestFrame(input: {
   const apiName = findTrailingLengthPrefixedAscii(prefix);
   if (apiName) {
     prefix = patchPrefixPayloadLength(prefix, apiName, templateCompressedLength, compressed.length);
+    prefix = patchEmbeddedCommonRestPayloadLength(prefix, apiName, compressed.length);
   }
 
   const body = Buffer.concat([
@@ -3760,7 +4525,7 @@ function buildPushAckFrame(frame: ParsedFrame) {
   return encodeFrame(frame.session, 0x0103, Buffer.concat([destinationRoute, sourceRoute, ackTail]));
 }
 
-function buildPushDeliveryConfirmFrame(frame: ParsedFrame, account: Pick<DirectSessionAccount, "dtUserId" | "deviceId">, serial: number, messageIdOverride?: string) {
+function buildPushDeliveryConfirmFrame(frame: ParsedFrame, account: Pick<DirectSessionAccount, "dtUserId" | "deviceId">, serial: number) {
   if (frame.type !== 0x8107 || frame.status !== 0x0103 || frame.body.length < 40) {
     return null;
   }
@@ -3769,7 +4534,7 @@ function buildPushDeliveryConfirmFrame(frame: ParsedFrame, account: Pick<DirectS
   const destinationRoute = frame.body.subarray(8, 16);
   const pushTail = frame.body.subarray(28, 32);
   const deviceId = accountDeviceId(account);
-  const messageId = messageIdOverride ?? frame.body.readBigUInt64BE(32).toString();
+  const messageId = frame.body.readBigUInt64BE(32).toString();
   const deviceBytes = Buffer.from(deviceId, "utf8");
   const messageIdBytes = Buffer.from(messageId, "utf8");
   if (deviceBytes.length > 0xff) {
@@ -3818,66 +4583,6 @@ function u24be(value: number) {
 
 function lengthPrefixedBuffer(value: Buffer) {
   return Buffer.concat([u32be(value.length), value]);
-}
-
-function extractNotifyMessageIds(frame: ParsedFrame) {
-  const payload = extractJsonPayload(frame.raw);
-  const notifyIds = new Set<string>();
-  if (isRecord(payload) && Array.isArray(payload.notifyInfoList)) {
-    for (const item of payload.notifyInfoList) {
-      const value = isRecord(item) ? stringifyPrimitive(item.msgId ?? item.msgid ?? item.messageId ?? item.message_id) : undefined;
-      if (value?.trim()) {
-        notifyIds.add(value.trim());
-      }
-    }
-  }
-  const legacyIds = extractLegacyNotifyMessageIds(frame)
-    .filter((value) => !notifyIds.has(value));
-  return [...notifyIds, ...legacyIds];
-}
-
-function extractLegacyNotifyMessageIds(frame: ParsedFrame) {
-  return extractLengthPrefixedAsciiFieldValues(frame.body, ["dtId", "msgId", "msgid", "messageId", "message_id"])
-    .filter((value) => /^\d{5,30}$/.test(value));
-}
-
-function extractLengthPrefixedAsciiFieldValues(payload: Buffer, keys: string[]) {
-  const output: string[] = [];
-  for (const key of keys) {
-    let cursor = 0;
-    const keyBytes = Buffer.from(key, "utf8");
-    while (cursor < payload.length) {
-      const keyOffset = payload.indexOf(keyBytes, cursor);
-      if (keyOffset < 0) {
-        break;
-      }
-      const value = readLengthPrefixedAsciiAfter(payload, keyOffset + keyBytes.length);
-      if (value && !output.includes(value)) {
-        output.push(value);
-      }
-      cursor = keyOffset + keyBytes.length;
-    }
-  }
-  return output;
-}
-
-function readLengthPrefixedAsciiAfter(payload: Buffer, offset: number) {
-  for (let cursor = offset; cursor < Math.min(payload.length, offset + 16); cursor += 1) {
-    for (const width of [1, 2, 4]) {
-      if (cursor + width >= payload.length) {
-        continue;
-      }
-      const length = width === 1 ? payload[cursor] : width === 2 ? payload.readUInt16BE(cursor) : payload.readUInt32BE(cursor);
-      if (!length || length > 64 || cursor + width + length > payload.length) {
-        continue;
-      }
-      const value = payload.subarray(cursor + width, cursor + width + length).toString("utf8").trim();
-      if (/^[\x20-\x7e]+$/.test(value)) {
-        return value;
-      }
-    }
-  }
-  return null;
 }
 
 function patchQuery(templateQuery: string, params: DirectTemplateParams) {
@@ -4221,6 +4926,54 @@ function buildGwebInfoBusQuery(
   ].join("&");
 }
 
+function buildDirectSessionClientInfoQuery(
+  account: DirectSessionAccount,
+  runtime: DirectRuntimeConfig,
+  trackCode: string
+) {
+  const deviceId = accountDeviceId(account);
+  const appVersion = resolveDirectAppVersion(account, runtime);
+  const clientInfo = JSON.stringify({
+    deviceOriginalId: "0000000000000000",
+    advertisingId: "00000000-0000-0000-0000-000000000000",
+    appVersion,
+    timezone: "Asia/Shanghai",
+    tzOffset: "GMT+08:00",
+    simCC: "cn",
+    mac: "02:00:00:00:00:00",
+    imei: "000000000000000",
+    mobileNum: "00000000000",
+    wifiSSid: "AndroidWifi",
+    language: "zh",
+    serialNumber: "000000000000",
+    mobileNetworkCarrier: {
+      mcc: 460,
+      mnc: 0,
+      carrierNmae: "China Mobile GSM"
+    },
+    isoCountryCode: "CN",
+    isSimulator: 0,
+    rooted: 1,
+    connectedV: 0,
+    hasV: 0,
+    appId: appIdForVariant(account.appVariant),
+    deviceId,
+    platform: "Android",
+    manufacture: "OPPO",
+    osVersion: "9",
+    deviceModel: "PCRT00",
+    clientTime: Date.now(),
+    ipv4: "10.0.2.15"
+  });
+  return [
+    queryPair("deviceId", deviceId),
+    queryPair("TrackCode", trackCode),
+    queryPair("appVersion", appVersion),
+    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
+    queryPair("clientInfo", clientInfo)
+  ].join("&");
+}
+
 function resolveDirectGwebAppId(identity: string | DirectAccountIdentity) {
   return isTalkUIdentity(identity) ? "TU" : "DT";
 }
@@ -4456,6 +5209,10 @@ function resolvePhoneActionApiName(label: DirectPhoneActionLabel, settings: Reco
       key: "dt_direct_api_resume_phone",
       fallback: "/pstn/share/privateNumberSetting"
     },
+    enableSmsReceive: {
+      key: "dt_direct_api_phone_setting",
+      fallback: "/pstn/share/privateNumberSetting"
+    },
     updatePhoneLabel: {
       key: "dt_direct_api_phone_setting",
       fallback: "/pstn/share/privateNumberSetting"
@@ -4659,23 +5416,23 @@ function buildPrivateNumberSettingQuery(
   ].join("&");
 }
 
-function buildPrivateNumberSettingJson(phone: DirectPhoneActionContext, suspendFlag: 0 | 1) {
+export function buildPrivateNumberSettingJson(phone: DirectPhoneActionContext, suspendFlag: 0 | 1) {
   const raw = collectPhoneActionRecords(phone);
-  const silentFlag = pickPhoneBoolean(phone, raw, ["silentFlag", "silent_flag"]);
+  const slientFlag = pickPhoneBoolean(phone, raw, ["slientFlag", "silentFlag", "slient_flag", "silent_flag"]);
   const isSuspending = suspendFlag === 1;
   const primaryFlag = isSuspending ? false : (pickPhoneBoolean(phone, raw, ["isPrimary", "primaryFlag", "primary_flag"]) ?? true);
   const callForwardFlag = pickPhoneBoolean(phone, raw, ["callForwardFlag", "call_forward_flag"]);
   const autoRenew = pickPhoneBoolean(phone, raw, ["autoRenew", "auto_renew"]) ?? true;
   const filterSetting = {
-    ...parsePrivateNumberFilterSetting(pickPhoneString(phone, raw, ["filterSetting", "filter_setting"])),
+    ...parsePrivateNumberFilterSetting(pickPhoneValue(phone, raw, ["filterSetting", "filter_setting"])),
     allowReceiveSMS: true
   };
   return {
     phoneNumber: stripPhonePrefix(phone.phoneNumber ?? pickPhoneString(phone, raw, ["phoneNumber", "phone_number"]) ?? ""),
     displayName: phone.displayName ?? pickPhoneString(phone, raw, ["displayName", "display_name"]) ?? "",
     primaryFlag: booleanFlagNumber(primaryFlag),
-    silentFlag: booleanFlagNumber(silentFlag),
-    slientFlag: booleanFlagNumber(silentFlag),
+    faxEnabled: pickPhoneNumber(phone, raw, ["faxEnabled", "fax_enabled"]) ?? 0,
+    slientFlag: booleanFlagNumber(slientFlag),
     suspendFlag,
     callForwardFlag: booleanFlagNumber(callForwardFlag),
     forwardNumber: pickPhoneString(phone, raw, ["forwardNumber", "forward_number"]) ?? "",
@@ -4687,7 +5444,7 @@ function buildPrivateNumberSettingJson(phone: DirectPhoneActionContext, suspendF
     autoSMSContent: pickPhoneString(phone, raw, ["autoSMSContent", "auto_sms_content"]) ?? "",
     defaultGreetings: pickPhoneNumber(phone, raw, ["defaultGreetings", "default_greetings"]) ?? 0,
     autoRenew: autoRenew ? 1 : 0,
-    filterSetting: JSON.stringify(filterSetting)
+    filterSetting
   };
 }
 
@@ -4695,8 +5452,11 @@ function booleanFlagNumber(value: boolean | undefined) {
   return value ? 1 : 0;
 }
 
-function parsePrivateNumberFilterSetting(value?: string) {
-  if (!value?.trim()) {
+function parsePrivateNumberFilterSetting(value: unknown) {
+  if (isRecord(value)) {
+    return value;
+  }
+  if (typeof value !== "string" || !value.trim()) {
     return {};
   }
   try {
@@ -5107,23 +5867,6 @@ function activationTemplateBaseSettingKey(apiName: string): DirectActivationTemp
   return "dt_direct_template_register_email";
 }
 
-function buildGetWebOfflineMessageQuery(
-  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
-  runtime: DirectRuntimeConfig,
-  trackCode: string
-) {
-  const appVersion = resolveDirectAppVersion(account, runtime);
-  return [
-    queryPair("deviceId", accountDeviceId(account)),
-    queryPair("TrackCode", trackCode),
-    queryPair("clientVersion", appVersion),
-    queryPair("appVersion", appVersion),
-    queryPair("apkCertificateSign", resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)),
-    queryPair("userId", account.dtUserId),
-    queryPair("token", account.token)
-  ].join("&");
-}
-
 function activationTemplateVariantSettingKey(
   baseKey: DirectActivationTemplateSettingKey,
   identity?: DirectActivationIdentity
@@ -5307,18 +6050,18 @@ function buildActivationClientInfo(input: DingtoneLoginInput, runtime: DirectRun
   const clientDeviceId = input.appVariant === "dingtone" ? normalizeActivationDeviceIdForVariant(input.deviceId, input.appVariant) : deviceId;
   const appVersion = resolveDirectAppVersion(input, runtime);
   return JSON.stringify({
-    deviceOriginalId: "69d4b9d8007bbc7e",
+    deviceOriginalId: "0000000000000000",
     advertisingId: "00000000-0000-0000-0000-000000000000",
     appVersion,
     timezone: "Asia/Shanghai",
     tzOffset: "GMT+08:00",
     simCC: "cn",
-    mac: "F4:51:9B:93:E7:95",
-    imei: "865166026274985",
-    mobileNum: "13200000054",
-    wifiSSid: "frigfb1063",
+    mac: "02:00:00:00:00:00",
+    imei: "000000000000000",
+    mobileNum: "00000000000",
+    wifiSSid: "AndroidWifi",
     language: "zh",
-    serialNumber: "772499999948",
+    serialNumber: "000000000000",
     pingTime: "100000;100000",
     mobileNetworkCarrier: {
       mcc: 460,
@@ -5339,7 +6082,7 @@ function buildActivationClientInfo(input: DingtoneLoginInput, runtime: DirectRun
     deviceOSVersion: "9",
     deviceModel: "PCRT00",
     clientTime: Date.now(),
-    ipv4: "192.168.232.2",
+    ipv4: "10.0.2.15",
     signMd5: appVariantSign(input.appVariant, clientDeviceId, runtime.apkCertificateSign)
   });
 }
@@ -5645,6 +6388,20 @@ function parseFrame(raw: Buffer): ParsedFrame {
   };
 }
 
+function frameToDirectFrameSummary(frame: ParsedFrame): DirectProbePushResult {
+  return {
+    receivedAt: new Date().toISOString(),
+    frameType: frame.type,
+    status: frame.status,
+    routeHex: frame.route?.toString("hex"),
+    bodyLength: frame.body.length,
+    rawHexPreview: frame.raw.subarray(0, 160).toString("hex"),
+    bodyHexPreview: frame.body.subarray(0, 160).toString("hex"),
+    jsonPayload: null,
+    sms: null
+  };
+}
+
 function frameToDirectPush(frame: ParsedFrame): DirectProbePushResult {
   return {
     receivedAt: new Date().toISOString(),
@@ -5665,10 +6422,10 @@ function isNotifyOnlyMessageIndexPush(push: DirectProbePushResult) {
   if (push.status !== 0x0103 || push.sms) {
     return false;
   }
-  const bodyText = push.bodyHex ? Buffer.from(push.bodyHex, "hex").toString("utf8") : "";
-  const rawText = push.rawHex ? Buffer.from(push.rawHex, "hex").toString("utf8") : "";
-  const text = `${bodyText}\n${rawText}`;
-  return /notifyInfoList|msgId|senderId/i.test(text);
+  return Boolean(
+    (push.rawHex && isOfflineMessageIndexPush(Buffer.from(push.rawHex, "hex"))) ||
+      (push.bodyHex && isOfflineMessageIndexPush(Buffer.from(push.bodyHex, "hex")))
+  );
 }
 function extractJsonPayload(raw: Buffer): ApiResult | null {
   const payload = raw.subarray(22);
@@ -6619,6 +7376,7 @@ function normalizePhoneNumber(value: unknown): DingtonePhoneNumber {
     autoRenew: pickBoolean(record, ["autoRenew", "auto_renew"]),
     isPrimary: pickBoolean(record, ["isPrimary", "is_primary", "primaryFlag", "primary_flag"]),
     isGoodNumber: pickBoolean(record, ["isGoodNumber", "is_good_number"]),
+    allowReceiveSms: parsePhoneAllowReceiveSms(record),
     portoutInfo: pickString(record, ["portoutInfo", "portout_info"]),
     rawJson: safeJsonStringify(value)
   };
@@ -6639,9 +7397,52 @@ function normalizePhoneNumberPatch(value: unknown): Partial<DingtonePhoneNumber>
     autoRenew: normalized.autoRenew,
     isPrimary: normalized.isPrimary,
     isGoodNumber: normalized.isGoodNumber,
+    allowReceiveSms: normalized.allowReceiveSms,
     portoutInfo: normalized.portoutInfo,
     rawJson: normalized.rawJson
   };
+}
+
+function parsePhoneAllowReceiveSms(record: Record<string, unknown>) {
+  const keys = ["allowReceiveSMS", "allowReceiveSms", "allow_receive_sms"];
+  for (const candidate of collectNestedRecords(record)) {
+    const direct = pickBoolean(candidate, keys);
+    if (direct !== undefined) {
+      return direct;
+    }
+    const filterSetting = candidate.filterSetting ?? candidate.filter_setting;
+    if (isRecord(filterSetting)) {
+      const nested = pickBoolean(filterSetting, keys);
+      if (nested !== undefined) {
+        return nested;
+      }
+    }
+    if (typeof filterSetting === "string" && filterSetting.trim()) {
+      try {
+        const parsed = JSON.parse(filterSetting) as unknown;
+        if (isRecord(parsed)) {
+          const nested = pickBoolean(parsed, keys);
+          if (nested !== undefined) {
+            return nested;
+          }
+        }
+      } catch {
+        // Ignore malformed legacy filter settings and keep searching nested records.
+      }
+    }
+  }
+  return undefined;
+}
+
+function pickPhoneValue(phone: DirectPhoneActionContext, records: Record<string, unknown>[], keys: string[]) {
+  for (const record of [phone as Record<string, unknown>, ...records]) {
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(record, key)) {
+        return record[key];
+      }
+    }
+  }
+  return undefined;
 }
 
 function normalizePhoneStatus(record: Record<string, unknown>): DingtonePhoneNumber["status"] {
@@ -7189,16 +7990,85 @@ function directSessionAccountKey(account: { dtUserId: string; deviceId?: string 
   return account.dtUserId;
 }
 
-function preemptActiveDirectPushListener(account: { dtUserId: string; deviceId?: string | null }) {
+function createDirectRouteCoordinator(primaryHost: string) {
+  let owner: string | null = null;
+  let ownerEpoch = 0;
+  let backupEligible = false;
+
+  return {
+    shouldClaim(host: string) {
+      return host === primaryHost || (backupEligible && owner === null);
+    },
+    claim(host: string) {
+      owner = host;
+      ownerEpoch += 1;
+      if (host === primaryHost) {
+        backupEligible = false;
+      }
+      return ownerEpoch;
+    },
+    release(host: string, epoch: number) {
+      if (owner !== host || ownerEpoch !== epoch) {
+        return;
+      }
+      owner = null;
+      if (host === primaryHost) {
+        backupEligible = true;
+      }
+    },
+    markPrimaryUnavailable() {
+      if (owner === primaryHost) {
+        owner = null;
+        ownerEpoch += 1;
+      }
+      backupEligible = true;
+    },
+    ownerHost() {
+      return owner;
+    },
+    isOwner(host: string, epoch: number) {
+      return owner === host && ownerEpoch === epoch;
+    }
+  };
+}
+
+export function createDirectRouteCoordinatorForTest(primaryHost: string) {
+  return createDirectRouteCoordinator(primaryHost);
+}
+
+function getPrioritizedDirectPushHosts(
+  runtime: Pick<DirectRuntimeConfig, "primaryHost" | "backupHost">,
+  account: { dtUserId: string; deviceId?: string | null }
+) {
+  const preferredHosts = directSmsHostAffinity.get(directSessionAccountKey(account)) ?? [];
+  return uniqueHosts([...preferredHosts, ...APP_DIRECT_PUSH_HOSTS, runtime.primaryHost, runtime.backupHost]);
+}
+
+function rememberDirectSmsHost(account: { dtUserId: string; deviceId?: string | null }, host: string) {
+  const key = directSessionAccountKey(account);
+  const previous = directSmsHostAffinity.get(key) ?? [];
+  directSmsHostAffinity.set(key, [host, ...previous.filter((item) => item !== host)].slice(0, 6));
+}
+
+function isActiveDirectPushListener(listener: ActiveDirectPushListener) {
+  return !listener.preempted && activeDirectPushListeners.get(listener.key) === listener;
+}
+
+async function preemptActiveDirectPushListener(account: { dtUserId: string; deviceId?: string | null }) {
   const active = activeDirectPushListeners.get(directSessionAccountKey(account));
-  if (!active || active.preempted) {
+  if (!active) {
     return false;
+  }
+  if (active.preempted) {
+    await active.done;
+    return true;
   }
   active.preempted = true;
   void active.session?.close().catch(() => undefined);
   for (const session of active.sessions ?? []) {
     void session.close().catch(() => undefined);
   }
+  await active.done;
   return true;
 }
 
@@ -7222,8 +8092,18 @@ async function runWithDirectSessionOperationLock<T>(account: { dtUserId: string;
   }
 }
 
-async function waitForDirectSessionOperationIdle(account: { dtUserId: string; deviceId?: string | null }) {
-  await directSessionOperationLocks.get(directSessionAccountKey(account))?.catch(() => undefined);
+async function waitForDirectSessionOperationIdle(
+  account: { dtUserId: string; deviceId?: string | null },
+  timeoutMs = DIRECT_SESSION_OPERATION_IDLE_WAIT_MS
+) {
+  const active = directSessionOperationLocks.get(directSessionAccountKey(account));
+  if (!active) {
+    return true;
+  }
+  return Promise.race([
+    active.then(() => true, () => true),
+    delay(Math.max(1, timeoutMs)).then(() => false)
+  ]);
 }
 
 function yieldToEventLoop() {
@@ -7271,7 +8151,6 @@ export async function getDirectRuntimeConfig(): Promise<DirectRuntimeConfig> {
     appVersion: config.DT_APP_VERSION,
     dingdongAppVersion: settings.dt_dingdong_app_version || config.DT_DINGDONG_APP_VERSION,
     apkCertificateSign: config.DT_APK_CERTIFICATE_SIGN,
-    listenHostConcurrency: parsePositiveIntSetting(settings.dt_direct_listener_host_concurrency, 1, 1, 1),
     proxyUrl: (settings.dt_proxy_url || config.DT_PROXY_URL || "").trim()
   };
 }

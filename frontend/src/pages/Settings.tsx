@@ -75,6 +75,7 @@ export default function Settings() {
   const [testing, setTesting] = useState(false);
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [versionLoading, setVersionLoading] = useState(false);
+  const [versionSearch, setVersionSearch] = useState('');
   const { message } = App.useApp();
   const { token } = antdTheme.useToken();
 
@@ -166,6 +167,16 @@ export default function Settings() {
   };
 
   const settingsMap = useMemo(() => toMap(items), [items]);
+  const filteredVersions = useMemo(() => {
+    const keyword = versionSearch.trim().toLowerCase();
+    const versions = versionInfo?.recent_versions ?? [];
+    if (!keyword) return versions;
+    return versions.filter((item) =>
+      item.sha.toLowerCase().includes(keyword) ||
+      item.short_sha.toLowerCase().includes(keyword) ||
+      item.title.toLowerCase().includes(keyword)
+    );
+  }, [versionInfo?.recent_versions, versionSearch]);
   const activeMode = (settingsMap.DT_GATEWAY_MODE || 'mock') as GatewayMode;
   const activeModeMeta = gatewayModeOptions.find((item) => item.value === activeMode) ?? gatewayModeOptions[0];
 
@@ -284,9 +295,9 @@ export default function Settings() {
                   <Form.Item
                     label="直连监听最大并发"
                     name="direct_monitor_max_concurrent"
-                    help="低配 VPS 可设为 1-3 限制同时打开的直连短信监听连接；0 表示不限制。"
+                    help="低配 VPS 可设为 1-3；默认值 10，必须填写大于 0 的整数。"
                   >
-                    <InputNumber min={0} max={100} style={{ width: '100%' }} />
+                    <InputNumber min={1} max={100} style={{ width: '100%' }} />
                   </Form.Item>
 
                   <Divider>direct 号码模板</Divider>
@@ -518,17 +529,29 @@ export default function Settings() {
                   </Descriptions.Item>
                   <Descriptions.Item label="更新分支">{versionInfo ? `${versionInfo.repository}@${versionInfo.update_branch}` : '-'}</Descriptions.Item>
                   <Descriptions.Item label="更新状态">
-                    {versionInfo?.update_available === true ? <Tag color="orange">发现更新</Tag> : versionInfo?.update_available === false ? <Tag color="green">已是最新</Tag> : <Tag>无法比较</Tag>}
+                    {versionInfo?.update_status === 'behind' ? <Tag color="orange">发现更新</Tag> : null}
+                    {versionInfo?.update_status === 'current' ? <Tag color="green">已是最新</Tag> : null}
+                    {versionInfo?.update_status === 'ahead' ? <Tag color="blue">本地领先</Tag> : null}
+                    {versionInfo?.update_status === 'diverged' ? <Tag color="gold">分支不同</Tag> : null}
+                    {!versionInfo || versionInfo.update_status === 'unknown' ? <Tag>无法比较</Tag> : null}
                   </Descriptions.Item>
                 </Descriptions>
                 <Space style={{ marginTop: 16 }}>
                   <Button icon={<ReloadOutlined />} loading={versionLoading} onClick={() => void loadVersionInfo(true)}>检测更新</Button>
                   {versionInfo?.check_error ? <Typography.Text type="warning">{versionInfo.check_error}</Typography.Text> : null}
                 </Space>
+                <Input.Search
+                  allowClear
+                  value={versionSearch}
+                  placeholder="按提交号或标题查询版本"
+                  onChange={(event) => setVersionSearch(event.target.value)}
+                  style={{ marginTop: 16, maxWidth: 420 }}
+                />
                 <List
                   style={{ marginTop: 16 }}
                   header={<Typography.Text strong>最近版本</Typography.Text>}
-                  dataSource={versionInfo?.recent_versions ?? []}
+                  dataSource={filteredVersions}
+                  pagination={{ pageSize: 10, hideOnSinglePage: true }}
                   locale={{ emptyText: '暂无版本记录' }}
                   renderItem={(item) => (
                     <List.Item>

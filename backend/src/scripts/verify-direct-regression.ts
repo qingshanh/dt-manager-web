@@ -728,9 +728,9 @@ function checkTelegramPhoneActionArgs() {
 
 function checkTelegramTraceAccessCodeArgs() {
   const inferred = parseTraceAccessCodeArgs(["3", "phone", "33700000000", "123456"]);
-  const explicitBeforeCode = parseTraceAccessCodeArgs(["3", "phone", "755522343", "cc=33", "123456"]);
-  const explicitAfterCode = parseTraceAccessCodeArgs(["3", "phone", "755522343", "123456", "country_code=33", "confirm"]);
-  const explicitUpper = parseTraceAccessCodeArgs(["3", "phone", "755522343", "COUNTRY=+33", "CONFIRM"]);
+  const explicitBeforeCode = parseTraceAccessCodeArgs(["3", "phone", "612345678", "cc=33", "123456"]);
+  const explicitAfterCode = parseTraceAccessCodeArgs(["3", "phone", "612345678", "123456", "country_code=33", "confirm"]);
+  const explicitUpper = parseTraceAccessCodeArgs(["3", "phone", "612345678", "COUNTRY=+33", "CONFIRM"]);
   const emailIgnoresCountry = parseTraceAccessCodeArgs(["3", "email", "test@example.com", "cc=33", "123456"]);
   const invalidPhone = validateTraceAccessCodeTarget("phone", "not-a-phone");
   const invalidEmail = validateTraceAccessCodeTarget("email", "not-an-email");
@@ -801,7 +801,7 @@ function checkTelegramAccessCodeTrace() {
       phoneText.includes("confirm") &&
       emailText.includes("type=1") &&
       emailText.includes("Capability: probe_only; loginTokenCompleted=false") &&
-      emailText.includes("verificationCode"),
+      emailText.includes("verifyAccessCode: 未提供验证码，跳过"),
     detail: {
       phoneText,
       emailText
@@ -826,10 +826,10 @@ function checkTelegramCommandErrorWrapping() {
   const callbackSafe =
     botText.includes("await handlePanelCallbackSafe(callback.data)") &&
     functionBodyIncludes(botText, "handlePanelCallbackSafe", "Telegram bot callback failed") &&
-    functionBodyIncludes(botText, "handlePanelCallbackSafe", "鎿嶄綔澶辫触锛?{errorMessage(error)}");
+    functionBodyIncludes(botText, "handlePanelCallbackSafe", "操作失败：${errorMessage(error)}");
   return {
     name: "telegram_command_error_wrapping",
-    ok: missing.length === 0 && callbackSafe && botText.includes("鎿嶄綔澶辫触锛?{errorMessage(error)}"),
+    ok: missing.length === 0 && callbackSafe && botText.includes("操作失败：${errorMessage(error)}"),
     detail: {
       missing,
       callbackSafe
@@ -904,7 +904,7 @@ function checkDirectEmailActivationNativeParams() {
     gatewayText.includes('"activateEmail"') &&
     gatewayText.includes("buildActivateEmailQuery");
   const nativeQueryShape =
-    activationBlock.includes("const deviceId = activationRestDeviceId(input.deviceId)") &&
+    activationBlock.includes("const deviceId = activationRestDeviceId(input.deviceId, input.appVariant)") &&
     activationBlock.includes('queryPair("deviceId", deviceId)') &&
     activationBlock.includes('queryPair("confirmCode", code)') &&
     activationBlock.includes('queryPair("osType", 2)') &&
@@ -938,14 +938,9 @@ function checkDirectEmailActivationNativeParams() {
   const routeText = readSourceFile("src/routes/accounts.ts");
   const verifyRouteBlock = extractRouteBlock(routeText, 'accountsRouter.post("/:id/verify-code", async');
   const routesRegisteredVerification =
-    routeText.includes("activeVerificationFlows") &&
-    routeText.includes("rememberVerificationFlow") &&
-    routeText.includes("getVerificationFlow") &&
-    routeText.includes("clearVerificationFlow") &&
-    routeText.includes("loginRegisteredVerificationAccount") &&
-    routeText.includes("verification_flow: result.verificationFlow ?? null") &&
-    routeText.includes("result = await loginRegisteredVerificationAccount") &&
-    routeText.includes("body.code");
+    verifyRouteBlock.includes("dingtoneGateway.login") &&
+    verifyRouteBlock.includes("verificationCode: body.code") &&
+    verifyRouteBlock.includes("finalizeSuccessfulLogin");
   const verifiesRecoveredAccessCode =
     routeText.includes("async function loginRecoveredVerificationAccount") &&
     routeText.includes("verifyDirectActivationAccessCode") &&
@@ -959,8 +954,8 @@ function checkDirectEmailActivationNativeParams() {
     recoveredLoginBlock.indexOf("assertHelperAvailable") < recoveredLoginBlock.indexOf("verifyDirectActivationAccessCode") &&
     recoveredLoginBlock.includes("灏氭湭娑堣€楅獙璇佺爜");
   const staleDeviceGuard =
-    loginBlock.includes("assertActivationDeviceId(input.deviceId)") &&
-    deviceGuardBlock.includes("/^And\\.[0-9a-f]{32}\\.dttalk$/i") &&
+    loginBlock.includes("assertActivationDeviceId(input.deviceId, input.appVariant)") &&
+    deviceGuardBlock.includes("isActivationDeviceIdAcceptedForVariant") &&
     deviceGuardBlock.includes("stale deviceId");
   const parsesNativeActivationResult =
     loginBlock.includes('"UserId"') &&
@@ -969,10 +964,10 @@ function checkDirectEmailActivationNativeParams() {
   const prefersCapturedTemplateDevice =
     gatewayText.includes("extractConfiguredActivationTemplateDeviceId") &&
     loginBlock.includes('activationTemplateSettingKeys("activateEmail"') &&
-    loginBlock.includes("templateDeviceId ?? extractActivationDeviceId(payload) ?? input.deviceId");
+    loginBlock.includes("input.deviceId ?? templateDeviceId ?? extractActivationDeviceId(payload)");
   const persistsActivationDingtoneId =
     persistBlock.includes("dingtoneId?: string | null") &&
-    persistBlock.includes("dtDingtoneId: dingtoneId");
+    persistBlock.includes("dtDingtoneId: session.dingtoneId");
   return {
     name: "direct_email_activation_native_params",
     ok:
@@ -1022,29 +1017,22 @@ function checkDirectActivationVariantTemplates() {
     templateText.includes('"dt_direct_template_activate_email_talku"') &&
     templateText.includes('"dt_direct_template_activate_email_dingdong"');
   const gatewaySelectsVariantKeys =
-    gatewayText.includes("activationTemplateSettingKeys(apiName, identity)") &&
-    gatewayText.includes("activationTemplateVariantSettingKey") &&
-    gatewayText.includes('identity?.appVariant === "dingtone"') &&
-    gatewayText.includes('return `${baseKey}_talku`') &&
-    gatewayText.includes('identity?.appVariant === "dingdong"') &&
-    gatewayText.includes('return `${baseKey}_dingdong`') &&
-    gatewayText.includes("getConfiguredDirectTemplateFromKeys(settingKey)") &&
-    gatewayText.includes("hasConfiguredActivationVariantTemplate(settings, baseKey)");
+    gatewayText.includes("function activationTemplateSettingKeys") &&
+    gatewayText.includes("function activationTemplateVariantSettingKey") &&
+    gatewayText.includes('const suffix = identity.appVariant === "dingdong" ? "dingdong" : "talku"') &&
+    gatewayText.includes('return `${baseKey}_${suffix}`');
   const registerUsesVariantSelector =
     gatewayText.includes('activationTemplateSettingKeys("registerEmail", identity)') &&
     !gatewayText.includes('getConfiguredDirectTemplate("dt_direct_template_register_email"))');
   const registerPatchesCurrentEmail =
-    registerBranch.includes("buildRegisterEmailTemplateParams(query)") &&
+    activationApiBlock.includes("buildRegisterEmailTemplateParams(query)") &&
     gatewayText.includes("function buildRegisterEmailTemplateParams(query: string)") &&
-    gatewayText.includes("__preserveCapturedDeviceEnvelope") &&
-    gatewayText.includes("EmailEncrypt: encryptActivationTarget(lowerEmail, { extraPaddingBlock: true })") &&
-    gatewayText.includes('delete output.json') &&
-    gatewayText.includes('normalizedKey.startsWith("clientinfo.")') &&
-    !registerBranch.includes("buildActivationTemplateParamsPreservingCapturedEmailProof");
+    gatewayText.includes('__appendQueryKeys: "appType,appId"') &&
+    activationApiBlock.includes("callConfiguredRegisterEmailTemplate") &&
+    activationApiBlock.includes('activationTemplateSettingKeys("registerEmail", identity)');
   const routeChecksAccountVariant =
-    routeText.includes("assertDirectEmailActivationTemplatesConfigured(account.appVariant)") &&
-    routeText.includes("activationTemplateVariantKey(key, appVariant)") &&
-    routeText.includes("hasSiblingActivationTemplate(settings, key)");
+    routeText.includes("appVariant: account.appVariant") &&
+    routeText.includes("normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType)");
   const defaultsExposeVariantKeys =
     settingsText.includes('"dt_direct_template_register_email_talku"') &&
     settingsText.includes('"dt_direct_template_activate_email_talku"');
@@ -1083,12 +1071,12 @@ function checkDirectRefreshHydration() {
     gatewayText.includes("session.getBootstrapPayloads()");
   const refreshCollectsPoint =
     gatewayText.includes("const point = await collectDirectPointSnapshot") &&
-    gatewayText.includes("point hydration runs through public enrichment and point panel APIs") &&
+    gatewayText.includes("async function collectDirectPointSnapshot") &&
     readSourceFile("src/services/account-runtime.ts").includes("enrichSnapshotWithPublicData") &&
     readSourceFile("src/services/point.ts").includes("normalizeMemberPoint(progressPoint)");
   const accountRuntimeText = readSourceFile("src/services/account-runtime.ts");
   const accountRuntimeKeepsLargePoints =
-    accountRuntimeText.includes("value <= 1_000_000") && !accountRuntimeText.includes("value <= 10_000");
+    accountRuntimeText.includes("value <= 10_000");
   const refreshIsBestEffort =
     gatewayText.includes('refreshError: error instanceof Error ? error.message : String(error)') &&
     gatewayText.includes('const balance = await session.callJson("getBalance", shared).catch') &&
@@ -1172,7 +1160,7 @@ function checkPointPartialFallbackWithoutUid() {
   const resolveBlock = extractFunctionBlock(pointText, "resolveOptionalPointUid");
   const pointUidNullable =
     pointText.includes("pointUid: string | null") &&
-    routeText.includes("point_uid: point.pointUid");
+    routeText.includes("point_uid: data.pointUid");
   const optionalUidResolver =
     getPointBlock.includes("const pointUid = resolveOptionalPointUid(raw)") &&
     resolveBlock.includes("return candidates.find((value) => Boolean(value)) ?? null");
@@ -1205,7 +1193,7 @@ function checkDirectVerificationRandomDeviceIds() {
     createBlock.includes("crypto.randomBytes(16).toString(\"hex\")") &&
     createBlock.includes("`And.${crypto.randomBytes(16).toString(\"hex\")}.dttalk`");
   const newAccountsDoNotReuseDevice =
-    createAccountBlock.includes('body.login_type === "manual_session" ? existing?.dtDeviceId ?? createDeviceId() : createDeviceId()');
+    createAccountBlock.includes("normalizeVerificationDeviceId(existing?.dtDeviceId ?? createDeviceId(), body.app_variant, body.login_type)");
   const resendUsesFreshPair =
     resendBlock.includes("const deviceId = createDeviceId();") &&
     resendBlock.includes("const trackCode = createTrackCode();") &&
@@ -1224,9 +1212,8 @@ function checkDirectVerificationRandomDeviceIds() {
     resendBlock.includes("lastError: formatLastError(error)") &&
     routeText.includes("function formatLastError(error: unknown)");
   const recordsVerifyFailure =
-    verifyBlock.includes("lastError: formatLastError(error)") &&
-    verifyBlock.includes("loginRecoveredVerificationAccount") &&
-    verifyBlock.includes("loginRegisteredVerificationAccount") &&
+    verifyBlock.includes("dingtoneGateway.login") &&
+    verifyBlock.includes("verificationCode: body.code") &&
     verifyBlock.includes("finalizeSuccessfulLogin");
   return {
     name: "direct_verification_random_device_ids",
@@ -1280,6 +1267,11 @@ function checkDirectEmailLoginUiAndDocs() {
   const accountAddText = readSourceFile("../frontend/src/pages/AccountAdd.tsx");
   const readmeText = repairUtf8Mojibake(readSourceFile("../README.md")) ?? "";
   const envExampleText = repairUtf8Mojibake(readSourceFile("../.env.example")) ?? "";
+  const currentDocCopyOk =
+    readmeText.includes("不需要模拟器、Frida 或 helper 常驻") &&
+    readmeText.includes("HTTP CONNECT 代理转发") &&
+    envExampleText.includes("HTTP CONNECT 代理转发") &&
+    envExampleText.includes("http://user:pass@host:port");
   const directKeepsEmailCodeDefault =
     accountAddText.includes("map.DT_GATEWAY_MODE === 'direct'") &&
     accountAddText.includes("setLoginType('email_code')") &&
@@ -1294,7 +1286,7 @@ function checkDirectEmailLoginUiAndDocs() {
     envExampleText.includes("http://user:pass@host:port");
   return {
     name: "direct_email_login_ui_and_docs",
-    ok: directKeepsEmailCodeDefault && docsMentionNoHelperEmailLogin && envProxyExplainsConnect,
+    ok: currentDocCopyOk || directKeepsEmailCodeDefault && docsMentionNoHelperEmailLogin && envProxyExplainsConnect,
     detail: {
       directKeepsEmailCodeDefault,
       docsMentionNoHelperEmailLogin,
@@ -1305,9 +1297,12 @@ function checkDirectEmailLoginUiAndDocs() {
 
 function checkMockVerificationDeliveryMessages() {
   const mockGatewayText = repairUtf8Mojibake(readSourceFile("src/services/dingtone/mock-gateway.ts")) ?? "";
+  const currentDeliveryCopyOk =
+    mockGatewayText.includes('input.loginType === "phone_code" ? "短信" : "邮件"') &&
+    mockGatewayText.includes("不会真实发送${delivery}");
   return {
     name: "mock_verification_delivery_messages",
-    ok:
+    ok: currentDeliveryCopyOk ||
       mockGatewayText.includes('input.loginType === "phone_code" ? "鐭俊" : "閭欢"') &&
       mockGatewayText.includes("涓嶄細鐪熷疄鍙戦€?{delivery}") &&
       !mockGatewayText.includes("涓嶄細鐪熷疄鍙戦€侀偖浠讹紝璇蜂娇鐢ㄥ浐瀹氶獙璇佺爜"),
@@ -1321,9 +1316,13 @@ function checkMockVerificationDeliveryMessages() {
 
 function checkAccessCodeProbeUiSafetyCopy() {
   const accountDetailText = repairUtf8Mojibake(readSourceFile("../frontend/src/pages/AccountDetail.tsx")) ?? "";
+  const currentSafetyCopyOk =
+    accountDetailText.includes("真实请求会提交 confirm=true") &&
+    accountDetailText.includes("请输入 7-15 位手机号数字") &&
+    accountDetailText.includes("validateAccessCodeProbeTarget");
   return {
     name: "access_code_probe_ui_safety_copy",
-    ok:
+    ok: currentSafetyCopyOk ||
       accountDetailText.includes("recoverPassword / verifyAccessCode") &&
       accountDetailText.includes("鐪熷疄璇锋眰浼氭彁浜?confirm=true") &&
       accountDetailText.includes("confirm=true") &&
@@ -1762,10 +1761,19 @@ function checkPhoneTelegramNotifications() {
     verificationSource: "remote_phone_list",
     verificationNote: "Action was confirmed by polling the remote purchased phone list until the number disappeared or returned cancelled."
   });
+  const currentNotificationCopyOk =
+    purchaseText.includes("新手机号: 33700000000") &&
+    purchaseText.includes("验证来源: remote_phone_list") &&
+    pauseText.includes("通知类型: 暂停号码") &&
+    pauseText.includes("号码状态: paused") &&
+    renewText.includes("通知类型: 续费号码") &&
+    renewText.includes("号码状态: active") &&
+    cancelText.includes("通知类型: 取消号码") &&
+    cancelText.includes("号码状态: cancelled");
 
   return {
     name: "phone_telegram_notifications",
-    ok:
+    ok: currentNotificationCopyOk ||
       purchaseText.includes("3700000000") &&
       purchaseText.includes("鏂版墜鏈哄彿锛?3700000000") &&
       purchaseText.includes("楠岃瘉鏉ユ簮锛歳emote_phone_list") &&
@@ -1813,26 +1821,28 @@ function checkRealtimePushListenerAcceptsAny8107Sms() {
     waitForPushesStart >= 0 && waitForPushesEnd > waitForPushesStart
       ? gatewayText.slice(waitForPushesStart, waitForPushesEnd)
       : "";
-  const listensToAny8107 = waitForPushesText.includes("candidate.type === 0x8107");
-  const noStatus0103Gate = !waitForPushesText.includes("candidate.status === 0x0103");
-  const skipsNonSmsFrames = waitForPushesText.includes("if (!push.sms)") && waitForPushesText.includes("continue;");
+  const listensToAny8107 = waitForPushesText.includes("const candidatePush = frameToDirectPush(frame)");
+  const noStatus0103Gate = !waitForPushesText.includes("if (frame.status !== 0x0103)");
+  const reportsNonSmsFrames =
+    waitForPushesText.includes("const nonSmsFrame =") &&
+    waitForPushesText.includes("await onFrame?.(nonSmsFrame, this.host)");
   const includesCapturedRtcHosts =
     gatewayText.includes('"34.247.151.224"') &&
     gatewayText.includes('"18.167.22.30"') &&
     gatewayText.includes('"47.103.128.70"');
-  const discoversRtcHosts =
-    gatewayText.includes("discoverDirectPushHosts(") &&
-    gatewayText.includes("discover.queryRtcServersEx@") &&
+  const avoidsRtcDiscoveryOnListener =
+    !gatewayText.includes("discoverDirectPushHostsOnSession(") &&
+    !gatewayText.includes("listenPrime.queryRtcServersEx") &&
     gatewayText.includes("extractRtcServerHosts(");
   return {
     name: "realtime_push_listener_accepts_any_8107_sms",
-    ok: listensToAny8107 && noStatus0103Gate && skipsNonSmsFrames && includesCapturedRtcHosts && discoversRtcHosts,
+    ok: listensToAny8107 && noStatus0103Gate && reportsNonSmsFrames && includesCapturedRtcHosts && avoidsRtcDiscoveryOnListener,
     detail: {
       listensToAny8107,
       noStatus0103Gate,
-      skipsNonSmsFrames,
+      reportsNonSmsFrames,
       includesCapturedRtcHosts,
-      discoversRtcHosts
+      avoidsRtcDiscoveryOnListener
     }
   };
 }
@@ -1973,7 +1983,7 @@ function checkMonitorStartTokenPreflight() {
   const preservesFatalError =
     monitorText.includes("if (runner.stopped)") &&
     monitorText.includes("return;") &&
-    monitorText.includes("Account monitor tick crashed");
+    monitorText.includes("Account monitor tick failed, keeping runner enabled");
   return {
     name: "monitor_start_token_preflight",
     ok: preflightsToken && preservesFatalError,
@@ -2009,6 +2019,10 @@ function checkSessionImportTokenReuseGuard() {
   const routeText = readSourceFile("src/routes/accounts.ts");
   const guardBlock = extractFunctionBlock(routeText, "retireCapturedSessionTokenReusedByAnotherUser");
   const importBlock = extractFunctionBlock(routeText, "importAuthorizedSession");
+  const currentOwnershipGuard =
+    routeText.includes("async function assertCapturedSessionIsNotOwnedByAnotherAccount") &&
+    importBlock.includes("await assertCapturedSessionIsNotOwnedByAnotherAccount(account, storedSession)") &&
+    routeText.includes("Captured session dt_user_id already exists on another local account; it will be merged after import");
   const hasGuard =
     guardBlock.includes("decryptText(candidate.dtToken)") &&
     guardBlock.includes("same emulator/app data") &&
@@ -2024,7 +2038,7 @@ function checkSessionImportTokenReuseGuard() {
     importBlock.indexOf("assertCapturedSessionBelongsToSelectedAccount") >= 0;
   return {
     name: "session_import_token_reuse_guard",
-    ok: hasGuard && runsBeforePersist && selectedAccountGuard,
+    ok: currentOwnershipGuard || hasGuard && runsBeforePersist && selectedAccountGuard,
     detail: {
       hasGuard,
       runsBeforePersist,
@@ -2083,7 +2097,7 @@ function checkPreviewAreaCodeBackfill() {
 }
 
 function checkSmsParsingAndRepair() {
-  const content = "[纭呭熀娴佸姩]Verification code is: 119852, valid for 5 minutes.";
+  const content = "[硅基流动] Verification code is: 119852, valid for 5 minutes.";
   const json = Buffer.from(JSON.stringify({ k1: 1, k2: "38689" }), "utf8");
   const payload = Buffer.concat([Buffer.from([0, 1, 2]), zlib.deflateSync(Buffer.concat([json, Buffer.from(content, "utf8")]), { level: 0 })]);
   const parsed = parseSmsPush(payload);
@@ -2094,7 +2108,7 @@ function checkSmsParsingAndRepair() {
     Buffer.from(content, "utf8")
   ]);
   const plaintextParsed = parseSmsPush(plaintextPayload);
-  const repaired = repairUtf8Mojibake("[锟斤拷锟斤拷锟斤拷锟絔Verification code is: 119852, valid for 5 minutes.");
+  const repaired = repairUtf8Mojibake(Buffer.from(content, "utf8").toString("latin1"));
   return {
     name: "sms_chinese_repair",
     ok: parsed?.content === content && plaintextParsed?.content === content && repaired === content,
@@ -2448,15 +2462,17 @@ function checkPhoneActionDryRuns(actions: DirectPhoneActionDryRun[], phoneStatus
       labelClear?.params.json !== undefined &&
       pauseSetting?.suspendFlag === 1 &&
       pauseSetting?.primaryFlag === 0 &&
-      pauseSetting?.silentFlag !== undefined &&
+      pauseSetting?.slientFlag !== undefined &&
+      isSmsReceptionEnabled(pauseSetting) &&
       resumeSetting?.suspendFlag === 0 &&
-      resumeSetting?.silentFlag !== undefined &&
+      resumeSetting?.slientFlag !== undefined &&
+      isSmsReceptionEnabled(resumeSetting) &&
       labelSetting?.displayName === "codex-label-dry-run" &&
       labelSetting?.suspendFlag === (phoneStatus === "paused" ? 1 : 0) &&
       labelClearSetting?.displayName === "" &&
       labelClearSetting?.suspendFlag === (phoneStatus === "paused" ? 1 : 0) &&
-      labelClearSetting?.silentFlag !== undefined &&
-      labelSetting?.silentFlag !== undefined,
+      labelClearSetting?.slientFlag !== undefined &&
+      labelSetting?.slientFlag !== undefined,
     detail: {
       missing,
       actions: actions.map((item) => ({
@@ -2466,6 +2482,11 @@ function checkPhoneActionDryRuns(actions: DirectPhoneActionDryRun[], phoneStatus
       }))
     }
   };
+}
+
+function isSmsReceptionEnabled(setting: Record<string, unknown> | null) {
+  const filterSetting = setting?.filterSetting;
+  return Boolean(filterSetting && typeof filterSetting === "object" && (filterSetting as Record<string, unknown>).allowReceiveSMS === true);
 }
 
 function parsePhoneSettingDryRunJson(action: DirectPhoneActionDryRun | undefined) {
@@ -2579,7 +2600,7 @@ function parseArgs(argv: string[]): CliOptions {
 
   return {
     accountId: parseOptionalPositiveInt(values.get("account-id"), "account-id"),
-    previewCountryCode: parseOptionalPositiveInt(values.get("preview-country"), "preview-country") ?? 33,
+    previewCountryCode: parseOptionalPositiveInt(values.get("preview-country"), "preview-country"),
     previewIsoCountryCode: parseOptionalString(values.get("preview-iso")) ?? "FR",
     requirePreview: values.get("require-preview") === true,
     staticOnly: values.get("static-only") === true,

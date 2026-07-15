@@ -585,6 +585,37 @@ rpc.exports = {
     }
     return result;
   },
+  requestweboffline: function () {
+    if (typeof Java === "undefined" || !Java.available) {
+      throw new Error("Java runtime is not available in this process yet");
+    }
+    if (!TpClientClass) {
+      installJavaHooks();
+    }
+    if (!TpClientClass) {
+      throw new Error("TpClient Java class is not available in this process yet");
+    }
+    const result = {
+      appCall: false,
+      errors: []
+    };
+    Java.perform(function () {
+      armNativeCapture("rpc:getWebOfflineMessage", 15000);
+      try {
+        const DTRestCallBase = Java.use("me.tzim.app.im.datatype.DTRestCallBase");
+        const client = TpClientClass.getInstance();
+        log("rpc", "calling TpClient.getInstance().getWebOfflineMessage(DTRestCallBase)");
+        client.getWebOfflineMessage(DTRestCallBase.$new());
+        result.appCall = true;
+      } catch (error) {
+        result.errors.push("appCall: " + error);
+      }
+    });
+    if (!result.appCall) {
+      throw new Error("requestweboffline failed: " + result.errors.join("; "));
+    }
+    return result;
+  },
   captures: function () {
     return captures;
   },

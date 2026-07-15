@@ -38,7 +38,6 @@ function startBackend() {
         startBackend();
       }
     }, restartDelayMs);
-    restartTimer.unref?.();
   });
 
   child.on("error", (error) => {

@@ -27,10 +27,10 @@ test("fallback polling is slower than direct page navigation and SSE carries fre
   assert.match(accountDetailSource, /LOCAL_MESSAGE_POLL_MS\s*=\s*30_000/);
 });
 test("message list refreshes bypass cached pages", () => {
-  assert.match(accountDetailSource, /fetchMessages\(msgPage, \{ silent: true, suppressError: true, force: true \}\)/);
+  assert.match(accountDetailSource, /fetchMessages\(msgPage, \{ silent, suppressError: silent, force: true \}\)/);
   assert.match(accountDetailSource, /fetchTeamMessages\(teamMessageModalOpen \? teamMsgPage : 1, \{ silent: true, force: true \}\)/);
-  assert.match(accountDetailSource, /fetchMessages\(msgPage, \{ force: true \}\)/);
-  assert.match(accountDetailSource, /fetchMessages\(page, \{ force: true \}\)/);
+  assert.match(accountDetailSource, /void pollLocalMessages\(false\)/);
+  assert.doesNotMatch(accountDetailSource, /setMsgPage\(page\);\s*fetchMessages\(page/);
 });
 test("account detail refreshes point store data without blocking the first account render", () => {
   assert.match(accountDetailSource, /getAccountPointStore/);

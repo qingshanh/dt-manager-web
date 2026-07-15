@@ -65,7 +65,7 @@ export async function sendPhoneTelegramNotification(input: PhoneNotificationInpu
 }
 
 export async function sendPointStoreTelegramNotification(input: PointStoreNotificationInput) {
-  return sendAccountTelegramNotification(input.account, "积分商城兑换成功", [
+  return sendAccountTelegramNotification(input.account, pointStoreNotificationTitle(input.status), [
     ["账号", deriveAccountName(input.account)],
     ["面板账号ID", input.account.id],
     ["说道用户ID", input.account.dtUserId],
@@ -77,6 +77,20 @@ export async function sendPointStoreTelegramNotification(input: PointStoreNotifi
     ["订单状态", input.status],
     ["兑换时间", formatTelegramTime(input.orderTime)]
   ]);
+}
+
+export function pointStoreNotificationTitle(status: string) {
+  const normalized = status.trim().toLowerCase();
+  if (/complete|success|done|fulfilled|^1$/.test(normalized)) {
+    return "积分商城兑换成功";
+  }
+  if (/fail|cancel|error|reject|^2$/.test(normalized)) {
+    return "积分商城兑换失败";
+  }
+  if (/process|^3$/.test(normalized)) {
+    return "积分商城兑换处理中";
+  }
+  return "积分商城兑换已提交";
 }
 
 export function buildPhoneTelegramNotificationText(input: PhoneNotificationInput) {

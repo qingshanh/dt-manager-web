@@ -22,6 +22,7 @@ test("backend logs process-level failures instead of disappearing silently", () 
 test("backend dev supervisor restarts the service after unexpected exits", () => {
   assert.match(supervisorSource, /backend exited; restarting/);
   assert.match(supervisorSource, /setTimeout\(\(\) => \{/);
+  assert.doesNotMatch(supervisorSource, /restartTimer\.unref/);
   assert.match(supervisorSource, /spawn\(process\.execPath, \["--import", "tsx", "src\/index\.ts"\]/);
   assert.match(supervisorSource, /process\.on\("SIGTERM"/);
 });

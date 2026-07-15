@@ -25,6 +25,20 @@ function orderStatusColor(status: string) {
   return 'default';
 }
 
+function pointStoreOrderFeedback(status: string, orderId: string | number) {
+  const normalized = status.toLowerCase();
+  if (/complete|success|done|1/.test(normalized)) {
+    return { type: 'success' as const, content: `兑换成功，订单 ID：${orderId}` };
+  }
+  if (/fail|cancel|error|2/.test(normalized)) {
+    return { type: 'error' as const, content: `兑换失败，订单 ID：${orderId}` };
+  }
+  if (/process|3/.test(normalized)) {
+    return { type: 'info' as const, content: `兑换处理中，订单 ID：${orderId}` };
+  }
+  return { type: 'info' as const, content: `兑换请求已提交，订单 ID：${orderId}` };
+}
+
 export default function PointStore() {
   const { id } = useParams<{ id: string }>();
   const accountId = Number(id);
@@ -98,7 +112,10 @@ export default function PointStore() {
           setStore(result.point_store);
           setOrders((items) => [result.history_order, ...items.filter((item) => item.id !== result.history_order.id)]);
           setEmail(defaultEmail);
-          message.success(`兑换成功，订单 ID：${result.order_id || result.history_order.id}`);
+          message.open(pointStoreOrderFeedback(
+            result.history_order.status,
+            result.order_id || result.history_order.id,
+          ));
         } catch (err) {
           message.error(err instanceof Error ? err.message : '兑换失败');
           throw err;
@@ -114,7 +131,7 @@ export default function PointStore() {
     try {
       const updated = await refreshPointStoreOrder(accountId, orderId);
       setOrders((items) => items.map((item) => item.id === updated.id ? updated : item));
-      message.success('订单状态已刷新');
+      message.open(pointStoreOrderFeedback(updated.status, updated.remote_order_id || updated.id));
     } catch (err) {
       message.error(err instanceof Error ? err.message : '刷新订单状态失败');
     } finally {

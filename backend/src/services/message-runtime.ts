@@ -9,6 +9,7 @@ import { eventBus } from "./event-bus.js";
 import { sendSmsTelegramNotification } from "./telegram-notifier.js";
 
 type MessageRuntimeDb = Pick<PrismaClient, "dtAccount" | "message" | "phoneNumber">;
+const DIRECT_FALLBACK_DEDUPE_MS = 30_000;
 
 type MessageRuntimeOptions = {
   db?: MessageRuntimeDb;
@@ -163,7 +164,7 @@ async function findDuplicateMessage(accountId: number, push: ParsedSmsPush, db: 
     }
   }
 
-  const recentSince = new Date(Date.now() - 10 * 60_000);
+  const recentSince = new Date(Date.now() - DIRECT_FALLBACK_DEDUPE_MS);
   const target = push.toNumber ?? null;
   return db.message.findFirst({
     where: {
@@ -202,11 +203,16 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
     return false;
   }
 
-
-  const storedContent = teamName ? extractTeamMessageContent(normalizedRow.content) : content;
-  const rowForStorage = { ...normalizedRow, content: storedContent };
-  const receivedAt = normalizeHelperReceivedAt(rowForStorage);
   const sender = teamName ?? normalizedRow.senderId ?? normalizedRow.data1 ?? null;
+  if (!teamName && await isHelperOutgoingMessage(account, sender, db)) {
+    return false;
+  }
+
+
+  const storedContent = teamName ? extractTeamMessageContent(normalizedRow.content, account.appVariant) : content;
+  const rowForStorage = { ...normalizedRow, content: storedContent };
+  const receivedAtResult = normalizeHelperReceivedAtResult(rowForStorage);
+  const receivedAt = receivedAtResult.receivedAt;
   let toNumber =
     extractTargetNumber(rowForStorage.conversationId, sender) ??
     (await inferTargetNumberFromAccountPhones(accountId, rowForStorage, sender, db));
@@ -216,6 +222,26 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
 
   const duplicate = await findDuplicateHelperSmsMessage(targetAccount.id, rowForStorage, db, toNumber);
   if (duplicate) {
+    const replacementReceivedAt = resolveDuplicateTeamReceivedAt(
+      duplicate,
+      receivedAtResult
+    );
+    if (
+      teamName &&
+      (duplicate.content !== storedContent ||
+        duplicate.fromNumber !== teamName ||
+        replacementReceivedAt)
+    ) {
+      await db.message.update({
+        where: { id: duplicate.id },
+        data: {
+          fromNumber: teamName,
+          content: storedContent,
+          isRead: true,
+          ...(replacementReceivedAt ? { receivedAt: replacementReceivedAt } : {})
+        }
+      });
+    }
     return false;
   }
 
@@ -288,7 +314,7 @@ async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMe
         direction: MessageDirection.incoming,
         rawK3: row.msgId
       },
-      select: { id: true }
+      select: { id: true, content: true, fromNumber: true, receivedAt: true, createdAt: true }
     });
     if (byMsgId) {
       return byMsgId;
@@ -308,7 +334,7 @@ async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMe
       content,
       receivedAt: { gte: recentSince, lte: recentUntil }
     },
-    select: { id: true }
+    select: { id: true, content: true, fromNumber: true, receivedAt: true, createdAt: true }
   });
   if (exactMatch) {
     return exactMatch;
@@ -323,10 +349,29 @@ async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMe
       content,
       receivedAt: { gte: recentSince, lte: recentUntil }
     },
-    select: { id: true }
+    select: { id: true, content: true, fromNumber: true, receivedAt: true, createdAt: true }
   });
   if (sameMessage) {
     return sameMessage;
+  }
+
+  if (target) {
+    const crossSourceMatch = await db.message.findFirst({
+      where: {
+        accountId,
+        direction: MessageDirection.incoming,
+        toNumber: target,
+        content,
+        receivedAt: {
+          gte: new Date(normalizedReceivedAt.getTime() - 5_000),
+          lte: new Date(normalizedReceivedAt.getTime() + 5_000)
+        }
+      },
+      select: { id: true, content: true, fromNumber: true, receivedAt: true, createdAt: true }
+    });
+    if (crossSourceMatch) {
+      return crossSourceMatch;
+    }
   }
 
   if (isUiExtractedHelperRow(row)) {
@@ -339,7 +384,7 @@ async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMe
         content,
         receivedAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60_000) }
       },
-      select: { id: true }
+      select: { id: true, content: true, fromNumber: true, receivedAt: true, createdAt: true }
     });
   }
 
@@ -398,7 +443,7 @@ function resolveHelperTeamName(row: HelperSmsMessageRecord, appVariant: unknown)
   return null;
 }
 
-function extractTeamMessageContent(content: string) {
+function extractTeamMessageContent(content: string, appVariant: unknown) {
   const envelope = parseJsonRecord(content);
   if (!envelope) {
     return content;
@@ -408,7 +453,21 @@ function extractTeamMessageContent(content: string) {
   const meta = parseJsonRecord(readJsonString(envelope.msgMeta));
   const credits = readFiniteNumber(meta?.credits);
   if (credits !== null) {
-    return `积分变动：${formatTeamNumber(credits)}`;
+    const currency = appVariant === "dingdong" ? "叮咚币" : "说道币";
+    const messageType = readFiniteNumber(meta?.type);
+    const expiryDays = readFiniteNumber(meta?.ex);
+    if (messageType === 5) {
+      return `您获得了${formatTeamFixedNumber(credits)}个${currency}。此任务已完成，开始一个新任务获得更多${currency}吧！`;
+    }
+    if (messageType === 34) {
+      const expiryMonths = expiryDays !== null && expiryDays > 0 ? Math.max(1, Math.round(expiryDays / 30)) : null;
+      const expiryText = expiryMonths === null ? "" : `（有效期${expiryMonths}个月）`;
+      return `兑换成功，恭喜您成功获得${currency}${formatTeamNumber(credits)}个${expiryText}。现在去查看余额`;
+    }
+    if (messageType === 99) {
+      return `${formatTeamNumber(credits)}个${currency}已经到你账上。现在去查看余额。`;
+    }
+    return `${formatTeamNumber(credits)}个${currency}已经到你账上。`;
   }
   if (title && body && !looksLikeJson(body)) {
     return `${title}\n${body}`;
@@ -447,6 +506,10 @@ function formatTeamNumber(value: number) {
   return Number.isInteger(value) ? String(value) : String(value);
 }
 
+function formatTeamFixedNumber(value: number) {
+  return value.toFixed(2);
+}
+
 function looksLikeJson(value: string) {
   const text = value.trim();
   return (text.startsWith("{") && text.endsWith("}")) || (text.startsWith("[") && text.endsWith("]"));
@@ -471,13 +534,54 @@ function parseBooleanSetting(value: string | undefined, fallback: boolean) {
   return !/^(false|0|no|off)$/i.test(value.trim());
 }
 function normalizeHelperReceivedAt(row: HelperSmsMessageRecord) {
+  return normalizeHelperReceivedAtResult(row).receivedAt;
+}
+
+function resolveDuplicateTeamReceivedAt(
+  duplicate: { receivedAt: Date | null; createdAt: Date },
+  incoming: { receivedAt: Date; reliable: boolean }
+) {
+  const existingTime = duplicate.receivedAt?.getTime() ?? null;
+  const createdTime = duplicate.createdAt.getTime();
+  const incomingTime = incoming.receivedAt.getTime();
+  const existingTimeIsPolluted = existingTime !== null && existingTime > createdTime + 5 * 60_000;
+
+  if (existingTimeIsPolluted) {
+    if (incoming.reliable && incomingTime < existingTime! && incomingTime <= createdTime + 5 * 60_000) {
+      return incoming.receivedAt;
+    }
+    return duplicate.createdAt;
+  }
+  if (!incoming.reliable) {
+    return null;
+  }
+  if (existingTime === null || incomingTime < existingTime) {
+    return incoming.receivedAt;
+  }
+  return null;
+}
+
+function normalizeHelperReceivedAtResult(row: HelperSmsMessageRecord) {
   const candidate = [row.time, row.timestamp].find(
     (value): value is number => typeof value === "number" && Number.isFinite(value) && value > 0
   );
   if (candidate === undefined) {
-    return new Date();
+    return { receivedAt: new Date(), reliable: false };
   }
-  return new Date(candidate > 1_000_000_000_000 ? candidate : candidate * 1000);
+  const timestamp = candidate > 1_000_000_000_000 ? candidate : candidate * 1000;
+  const now = Date.now();
+  if (timestamp > now + 5 * 60_000) {
+    // App databases can encode local wall-clock fields as if they were UTC.
+    const localUtcOffsetMs = -new Date(timestamp).getTimezoneOffset() * 60_000;
+    if (localUtcOffsetMs > 0) {
+      const corrected = timestamp - localUtcOffsetMs;
+      if (corrected > 0 && corrected <= now + 5 * 60_000) {
+        return { receivedAt: new Date(corrected), reliable: true };
+      }
+    }
+    return { receivedAt: new Date(now), reliable: false };
+  }
+  return { receivedAt: new Date(timestamp), reliable: true };
 }
 
 function normalizeReadFlag(value: number | null | undefined) {
@@ -632,28 +736,61 @@ async function inferTargetNumberFromAccountPhones(
   return candidates.length === 1 ? candidates[0]!.phoneNumber : null;
 }
 
+async function isHelperOutgoingMessage(
+  account: { id: number; phone?: string | null },
+  sender: string | null | undefined,
+  db: MessageRuntimeDb
+) {
+  if (!sender?.trim()) {
+    return false;
+  }
+  if (samePhoneDigits(account.phone, sender)) {
+    return true;
+  }
+  const phones = await db.phoneNumber.findMany({
+    where: { accountId: account.id },
+    select: { phoneNumber: true }
+  });
+  return phones.some((phone) => samePhoneDigits(phone.phoneNumber, sender));
+}
+
 function normalizeDigits(value: string | null | undefined) {
   return value?.replace(/\D/g, "") ?? "";
 }
 
 function samePhoneDigits(a: string | null | undefined, b: string | null | undefined) {
-  const left = normalizeComparablePhoneDigits(a);
-  const right = normalizeComparablePhoneDigits(b);
-  return Boolean(left && right && left === right);
+  const leftVariants = phoneDigitVariants(a);
+  const rightVariants = phoneDigitVariants(b);
+  for (const left of leftVariants) {
+    for (const right of rightVariants) {
+      if (left === right) {
+        return true;
+      }
+      const longer = left.length >= right.length ? left : right;
+      const shorter = left.length >= right.length ? right : left;
+      const prefixLength = longer.length - shorter.length;
+      if (shorter.length >= 7 && prefixLength >= 1 && prefixLength <= 3 && longer.endsWith(shorter)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
-function normalizeComparablePhoneDigits(value: string | null | undefined) {
+function phoneDigitVariants(value: string | null | undefined) {
   const digits = normalizeDigits(value);
-  if (digits.length === 11 && digits.startsWith("1")) {
-    return digits.slice(1);
+  const variants = new Set<string>();
+  if (!digits) {
+    return variants;
   }
-  if (digits.length === 12 && digits.startsWith("447")) {
-    return digits.slice(2);
+  variants.add(digits);
+  if (digits.startsWith("00") && digits.length > 2) {
+    variants.add(digits.slice(2));
   }
-  if (digits.length === 11 && digits.startsWith("07")) {
-    return digits.slice(1);
+  if (digits.startsWith("0") && digits.length > 1) {
+    variants.add(digits.slice(1));
   }
-  return digits;
+  return variants;
 }
 
 function isUiExtractedHelperRow(row: HelperSmsMessageRecord) {

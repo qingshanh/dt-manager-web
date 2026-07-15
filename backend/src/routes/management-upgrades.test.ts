@@ -13,12 +13,15 @@ function readProjectFile(relativePath: string) {
 
 test("persists account ordering and point-store order history", () => {
   const schema = readProjectFile("backend/prisma/schema.prisma");
+  const routes = readProjectFile("backend/src/routes/accounts.ts");
   assert.match(schema, /sortOrder\s+Int\s+@default\(0\)\s+@map\("sort_order"\)/);
   assert.match(schema, /pointStoreOrders\s+PointStoreOrder\[\]/);
   assert.match(schema, /model PointStoreOrder \{/);
   assert.match(schema, /remoteOrderId\s+String\?\s+@map\("remote_order_id"\)/);
   assert.match(schema, /status\s+String\s+@default\("pending"\)/);
   assert.match(schema, /@@index\(\[accountId, createdAt\(sort: Desc\)\]\)/);
+  assert.match(routes, /sort_order: account\.sortOrder/);
+  assert.match(routes, /sortOrder: incomingSortOrder !== null/);
 });
 
 test("account list uses persisted order and the refreshed bound phone", () => {
@@ -70,9 +73,12 @@ test("SSE message events carry the target phone number", () => {
 });
 
 test("team messages stay inside account history instead of dashboard notifications", () => {
+  const accounts = readProjectFile("backend/src/routes/accounts.ts");
   const dashboard = readProjectFile("backend/src/services/dashboard.service.ts");
   const detail = readProjectFile("frontend/src/pages/AccountDetail.tsx");
 
+  assert.match(accounts, /where: \{ accountId: \{ in: accountIds \}, isRead: false, msgType: \{ not: MessageType\.system \} \}/);
+  assert.match(accounts, /where: \{ accountId: \{ in: body\.account_ids \}, msgType: \{ not: MessageType\.system \} \}/);
   assert.match(dashboard, /getRecentMessages[\s\S]*msgType:\s*\{ not: MessageType\.system \}/);
   assert.match(dashboard, /getUnreadNotifications[\s\S]*msgType:\s*\{ not: MessageType\.system \}/);
   assert.match(detail, /teamMessageModalOpen/);
@@ -97,7 +103,13 @@ test("point store supports email override, persisted history, status refresh, an
   const remoteOrderIndex = store.indexOf("orderResponse = await fetchPublicJson");
   assert.ok(orderAttemptIndex >= 0 && remoteOrderIndex > orderAttemptIndex);
   assert.match(store, /status: "submitting"/);
-  assert.match(store, /return "pending"/);
+  assert.match(store, /POINT_STORE_ORDER_GUARD_MS/);
+  assert.match(store, /const orderGuardKey = `\$\{accountId\}:\$\{productId\}`/);
+  assert.match(store, /OR: \[[\s\S]*\{ status: "unknown" \}[\s\S]*status: "submitting"/);
+  assert.match(store, /status: "unknown"/);
+  assert.match(store, /POINT_STORE_ORDER_UNCERTAIN_MESSAGE/);
+  assert.match(store, /export function resolveSuccessfulPointStoreOrderStatus/);
+  assert.match(store, /readOrderStatus\(orderInfo\) \?\? readOrderStatus\(order\) \?\? "completed"/);
   assert.match(store, /sendPointStoreTelegramNotification/);
   assert.match(notifier, /export async function sendPointStoreTelegramNotification/);
   assert.match(notifier, /订单 ID/);
@@ -124,10 +136,15 @@ test("dashboard and account list expose the requested management controls", () =
 
 test("header bell shows unread messages and the sidebar stays visible", () => {
   const layout = readProjectFile("frontend/src/layouts/AppLayout.tsx");
+  const detail = readProjectFile("frontend/src/pages/AccountDetail.tsx");
 
   assert.match(layout, /getUnreadNotifications/);
   assert.match(layout, /markAllDashboardMessagesRead/);
   assert.match(layout, /<Popover/);
+  assert.match(layout, /navigate\(`\/accounts\/\$\{item\.account_id\}\?tab=messages&messageId=\$\{item\.id\}`\)/);
+  assert.match(detail, /useSearchParams\(\)/);
+  assert.match(detail, /searchParams\.get\('tab'\) === 'messages'/);
+  assert.match(detail, /activeKey=\{activeTab\}/);
   assert.match(layout, /if \(!rememberIncomingMessage\(data\)\)/);
   assert.ok(layout.indexOf("rememberIncomingMessage(data)") < layout.indexOf("dispatchIncomingMessage(data)"));
   assert.match(layout, /position: 'sticky'/);
@@ -140,6 +157,7 @@ test("point store is a dedicated routed page with redemption and order history",
   const app = readProjectFile("frontend/src/App.tsx");
   const detail = readProjectFile("frontend/src/pages/AccountDetail.tsx");
   const storePage = readProjectFile("frontend/src/pages/PointStore.tsx");
+  const storeService = readProjectFile("backend/src/services/point-store.ts");
 
   assert.match(app, /accounts\/:id\/point-store/);
   assert.match(detail, /navigate\(`\/accounts\/\$\{accountId\}\/point-store`\)/);
@@ -148,6 +166,8 @@ test("point store is a dedicated routed page with redemption and order history",
   assert.match(storePage, /refreshPointStoreOrder/);
   assert.match(storePage, /modal\.confirm/);
   assert.match(storePage, /setEmail\(defaultEmail\)/);
+  assert.match(storePage, /pointStoreOrderFeedback/);
+  assert.match(storeService, /pointStoreNotificationTitle/);
 });
 
 test("message page handles SSE locally instead of refetching system messages and account details", () => {
@@ -158,11 +178,56 @@ test("message page handles SSE locally instead of refetching system messages and
   assert.match(handler, /setMessages/);
   assert.match(handler, /detail\.msgType === 'system'/);
   assert.match(handler, /if \(msgPage === 1\)/);
+  assert.match(detail, /const messageRequestIdRef = useRef\(0\)/);
+  assert.match(detail, /const teamMessageRequestIdRef = useRef\(0\)/);
+  assert.match(detail, /const requestId = \+\+messageRequestIdRef\.current/);
+  assert.match(detail, /const requestId = \+\+teamMessageRequestIdRef\.current/);
+  assert.match(detail, /requestId !== messageRequestIdRef\.current/);
+  assert.match(detail, /requestId !== teamMessageRequestIdRef\.current/);
+  assert.match(handler, /teamMessageRequestIdRef\.current \+= 1/);
+  assert.match(handler, /messageRequestIdRef\.current \+= 1/);
+  assert.match(handler, /setTeamMsgTotal\(\(current\) => current \+ 1\)/);
   assert.doesNotMatch(handler, /setMsgPage\(1\)/);
   assert.doesNotMatch(handler, /fetchTeamMessages/);
   assert.doesNotMatch(handler, /fetchAccount/);
   assert.match(cache, /cacheGenerations/);
   assert.match(cache, /generation === getCacheGeneration\(key\)/);
+});
+
+test("message tab fetches immediately instead of waiting for the fallback polling interval", () => {
+  const detail = readProjectFile("frontend/src/pages/AccountDetail.tsx");
+  const pollingEffect = detail.slice(
+    detail.indexOf("const pollLocalMessages"),
+    detail.indexOf("}, [activeTab, fetchMessages", detail.indexOf("const pollLocalMessages")),
+  );
+  const tabHandler = detail.slice(
+    detail.indexOf("const handleTabChange"),
+    detail.indexOf("const handleMonitorToggle", detail.indexOf("const handleTabChange")),
+  );
+  const messageTable = detail.slice(
+    detail.indexOf("<Table\n                  columns={msgColumns}"),
+    detail.indexOf("scroll={{ x: 860 }}", detail.indexOf("<Table\n                  columns={msgColumns}")),
+  );
+
+  assert.match(pollingEffect, /void pollLocalMessages\(false\);[\s\S]*window\.setInterval/);
+  assert.match(pollingEffect, /fetchMessages\(msgPage, \{ silent, suppressError: silent, force: true \}\)/);
+  assert.doesNotMatch(tabHandler, /fetchMessages/);
+  assert.doesNotMatch(tabHandler, /fetchTeamMessages/);
+  assert.doesNotMatch(messageTable, /fetchMessages/);
+});
+
+test("notification deep links load and highlight the selected account message", () => {
+  const routes = readProjectFile("backend/src/routes/accounts.ts");
+  const endpoints = readProjectFile("frontend/src/services/endpoints.ts");
+  const detail = readProjectFile("frontend/src/pages/AccountDetail.tsx");
+  const styles = readProjectFile("frontend/src/styles.css");
+
+  assert.match(routes, /accountsRouter\.get\("\/:id\/messages\/:messageId"/);
+  assert.match(endpoints, /export async function getAccountMessage/);
+  assert.match(detail, /const focusedMessageId/);
+  assert.match(detail, /getAccountMessage\(accountId, focusedMessageId\)/);
+  assert.match(detail, /record\.id === focusedMessageId \? 'message-row-focused' : ''/);
+  assert.match(styles, /\.message-row-focused > td/);
 });
 
 test("version service identifies every commit and checks origin main", () => {
@@ -174,14 +239,22 @@ test("version service identifies every commit and checks origin main", () => {
   assert.match(service, /const buildVersion = commit\.shortSha \? `\$\{version\}\+\$\{commit\.shortSha\}` : version/);
   assert.match(service, /api\.github\.com\/repos/);
   assert.match(service, /updateAvailable/);
+  assert.match(service, /update_status: updateStatus/);
+  assert.match(service, /gitIsAncestor/);
+  assert.match(service, /classifyVersionRelation/);
   assert.match(service, /sameCommitSha/);
   assert.match(service, /readGitHead/);
+  assert.match(service, /per_page=100/);
   assert.match(route, /versionRouter\.get\("\/"/);
   assert.match(index, /app\.use\("\/api\/version"/);
   assert.match(settings, /getVersionInfo/);
   assert.match(settings, /latest_version/);
   assert.match(settings, /检测更新/);
+  assert.match(settings, /本地领先/);
+  assert.match(settings, /分支不同/);
   assert.match(settings, /recent_versions/);
+  assert.match(settings, /versionSearch/);
+  assert.match(settings, /pagination=\{\{ pageSize: 10/);
 });
 
 test("phone actions normalize second timestamps and verify that renewal advanced expiry", () => {

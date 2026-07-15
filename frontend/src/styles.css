@@ -36,3 +36,7 @@ body {
   width: 100% !important;
   min-width: 0 !important;
 }
+
+.ant-table-wrapper .message-row-focused > td {
+  background: color-mix(in srgb, #1677ff 12%, transparent) !important;
+}

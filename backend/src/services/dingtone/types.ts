@@ -86,6 +86,7 @@ export type DingtonePhoneNumber = {
   autoRenew?: boolean;
   isPrimary?: boolean;
   isGoodNumber?: boolean;
+  allowReceiveSms?: boolean;
   portoutInfo?: string;
   rawJson?: string;
 };

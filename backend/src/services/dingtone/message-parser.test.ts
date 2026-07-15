@@ -1,6 +1,40 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseSmsPush } from "./message-parser.js";
+import zlib from "node:zlib";
+import { isOfflineMessageIndexPush, parseSmsPush } from "./message-parser.js";
+
+test("direct push metadata identifies k1=8 offline-message index notifications", () => {
+  const metadata = Buffer.from(JSON.stringify({ info: "index-notification", k1: 8 }), "utf8");
+  const payload = Buffer.concat([
+    Buffer.from("01070000", "hex"),
+    zlib.deflateSync(metadata),
+    Buffer.from("\u0004dtId\u0009123456789\u0003who\u0009123456789", "utf8"),
+  ]);
+
+  assert.equal(isOfflineMessageIndexPush(payload), true);
+});
+
+test("direct push metadata identifies plaintext k1=8 offline-message index notifications", () => {
+  const metadata = Buffer.from(JSON.stringify({ info: "index-notification", k1: 8 }), "utf8");
+  const payload = Buffer.concat([
+    Buffer.from([0, 0, 0, metadata.length]),
+    metadata,
+    Buffer.from("\u0004dtId\u0009123456789\u0003who\u0009123456789", "utf8"),
+  ]);
+
+  assert.equal(isOfflineMessageIndexPush(payload), true);
+});
+
+test("direct push metadata does not classify k1=561 SMS frames as index notifications", () => {
+  const metadata = Buffer.from(JSON.stringify({ info: "sms", k1: 561, k2: "SiliconFlow" }), "utf8");
+  const payload = Buffer.concat([
+    Buffer.from("01070000", "hex"),
+    zlib.deflateSync(metadata),
+    Buffer.from("Verification code is 246810", "utf8"),
+  ]);
+
+  assert.equal(isOfflineMessageIndexPush(payload), false);
+});
 
 test("direct SMS parser trims trailing push metadata from plaintext content", () => {
   const json = Buffer.from(JSON.stringify({ k1: 561, k2: "(669) 999-8659", k3: "meta-regression" }), "utf8");
@@ -27,6 +61,18 @@ test("direct SMS parser does not use the sender number as the target phone", () 
   assert.equal(parsed?.toNumber, "33755520480");
 });
 
+test("direct SMS parser restores a truncated international sender from metadata", () => {
+  const metadata = Buffer.from("sender=33199001234 target=61491570006", "latin1").toString("base64");
+  const json = Buffer.from(JSON.stringify({ k1: 561, k2: "(319) 900-1234", info: metadata, k3: metadata }), "utf8");
+  const content = Buffer.from("7141352", "utf8");
+  const payload = Buffer.concat([Buffer.from([1, 7, 0, 0]), json, Buffer.from([0]), content]);
+
+  const parsed = parseSmsPush(payload);
+
+  assert.equal(parsed?.fromNumber, "33199001234");
+  assert.equal(parsed?.toNumber, "61491570006");
+});
+
 test("direct SMS parser leaves target empty when metadata only repeats the sender", () => {
   const metadata = Buffer.from("sender=16699998659", "latin1").toString("base64");
   const json = Buffer.from(JSON.stringify({ k1: 561, k2: "(669) 999-8659", info: metadata, k3: "sender-only-regression" }), "utf8");
@@ -46,7 +92,7 @@ test("direct SMS parser strips one-byte length prefix before provider text", () 
 
   const parsed = parseSmsPush(payload);
 
-  assert.equal(parsed?.content, "?<SiliconFlow?> Verification code is: 552420, valid for 5 minutes.");
+  assert.equal(parsed?.content, "[硅基流动] Verification code is: 552420, valid for 5 minutes.");
 });
 
 test("direct SMS parser strips one-byte length prefix before Chinese provider text", () => {

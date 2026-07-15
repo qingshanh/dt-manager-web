@@ -114,7 +114,14 @@ function createMessageRuntimeDb() {
           messages.push(message);
           return message;
         },
-        update: async () => null
+        update: async ({ where, data }: { where: { id: number }; data: Partial<(typeof messages)[number]> }) => {
+          const message = messages.find((item) => item.id === where.id);
+          if (!message) {
+            return null;
+          }
+          Object.assign(message, data);
+          return message;
+        }
       }
     }
   };
@@ -135,6 +142,18 @@ test("stores direct SMS pushes with the same sender and content when target phon
 
   assert.equal(imported, 2);
   assert.deepEqual(runtime.messages.map((message) => message.toNumber), ["12025550101", "33199000001"]);
+});
+
+test("only deduplicates adjacent direct frames when the provider message id is missing", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+  const push = { msgType: 1, fromNumber: "Provider", toNumber: "33612345678", content: "Repeated service notice" };
+
+  assert.equal(await storeParsedSmsPushes(1, [push], { db: runtime.db as any, emitEvents: false, sendTelegram: false }), 1);
+  assert.equal(await storeParsedSmsPushes(1, [push], { db: runtime.db as any, emitEvents: false, sendTelegram: false }), 0);
+
+  runtime.messages[0]!.receivedAt = new Date(Date.now() - 31_000);
+  assert.equal(await storeParsedSmsPushes(1, [push], { db: runtime.db as any, emitEvents: false, sendTelegram: false }), 1);
 });
 
 test("does not treat an unknown helper target as a duplicate of a confirmed target", async () => {
@@ -163,6 +182,32 @@ test("does not treat an unknown helper target as a duplicate of a confirmed targ
   );
 
   assert.equal(imported, 2);
+});
+
+test("deduplicates the same targeted SMS imported by direct push and app fallback", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+  runtime.phones.set(1, [{ phoneNumber: "61412345678" }]);
+  const content = "[硅基流动]Verification code is: 441071, valid for 5 minutes.";
+
+  assert.equal(await storeParsedSmsPushes(1, [{
+    msgType: 25,
+    fromNumber: "硅基流动",
+    toNumber: "61412345678",
+    content,
+    rawK3: "direct-au-code"
+  }], { db: runtime.db as any, emitEvents: false, sendTelegram: false }), 1);
+  const directReceivedAt = runtime.messages[0]!.receivedAt.getTime();
+
+  assert.equal(await storeHelperSmsMessages(1, [{
+    conversationId: "61412345678|Unverified",
+    senderId: "Unverified",
+    msgId: "adb-au-code",
+    content,
+    timestamp: directReceivedAt - 500
+  }], { db: runtime.db as any, emitEvents: false, sendTelegram: false }), 0);
+
+  assert.equal(runtime.messages.length, 1);
 });
 test("stores team messages as read system messages", async () => {
   const runtime = createMessageRuntimeDb();
@@ -300,7 +345,7 @@ test("stores the named DingDong team conversation as a system message", async ()
   assert.equal(runtime.messages[0]?.isRead, true);
 });
 
-test("extracts a TalkU team credit message from its real secretary envelope", async () => {
+test("renders a TalkU redemption message from its real secretary envelope", async () => {
   const runtime = createMessageRuntimeDb();
   runtime.accounts.set(1, { id: 1, appVariant: "dingtone", nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
 
@@ -324,7 +369,203 @@ test("extracts a TalkU team credit message from its real secretary envelope", as
   assert.equal(imported, 1);
   assert.equal(runtime.messages[0]?.msgType, MessageType.system);
   assert.equal(runtime.messages[0]?.fromNumber, "说道团队");
-  assert.equal(runtime.messages[0]?.content, "积分变动：20");
+  assert.equal(runtime.messages[0]?.content, "兑换成功，恭喜您成功获得说道币20个（有效期3个月）。现在去查看余额");
+});
+
+test("renders DingDong team credit arrivals and completed tasks from real metadata", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, appVariant: "dingdong", nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+
+  const imported = await storeHelperSmsMessages(
+    1,
+    [
+      {
+        conversationType: 4,
+        conversationId: "10000",
+        conversationUserId: "10000",
+        type: 531,
+        senderId: "2684354560",
+        msgId: "dingdong-credit-arrival",
+        content: "{\"msgContent\":\"\",\"msgTitle\":\"\",\"msgMeta\":\"{\\\"k1\\\":531,\\\"credits\\\":4.0,\\\"bc\\\":4.0,\\\"ex\\\":-1,\\\"type\\\":99}\"}",
+        timestamp: Date.now()
+      },
+      {
+        conversationType: 4,
+        conversationId: "10000",
+        conversationUserId: "10000",
+        type: 532,
+        senderId: "2684354560",
+        msgId: "dingdong-task-completed",
+        content: "{\"msgContent\":\"\",\"msgTitle\":\"\",\"msgMeta\":\"{\\\"k1\\\":532,\\\"credits\\\":0.5,\\\"bc\\\":0.5,\\\"ex\\\":-1,\\\"type\\\":5}\"}",
+        timestamp: Date.now() - 1
+      }
+    ],
+    { db: runtime.db as any, emitEvents: false, sendTelegram: false, collectTeamMessages: true }
+  );
+
+  assert.equal(imported, 2);
+  assert.equal(runtime.messages[0]?.content, "4个叮咚币已经到你账上。现在去查看余额。");
+  assert.equal(runtime.messages[1]?.content, "您获得了0.50个叮咚币。此任务已完成，开始一个新任务获得更多叮咚币吧！");
+});
+
+test("upgrades an existing team summary when the same helper message is scanned again", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, appVariant: "dingdong", nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+  runtime.messages.push({
+    id: 1,
+    accountId: 1,
+    direction: MessageDirection.incoming,
+    msgType: MessageType.system,
+    fromNumber: "叮咚团队",
+    toNumber: null,
+    content: "积分变动：4",
+    rawInfo: "10000",
+    rawK3: "existing-team-summary",
+    k5Flag: 531,
+    isRead: true,
+    telegramSent: false,
+    telegramMsgId: null,
+    receivedAt: new Date(Date.now() + 8 * 60 * 60_000),
+    createdAt: new Date()
+  });
+
+  const imported = await storeHelperSmsMessages(
+    1,
+    [
+      {
+        conversationType: 4,
+        conversationId: "10000",
+        conversationUserId: "10000",
+        type: 531,
+        senderId: "2684354560",
+        msgId: "existing-team-summary",
+        content: "{\"msgContent\":\"\",\"msgTitle\":\"\",\"msgMeta\":\"{\\\"k1\\\":531,\\\"credits\\\":4.0,\\\"bc\\\":4.0,\\\"ex\\\":-1,\\\"type\\\":99}\"}",
+        timestamp: Date.now() + 8 * 60 * 60_000
+      }
+    ],
+    { db: runtime.db as any, emitEvents: false, sendTelegram: false, collectTeamMessages: true }
+  );
+
+  assert.equal(imported, 0);
+  assert.equal(runtime.messages.length, 1);
+  assert.equal(runtime.messages[0]?.content, "4个叮咚币已经到你账上。现在去查看余额。");
+  assert.ok((runtime.messages[0]?.receivedAt.getTime() ?? 0) <= Date.now() + 1_000);
+});
+
+test("keeps the original import time when a repeated team message has no provider timestamp", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, appVariant: "dingdong", nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+  const row = {
+    conversationType: 4,
+    conversationId: "10000",
+    conversationUserId: "10000",
+    type: 531,
+    senderId: "2684354560",
+    msgId: "team-without-provider-time",
+    content: "{\"msgContent\":\"\",\"msgTitle\":\"\",\"msgMeta\":\"{\\\"k1\\\":531,\\\"credits\\\":1.0,\\\"bc\\\":1.0,\\\"ex\\\":-1,\\\"type\\\":99}\"}",
+    timestamp: 0
+  };
+
+  assert.equal(await storeHelperSmsMessages(1, [row], {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  }), 1);
+  const firstReceivedAt = runtime.messages[0]?.receivedAt.getTime();
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(await storeHelperSmsMessages(1, [row], {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  }), 0);
+
+  assert.equal(runtime.messages.length, 1);
+  assert.equal(runtime.messages[0]?.receivedAt.getTime(), firstReceivedAt);
+});
+
+test("does not move a repeated team message to a newer provider timestamp", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, appVariant: "dingdong", nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+  const originalReceivedAt = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+  runtime.messages.push({
+    id: 1,
+    accountId: 1,
+    direction: MessageDirection.incoming,
+    msgType: MessageType.system,
+    fromNumber: "鍙挌鍥㈤槦",
+    toNumber: null,
+    content: "1涓彯鍜氬竵宸茬粡鍒颁綘璐︿笂銆傜幇鍦ㄥ幓鏌ョ湅浣欓銆?",
+    rawInfo: "10000",
+    rawK3: "stable-team-time",
+    k5Flag: 531,
+    isRead: true,
+    telegramSent: false,
+    telegramMsgId: null,
+    receivedAt: originalReceivedAt,
+    createdAt: new Date(Date.now() - 24 * 60 * 60_000)
+  });
+
+  assert.equal(await storeHelperSmsMessages(1, [{
+    conversationType: 4,
+    conversationId: "10000",
+    conversationUserId: "10000",
+    type: 531,
+    senderId: "2684354560",
+    msgId: "stable-team-time",
+    content: "{\"msgContent\":\"\",\"msgTitle\":\"\",\"msgMeta\":\"{\\\"k1\\\":531,\\\"credits\\\":1.0,\\\"bc\\\":1.0,\\\"ex\\\":-1,\\\"type\\\":99}\"}",
+    timestamp: Date.now()
+  }], {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  }), 0);
+
+  assert.equal(runtime.messages[0]?.receivedAt.getTime(), originalReceivedAt.getTime());
+});
+
+test("repairs a team message time that was previously pushed past its import time", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, appVariant: "dingdong", nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+  const createdAt = new Date(Date.now() - 60 * 60_000);
+  runtime.messages.push({
+    id: 1,
+    accountId: 1,
+    direction: MessageDirection.incoming,
+    msgType: MessageType.system,
+    fromNumber: "叮咚团队",
+    toNumber: null,
+    content: "1个叮咚币已经到你账上。现在去查看余额。",
+    rawInfo: "10000",
+    rawK3: "polluted-team-time",
+    k5Flag: 531,
+    isRead: true,
+    telegramSent: false,
+    telegramMsgId: null,
+    receivedAt: new Date(createdAt.getTime() + 30 * 60_000),
+    createdAt
+  });
+
+  assert.equal(await storeHelperSmsMessages(1, [{
+    conversationType: 4,
+    conversationId: "10000",
+    conversationUserId: "10000",
+    type: 531,
+    senderId: "2684354560",
+    msgId: "polluted-team-time",
+    content: "{\"msgContent\":\"\",\"msgTitle\":\"\",\"msgMeta\":\"{\\\"k1\\\":531,\\\"credits\\\":1.0,\\\"bc\\\":1.0,\\\"ex\\\":-1,\\\"type\\\":99}\"}",
+    timestamp: 0
+  }], {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  }), 0);
+
+  assert.equal(runtime.messages[0]?.receivedAt.getTime(), createdAt.getTime());
 });
 
 test("does not import non-team system conversations into the team message list", async () => {
@@ -352,7 +593,7 @@ test("does not import non-team system conversations into the team message list",
 test("uses timestamp when helper time is zero", async () => {
   const runtime = createMessageRuntimeDb();
   runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
-  const timestamp = 1_800_000_000_000;
+  const timestamp = 1_700_000_000_000;
 
   await storeHelperSmsMessages(
     1,
@@ -369,6 +610,32 @@ test("uses timestamp when helper time is zero", async () => {
   );
 
   assert.equal(runtime.messages[0]?.receivedAt.getTime(), timestamp);
+});
+
+test("corrects historical helper timestamps encoded as local wall-clock time", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, { id: 1, appVariant: "dingdong", nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
+  const now = Date.now();
+  const actualReceivedAt = now - 6 * 60 * 60_000;
+  const localWallClockTimestamp = actualReceivedAt + 8 * 60 * 60_000;
+
+  await storeHelperSmsMessages(
+    1,
+    [
+      {
+        conversationType: 4,
+        conversationId: "10000",
+        msgId: "future-local-wall-clock",
+        content: "{\"msgContent\":\"\",\"msgTitle\":\"\",\"msgMeta\":\"{\\\"k1\\\":531,\\\"credits\\\":1.0,\\\"ex\\\":-1,\\\"type\\\":99}\"}",
+        time: 0,
+        timestamp: localWallClockTimestamp
+      }
+    ],
+    { db: runtime.db as any, emitEvents: false, sendTelegram: false, collectTeamMessages: true }
+  );
+
+  const receivedAt = runtime.messages[0]?.receivedAt.getTime() ?? 0;
+  assert.ok(Math.abs(receivedAt - actualReceivedAt) <= 1_000);
 });
 test("infers direct SMS target from owned phones in raw push metadata", async () => {
   const runtime = createMessageRuntimeDb();
@@ -463,7 +730,7 @@ test("does not infer direct SMS target from sender-only raw metadata", async () 
 test("does not infer helper SMS target from differently formatted sender", async () => {
   const runtime = createMessageRuntimeDb();
   runtime.accounts.set(1, { id: 1, nickname: null, email: "owner@example.com", phone: null, dtUserId: "u1", telegramNotify: false });
-  runtime.phones.set(1, [{ phoneNumber: "+12025550102" }]);
+  runtime.phones.set(1, [{ phoneNumber: "+12025550101" }]);
 
   const imported = await storeHelperSmsMessages(
     1,
@@ -481,6 +748,49 @@ test("does not infer helper SMS target from differently formatted sender", async
 
   assert.equal(imported, 1);
   assert.equal(runtime.messages[0]?.toNumber, null);
+});
+
+test("ignores outgoing helper rows whose sender is owned by the scanned account", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    adminId: 1,
+    appVariant: "dingdong",
+    nickname: null,
+    email: "sender@example.com",
+    phone: null,
+    dtUserId: "sender-user",
+    telegramNotify: false
+  });
+  runtime.accounts.set(2, {
+    id: 2,
+    adminId: 1,
+    appVariant: "dingtone",
+    nickname: null,
+    email: "receiver@example.com",
+    phone: null,
+    dtUserId: "receiver-user",
+    telegramNotify: false
+  });
+  runtime.phones.set(1, [{ phoneNumber: "+447700900101" }]);
+  runtime.phones.set(2, [{ phoneNumber: "+33612345678" }]);
+
+  const imported = await storeHelperSmsMessages(
+    1,
+    [
+      {
+        conversationId: "447700900101|33612345678",
+        senderId: "447700900101",
+        msgId: "outgoing-helper-row",
+        content: "Outbound test marker 123456",
+        time: 1_800_000_000_000
+      }
+    ],
+    { db: runtime.db as any, emitEvents: false, sendTelegram: false }
+  );
+
+  assert.equal(imported, 0);
+  assert.equal(runtime.messages.length, 0);
 });
 
 test("routes direct SMS pushes across different dt_user_id accounts when the target phone is unique", async () => {
@@ -612,6 +922,56 @@ test("routes UK local-format owned numbers when direct pushes include country co
   assert.equal(imported, 1);
   assert.equal(runtime.messages[0]?.accountId, 2);
   assert.equal(runtime.messages[0]?.toNumber, "7700900123");
+});
+
+test("routes France, Australia, and Mexico local-format numbers when direct pushes use international format", async () => {
+  const scenarios = [
+    { local: "0612345678", international: "+33612345678", rawK3: "fr-local-direct" },
+    { local: "0412345678", international: "+61412345678", rawK3: "au-local-direct" },
+    { local: "5512345678", international: "+525512345678", rawK3: "mx-local-direct" }
+  ];
+
+  for (const scenario of scenarios) {
+    const runtime = createMessageRuntimeDb();
+    runtime.accounts.set(1, {
+      id: 1,
+      adminId: 1,
+      appVariant: "dingtone",
+      nickname: null,
+      email: "first@example.com",
+      phone: null,
+      dtUserId: "user-one",
+      telegramNotify: false
+    });
+    runtime.accounts.set(2, {
+      id: 2,
+      adminId: 1,
+      appVariant: "dingtone",
+      nickname: null,
+      email: "second@example.com",
+      phone: null,
+      dtUserId: "user-two",
+      telegramNotify: false
+    });
+    runtime.phones.set(1, [{ phoneNumber: "2025550101" }]);
+    runtime.phones.set(2, [{ phoneNumber: scenario.local }]);
+
+    const imported = await storeParsedSmsPushes(
+      1,
+      [{
+        msgType: 1,
+        fromNumber: "Provider",
+        toNumber: scenario.international,
+        content: "Your code is 118899",
+        rawK3: scenario.rawK3
+      }],
+      { db: runtime.db as any, emitEvents: false, sendTelegram: false }
+    );
+
+    assert.equal(imported, 1, scenario.international);
+    assert.equal(runtime.messages[0]?.accountId, 2, scenario.international);
+    assert.equal(runtime.messages[0]?.toNumber, scenario.local, scenario.international);
+  }
 });
 
 test("routes UK local-format owned numbers when helper rows include country code", async () => {

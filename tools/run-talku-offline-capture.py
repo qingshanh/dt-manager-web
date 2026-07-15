@@ -68,12 +68,12 @@ def main() -> int:
 
     while time.time() < deadline:
         if (
-            options.action == "offline"
+            options.action in {"offline", "web-offline"}
             and not request_result["called"]
             and time.time() >= deadline - options.seconds + options.request_delay
         ):
             request_result["called"] = True
-            request_result.update(call_request_offline(script, options.request_retries, options.request_retry_delay))
+            request_result.update(call_request(script, options.action, options.request_retries, options.request_retry_delay))
         time.sleep(0.25)
 
     captures: Any = []
@@ -97,7 +97,7 @@ def main() -> int:
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote {output_path}", flush=True)
     print(f"Captured {len(captures) if isinstance(captures, list) else 0} native write(s)", flush=True)
-    if captures and options.action == "offline":
+    if captures and options.action in {"offline", "web-offline"}:
         print(
             "Next: cd backend && npm run import:direct-template -- "
             f"--capture-file {output_path} --setting-key dt_direct_template_offline_messages",
@@ -107,7 +107,7 @@ def main() -> int:
             "Inspect the dry-run candidate hints first, then re-run with --index <candidate-index> --write only for a confirmed offline-message frame.",
             flush=True,
         )
-    elif options.action == "offline":
+    elif options.action in {"offline", "web-offline"}:
         if env_probe.get("nativeBridgeLikely"):
             print(
                 "No native frame was captured. This device looks like an x86/x86_64 Android runtime running the app "
@@ -160,9 +160,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seconds", type=float, default=25, help="Total capture window in seconds.")
     parser.add_argument(
         "--action",
-        choices=["offline", "none"],
+        choices=["offline", "web-offline", "none"],
         default="offline",
-        help="offline calls requestAllOfflineMessage automatically; none only observes manual app actions such as phone-code login.",
+        help="offline calls requestAllOfflineMessage, web-offline calls getWebOfflineMessage, and none only observes manual app actions.",
     )
     parser.add_argument("--request-delay", type=float, default=8, help="Seconds to wait before calling requestoffline RPC.")
     parser.add_argument("--request-retries", type=int, default=8, help="requestoffline RPC retry count.")
@@ -198,15 +198,16 @@ def attach_or_spawn(device: frida.core.Device, options: argparse.Namespace) -> t
     return pid, device.attach(pid), False
 
 
-def call_request_offline(script: frida.core.Script, retries: int, delay: float) -> dict[str, Any]:
+def call_request(script: frida.core.Script, action: str, retries: int, delay: float) -> dict[str, Any]:
     last_error = ""
+    export_name = "requestweboffline" if action == "web-offline" else "requestoffline"
     for attempt in range(1, retries + 1):
         try:
-            value = script.exports_sync.requestoffline()
+            value = getattr(script.exports_sync, export_name)()
             return {"ok": True, "attempt": attempt, "result": value, "error": ""}
         except Exception as error:
             last_error = str(error)
-            print(f"requestoffline attempt {attempt} failed: {last_error}", flush=True)
+            print(f"{export_name} attempt {attempt} failed: {last_error}", flush=True)
             time.sleep(delay)
     return {"ok": False, "attempt": retries, "result": None, "error": last_error}
 

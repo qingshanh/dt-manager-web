@@ -15,6 +15,7 @@ import type {
   PagedData,
   PhoneNumber,
   PhoneActionResult,
+  PhoneSmsReceptionRepairResult,
   PhoneCountryOption,
   PhonePurchasePreview,
   PointData,
@@ -303,6 +304,13 @@ export async function getAccountMessages(
   }, options);
 }
 
+export async function getAccountMessage(accountId: number, messageId: number) {
+  const res = await api.get<ApiResponse<Message>>(`/accounts/${accountId}/messages/${messageId}`, {
+    timeout: PAGE_NAVIGATION_TIMEOUT_MS,
+  });
+  return res.data.data;
+}
+
 export async function readAllMessages(accountId: number) {
   const res = await api.put<ApiResponse<null>>(`/accounts/${accountId}/messages/read-all`);
   invalidateAccountCaches(accountId);
@@ -508,6 +516,16 @@ export async function renewPhoneNumber(accountId: number, phoneId: number) {
 
 export async function updatePhoneNumberLabel(accountId: number, phoneId: number, data: UpdatePhoneLabelBody) {
   const res = await api.put<ApiResponse<PhoneNumber>>(`/accounts/${accountId}/phone-numbers/${phoneId}/label`, data);
+  invalidateAccountCaches(accountId);
+  return res.data.data;
+}
+
+export async function enablePhoneSmsReception(accountId: number) {
+  const res = await api.post<ApiResponse<PhoneSmsReceptionRepairResult>>(
+    `/accounts/${accountId}/phone-numbers/enable-sms-reception`,
+    { confirm: true },
+    { timeout: 120_000 },
+  );
   invalidateAccountCaches(accountId);
   return res.data.data;
 }

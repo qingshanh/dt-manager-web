@@ -54,7 +54,6 @@ const defaultSettings = [
   ["direct_message_listen_seconds", "900", "Direct SMS push listen window in seconds"],
   ["direct_message_refresh_wait_seconds", "8", "Direct SMS refresh wait window in seconds"],
   ["direct_monitor_max_concurrent", "10", "Maximum concurrent direct SMS monitor sockets"],
-  ["dt_direct_listener_host_concurrency", "1", "Direct SMS listener gateway host concurrency; use one stable host per account"],
   ["direct_monitor_app_catchup_enabled", "true", "Allow direct monitors to scan app/helper/ADB messages as a fallback"],
   ["direct_monitor_app_catchup_seconds", "15", "Interval for direct monitors to scan app/helper/ADB messages as a fallback"],
   ["code_receiver_api_tokens", "", "Comma/newline separated code receiver API tokens. Use token or adminId:token."],
@@ -76,6 +75,8 @@ const runtimeSettings = [
   ["PORT", String(config.PORT), "Backend port"]
 ] as const;
 
+const obsoleteSettingKeys = ["dt_direct_listener_host_concurrency"] as const;
+
 const legacySettingRewrites = [
   ["dt_direct_api_cancel_phone", "/pstn/share/deletePrivateNumber", "/pstn/share/deletePhoneNumber"],
   ["direct_message_listen_seconds", String(Math.max(60, config.DEFAULT_MESSAGE_POLL_INTERVAL)), "900"],
@@ -88,8 +89,6 @@ const legacySettingRewrites = [
   ["direct_monitor_max_concurrent", "3", "10"],
   ["direct_monitor_max_concurrent", "2", "10"],
   ["direct_monitor_max_concurrent", "0", "10"],
-  ["dt_direct_listener_host_concurrency", "6", "1"],
-  ["dt_direct_listener_host_concurrency", "2", "1"],
   ["direct_monitor_app_catchup_enabled", "false", "true"],
   ["dt_adb_dingdong_package", "me.talkyou.app.im", "me.dingtone.app.im"],
   ["dt_adb_dingtone_main_activity", ".activity.TalkuMainActivity", ".activity.TalkuSplashActivity"],
@@ -97,6 +96,10 @@ const legacySettingRewrites = [
 ] as const;
 
 export async function ensureDefaultSettings() {
+  await prisma.setting.deleteMany({
+    where: { key: { in: [...obsoleteSettingKeys] } }
+  });
+
   for (const [key, value, description] of defaultSettings) {
     await prisma.setting.upsert({
       where: { key },

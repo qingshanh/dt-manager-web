@@ -332,7 +332,7 @@ export default function AppLayout() {
               style={{ cursor: 'pointer', alignItems: 'flex-start' }}
               onClick={() => {
                 setBellOpen(false);
-                navigate(`/accounts/${item.account_id}`);
+                navigate(`/accounts/${item.account_id}?tab=messages&messageId=${item.id}`);
               }}
             >
               <Space direction="vertical" size={2} style={{ width: '100%' }}>

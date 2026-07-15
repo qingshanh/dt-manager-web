@@ -11,6 +11,38 @@ export type ParsedSmsPush = {
   k5Flag?: number;
 };
 
+export function isOfflineMessageIndexPush(payload: Buffer) {
+  if (extractPushMetadataType(payload) !== 8) {
+    return false;
+  }
+  return /(?:dtId|who|devfilter)/i.test(payload.toString("latin1"));
+}
+
+function extractPushMetadataType(payload: Buffer) {
+  const inflated = inflateFirstJsonPayload(payload);
+  if (inflated) {
+    const type = parsePushMetadataType(inflated);
+    if (type !== null) {
+      return type;
+    }
+  }
+  const range = findJsonObjectRange(payload);
+  return range ? parsePushMetadataType(payload.subarray(range.start, range.end)) : null;
+}
+
+function parsePushMetadataType(payload: Buffer) {
+  const jsonEnd = payload.indexOf("}") + 1;
+  if (jsonEnd <= 0) {
+    return null;
+  }
+  try {
+    const metadata = JSON.parse(payload.subarray(0, jsonEnd).toString("utf8")) as { k1?: unknown };
+    return typeof metadata.k1 === "number" ? metadata.k1 : null;
+  } catch {
+    return null;
+  }
+}
+
 export function parseSmsPush(payload: Buffer): ParsedSmsPush | null {
   return parseCompressedSmsPush(payload) ?? parsePlaintextSmsPush(payload);
 }
@@ -41,10 +73,11 @@ function parseCompressedSmsPush(payload: Buffer): ParsedSmsPush | null {
   }
 
   const rawSender = json.k2 ?? null;
+  const fromNumber = normalizeSmsSender(rawSender, content, json);
   return {
     msgType: json.k1 ?? 0,
-    fromNumber: normalizeSmsSender(rawSender, content),
-    toNumber: extractTargetNumberFromPushMetadata(json, rawSender),
+    fromNumber,
+    toNumber: extractTargetNumberFromPushMetadata(json, fromNumber),
     content,
     rawInfo: json.info,
     rawK3: json.k3,
@@ -78,10 +111,11 @@ function parsePlaintextSmsPush(payload: Buffer): ParsedSmsPush | null {
   }
 
   const rawSender = json.k2 ?? null;
+  const fromNumber = normalizeSmsSender(rawSender, content, json);
   return {
     msgType: json.k1 ?? 0,
-    fromNumber: normalizeSmsSender(rawSender, content),
-    toNumber: extractTargetNumberFromPushMetadata(json, rawSender),
+    fromNumber,
+    toNumber: extractTargetNumberFromPushMetadata(json, fromNumber),
     content,
     rawInfo: json.info,
     rawK3: json.k3,
@@ -90,12 +124,37 @@ function parsePlaintextSmsPush(payload: Buffer): ParsedSmsPush | null {
 }
 
 
-function normalizeSmsSender(sender: string | null, content: string) {
+function normalizeSmsSender(
+  sender: string | null,
+  content: string,
+  metadata: { info?: string; k3?: string }
+) {
   const trimmed = sender?.trim() || null;
   if (trimmed && !/^unverified$/i.test(trimmed)) {
-    return trimmed;
+    return restoreInternationalSender(trimmed, metadata) ?? trimmed;
   }
   return extractProviderLabelFromContent(content) ?? trimmed;
+}
+
+function restoreInternationalSender(sender: string, metadata: { info?: string; k3?: string }) {
+  if (!/^[+\d().\s-]+$/.test(sender)) {
+    return null;
+  }
+  const senderDigits = normalizePhoneDigits(sender);
+  if (senderDigits.length < 7) {
+    return null;
+  }
+  const candidates = [metadata.info, metadata.k3]
+    .flatMap((value) => extractDigitRunsFromBase64(value))
+    .filter((candidate) => {
+      const prefixLength = candidate.length - senderDigits.length;
+      if (prefixLength < 1 || prefixLength > 3 || !candidate.endsWith(senderDigits)) {
+        return false;
+      }
+      return !(prefixLength === 1 && candidate.startsWith("1") && senderDigits.length === 10);
+    })
+    .sort((left, right) => right.length - left.length || left.localeCompare(right));
+  return candidates[0] ?? null;
 }
 
 function extractProviderLabelFromContent(content: string) {
@@ -327,7 +386,11 @@ function decodeSmsContent(bytes: Buffer, utf8Fallback: string) {
 }
 
 function normalizeSmsContent(value: string) {
-  return stripPushMetadata(value.replace(/\0+$/g, "")).trim();
+  return normalizeKnownProviderWrapper(stripPushMetadata(value.replace(/\0+$/g, "")).trim());
+}
+
+function normalizeKnownProviderWrapper(value: string) {
+  return value.replace(/^[A-Za-z]?\?<SiliconFlow\?>\s*/i, "[硅基流动] ");
 }
 
 function stripPushMetadata(value: string) {

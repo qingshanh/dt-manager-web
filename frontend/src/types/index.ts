@@ -257,10 +257,20 @@ export interface PhoneNumber {
   auto_renew: boolean;
   is_primary: boolean;
   is_good_number: boolean;
+  allow_receive_sms: boolean | null;
   portout_info: string | null;
   raw_json: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface PhoneSmsReceptionRepairResult {
+  checked: number;
+  repaired: number;
+  already_enabled: number;
+  unknown: number;
+  failed: Array<{ phone_number: string; error: string }>;
+  phone_numbers: PhoneNumber[];
 }
 
 export interface UpdatePhoneLabelBody {
@@ -431,6 +441,7 @@ export interface VersionInfo {
   update_branch: string;
   latest_version: VersionCommit | null;
   update_available: boolean | null;
+  update_status: 'current' | 'behind' | 'ahead' | 'diverged' | 'unknown';
   check_error: string | null;
   checked_at: string;
   recent_versions: VersionCommit[];

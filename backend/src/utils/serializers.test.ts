@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MessageDirection, MessageType } from "@prisma/client";
-import { repairUtf8Mojibake, serializeMessage } from "./serializers.js";
+import { MessageDirection, MessageType, PhoneStatus } from "@prisma/client";
+import { repairUtf8Mojibake, serializeMessage, serializePhoneNumber } from "./serializers.js";
 
 test("repairUtf8Mojibake restores UTF-8 Chinese text decoded as GBK", () => {
   assert.equal(repairUtf8Mojibake("璇撮亾鍥㈤槦绯荤粺娑堟伅"), "说道团队系统消息");
@@ -27,6 +27,68 @@ test("serializeMessage cleans stale direct SMS length-prefix bytes", () => {
     createdAt: new Date("2026-07-06T13:54:45.308Z")
   };
 
-  assert.equal(serializeMessage({ ...base, content: "C?<SiliconFlow?> Verification code is: 552420" }).content, "?<SiliconFlow?> Verification code is: 552420");
+  assert.equal(serializeMessage({ ...base, content: "C?<SiliconFlow?> Verification code is: 552420" }).content, "[硅基流动] Verification code is: 552420");
   assert.equal(serializeMessage({ ...base, content: "A[硅基流动]Verification code is: 521153" }).content, "[硅基流动]Verification code is: 521153");
+  assert.equal(
+    serializeMessage({ ...base, fromNumber: "TWVerify", content: "��������������916128" }).content,
+    "您的验证代码是：916128"
+  );
+  assert.equal(
+    serializeMessage({ ...base, fromNumber: "OPENAI", content: "���� OpenAI ���������:924582" }).content,
+    "您的 OpenAI 验证代码是：924582"
+  );
+});
+
+test("serializeMessage normalizes legacy SiliconFlow provider wrappers", () => {
+  const serialized = serializeMessage({
+    id: 1,
+    accountId: 1,
+    direction: "incoming",
+    msgType: "verification",
+    fromNumber: "(833) 858-1657",
+    toNumber: "16125550123",
+    content: "C?<SiliconFlow?> Verification code is: 791461, valid for 5 minutes.",
+    rawInfo: null,
+    rawK3: null,
+    k5Flag: null,
+    isRead: false,
+    telegramSent: false,
+    telegramMsgId: null,
+    receivedAt: new Date("2026-07-14T10:24:05.869Z"),
+    createdAt: new Date("2026-07-14T10:24:05.869Z")
+  });
+
+  assert.equal(serialized.content, "[硅基流动] Verification code is: 791461, valid for 5 minutes.");
+});
+
+test("serializePhoneNumber exposes the per-number SMS receive switch", () => {
+  const serialized = serializePhoneNumber({
+    id: 1,
+    accountId: 2,
+    phoneNumber: "525500000001",
+    countryCode: 52,
+    providerId: 1,
+    displayName: "Mexico",
+    status: PhoneStatus.active,
+    purchaseType: null,
+    payType: null,
+    validPeriodDays: null,
+    gainTime: null,
+    expiredTime: null,
+    autoRenew: true,
+    isPrimary: false,
+    isGoodNumber: false,
+    portoutInfo: null,
+    rawJson: JSON.stringify({
+      filterSetting: JSON.stringify({
+        useBlock: 1,
+        callBlockSetting: 2,
+        allowReceiveSMS: false
+      })
+    }),
+    createdAt: new Date("2026-07-12T00:00:00.000Z"),
+    updatedAt: new Date("2026-07-12T00:00:00.000Z")
+  });
+
+  assert.equal(serialized.allow_receive_sms, false);
 });
