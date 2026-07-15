@@ -1,8 +1,9 @@
-import { PhoneStatus } from "@prisma/client";
+import { AccountStatus, MessageDirection, MessageType, PhoneStatus } from "@prisma/client";
 import type { DtAccount, PhoneNumber } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { decryptText } from "../utils/crypto.js";
 import { logger } from "../utils/logger.js";
+import { serializePhoneNumber } from "../utils/serializers.js";
 import { accountMonitorService } from "./account-monitor.js";
 import { refreshAccountRuntimeData } from "./account-runtime.js";
 import {
@@ -17,11 +18,34 @@ import { storeParsedSmsPushes } from "./message-runtime.js";
 import { getSettingsMap } from "./settings.service.js";
 import { sendPhoneTelegramNotification } from "./telegram-notifier.js";
 import { telegramService, type TelegramUpdate } from "./telegram.js";
+import { parseTelegramCallback, type TelegramPanelCallback } from "./telegram-bot-callbacks.js";
+import {
+  accountActionKeyboard,
+  accountListKeyboard,
+  escapeTelegramHtml,
+  formatAccountCard,
+  formatAccountListCard,
+  formatCommandHelp,
+  formatPanelStatusCard,
+  formatPhoneAccountListCard,
+  formatPhoneCard,
+  formatPhoneListCard,
+  formatRecentMessagesCard,
+  limitTelegramMessage,
+  mainPanelKeyboard,
+  phoneAccountKeyboard,
+  phoneDetailKeyboard,
+  phoneListKeyboard
+} from "./telegram-bot-ui.js";
 
 const botGateway = new DirectDingtoneGateway();
 let botCommandsCacheKey = "";
 const TELEGRAM_NOTE_MAX_LENGTH = 100;
+const TELEGRAM_ACCOUNT_PAGE_SIZE = 8;
+const TELEGRAM_PHONE_ACCOUNT_PAGE_SIZE = 8;
+const TELEGRAM_ACCOUNT_PHONE_PAGE_SIZE = 6;
 type PhoneMatch = "confirmed" | "unverified" | "mismatch";
+type TelegramBotDb = Pick<typeof prisma, "dtAccount" | "phoneNumber" | "message">;
 
 export function isConfirmToken(value: string | undefined | null) {
   return value?.trim().toLowerCase() === "confirm";
@@ -40,6 +64,7 @@ export function normalizeTelegramNoteText(value: string) {
 type BotReply = {
   text: string;
   replyMarkup?: unknown;
+  parseMode?: "HTML";
 };
 
 export class TelegramBotService {
@@ -97,7 +122,7 @@ export class TelegramBotService {
         await this.handleUpdate(update, settings).catch((error) => {
           logger.warn("Telegram bot update handling failed", {
             updateId: update.update_id,
-            error: error instanceof Error ? error.message : String(error)
+            error: sanitizeTelegramError(errorMessage(error))
           });
         });
         await prisma.setting.upsert({
@@ -108,7 +133,7 @@ export class TelegramBotService {
       }
     } catch (error) {
       logger.warn("Telegram bot polling failed", {
-        error: error instanceof Error ? error.message : String(error)
+        error: sanitizeTelegramError(errorMessage(error))
       });
     } finally {
       this.running = false;
@@ -128,22 +153,28 @@ export class TelegramBotService {
       if (!botToken) {
         return;
       }
-      if (!isWhitelisted(settings.telegram_allowed_chat_ids, chatId, userId)) {
-        await telegramService.answerCallbackQuery({
+      await runAuthorizedTelegramCallback(
+        {
+          allowedChatIds: settings.telegram_allowed_chat_ids,
+          chatId,
+          userId,
           botToken,
           callbackQueryId: callback.id,
-          text: "未授权",
           apiBaseUrl: settings.telegram_api_base_url
-        });
-        return;
-      }
-      await telegramService.answerCallbackQuery({
-        botToken,
-        callbackQueryId: callback.id,
-        apiBaseUrl: settings.telegram_api_base_url
-      });
-      const reply = await handlePanelCallbackSafe(callback.data);
-      await this.reply(settings, chatId, reply.text, reply.replyMarkup);
+        },
+        async () => {
+          const parsed = parseTelegramCallback(callback.data);
+          if (!parsed) {
+            await this.replyToCallback(settings, chatId, callback.message?.message_id, await rootPanelReply());
+            return;
+          }
+          if (isSlowTelegramCallback(parsed)) {
+            await this.showCallbackProgress(settings, chatId, callback.message?.message_id);
+          }
+          const reply = await handleTelegramCallbackSafe(parsed);
+          await this.replyToCallback(settings, chatId, callback.message?.message_id, reply);
+        }
+      );
       return;
     }
 
@@ -168,22 +199,22 @@ export class TelegramBotService {
     switch (command) {
       case "/start":
       case "/help":
-        await this.reply(settings, chatId, helpText());
+        await this.reply(settings, chatId, helpReply());
         return;
       case "/panel":
-        await this.reply(settings, chatId, await panelText(), panelMarkup());
+        await this.reply(settings, chatId, await rootPanelReply());
         return;
       case "/accounts":
-        await this.reply(settings, chatId, await listAccountsText());
+        await this.reply(settings, chatId, await accountListReply(1));
         return;
       case "/account":
-        await this.reply(settings, chatId, await accountDetailText(Number(args[0])));
+        await this.reply(settings, chatId, await accountDetailReply(Number(args[0])));
         return;
       case "/phones":
-        await this.reply(settings, chatId, await phoneListText(Number(args[0])));
+        await this.reply(settings, chatId, await accountPhoneListReply(Number(args[0]), 1));
         return;
       case "/messages":
-        await this.reply(settings, chatId, await messageListText(Number(args[0]), Number(args[1])));
+        await this.reply(settings, chatId, await recentMessagesReply(Number(args[0]), Number(args[1])));
         return;
       case "/countries":
         await this.reply(settings, chatId, await countryListText(Number(args[0])));
@@ -216,7 +247,7 @@ export class TelegramBotService {
         await this.reply(settings, chatId, await clearPhoneNoteText(Number(args[0]), args[1]));
         return;
       case "/status":
-        await this.reply(settings, chatId, await panelStatusText());
+        await this.reply(settings, chatId, await rootPanelReply());
         return;
       case "/code":
         await this.reply(settings, chatId, await collectCodeText(Number(args[0]), args[1]));
@@ -247,19 +278,122 @@ export class TelegramBotService {
     }
   }
 
-  private async reply(settings: Record<string, string>, chatId: string, text: string, replyMarkup?: unknown) {
+  private async reply(settings: Record<string, string>, chatId: string, reply: BotReply | string) {
     const botToken = settings.telegram_bot_token;
     if (!botToken) {
       return;
     }
+    const normalized = typeof reply === "string" ? { text: reply } : reply;
+    const safeText = sanitizeTelegramError(normalized.text);
     await telegramService.sendMessage({
       botToken,
       chatId,
-      text: trimTelegramText(text),
-      replyMarkup,
+      text: normalized.parseMode === "HTML" ? limitTelegramMessage(safeText) : trimTelegramText(safeText),
+      replyMarkup: normalized.replyMarkup,
+      parseMode: normalized.parseMode,
       apiBaseUrl: settings.telegram_api_base_url
     });
   }
+
+  private async replyToCallback(
+    settings: Record<string, string>,
+    chatId: string,
+    messageId: number | undefined,
+    reply: BotReply
+  ) {
+    await deliverTelegramCallbackReply({ settings, chatId, messageId, reply });
+  }
+
+  private async showCallbackProgress(settings: Record<string, string>, chatId: string, messageId: number | undefined) {
+    const botToken = settings.telegram_bot_token;
+    if (!botToken || messageId === undefined) {
+      return;
+    }
+    await telegramService.editMessageText({
+      botToken,
+      chatId,
+      messageId,
+      text: "<b>⏳ 正在处理</b>",
+      parseMode: "HTML",
+      apiBaseUrl: settings.telegram_api_base_url
+    }).catch((error) => {
+      logger.warn("Telegram callback progress edit failed", {
+        chatId,
+        messageId,
+        error: sanitizeTelegramError(errorMessage(error))
+      });
+    });
+  }
+}
+
+type TelegramCallbackAuthorizationInput = {
+  allowedChatIds?: string;
+  chatId: string;
+  userId: string;
+  botToken: string;
+  callbackQueryId: string;
+  apiBaseUrl?: string | null;
+};
+
+export async function runAuthorizedTelegramCallback(
+  input: TelegramCallbackAuthorizationInput,
+  operation: () => Promise<void>,
+  api: Pick<typeof telegramService, "answerCallbackQuery"> = telegramService
+) {
+  if (!isWhitelisted(input.allowedChatIds, input.chatId, input.userId)) {
+    await api.answerCallbackQuery({
+      botToken: input.botToken,
+      callbackQueryId: input.callbackQueryId,
+      text: "未授权",
+      apiBaseUrl: input.apiBaseUrl
+    });
+    return false;
+  }
+  await api.answerCallbackQuery({
+    botToken: input.botToken,
+    callbackQueryId: input.callbackQueryId,
+    apiBaseUrl: input.apiBaseUrl
+  });
+  await operation();
+  return true;
+}
+
+type TelegramCallbackDeliveryInput = {
+  settings: Record<string, string>;
+  chatId: string;
+  messageId?: number;
+  reply: BotReply;
+};
+
+export async function deliverTelegramCallbackReply(
+  input: TelegramCallbackDeliveryInput,
+  api: Pick<typeof telegramService, "editMessageText" | "sendMessage"> = telegramService
+) {
+  const botToken = input.settings.telegram_bot_token;
+  if (!botToken) return "skipped";
+  const safeText = sanitizeTelegramError(input.reply.text);
+  const payload = {
+    botToken,
+    chatId: input.chatId,
+    text: input.reply.parseMode === "HTML" ? limitTelegramMessage(safeText) : trimTelegramText(safeText),
+    replyMarkup: input.reply.replyMarkup,
+    parseMode: input.reply.parseMode,
+    apiBaseUrl: input.settings.telegram_api_base_url
+  };
+  if (input.messageId !== undefined) {
+    try {
+      await api.editMessageText({ ...payload, messageId: input.messageId });
+      return "edited";
+    } catch (error) {
+      logger.warn("Telegram callback message edit failed; sending a new message", {
+        chatId: input.chatId,
+        messageId: input.messageId,
+        error: sanitizeTelegramError(errorMessage(error))
+      });
+    }
+  }
+  await api.sendMessage(payload);
+  return "sent";
 }
 
 async function ensureBotCommands(botToken: string, apiBaseUrl?: string | null) {
@@ -304,146 +438,40 @@ async function ensureBotCommands(botToken: string, apiBaseUrl?: string | null) {
     })
     .catch((error) => {
       logger.warn("Failed to set Telegram bot commands", {
-        error: error instanceof Error ? error.message : String(error)
+        error: sanitizeTelegramError(errorMessage(error))
       });
     });
 }
 
-function helpText() {
-  return [
-    "dt-manager 机器人命令：",
-    "/panel - 打开控制面板按钮菜单",
-    "/accounts - 查看账户列表",
-    "/account <账户ID> - 查看账户详情",
-    "/phones <账户ID> - 查看已购手机号",
-    "/messages <账户ID> [数量] - 查看最近消息",
-    "/countries <账户ID> - 查看可选号国家",
-    "/preview_number <账户ID> <国家ISO> [区号] - 预览号码和价格，不扣费",
-    "/buy_number <账户ID> <国家ISO> [confirm] [区号] [phone=号码] - 先预览，带 confirm 才购买",
-    "/code <账户ID> [号码ID|手机号] - 直连等待指定已购手机号的新短信/验证码 60 秒",
-    "/trace_access_code <账户ID> <phone|email> <目标> [验证码] [cc=国家码] [confirm] - 追踪验证码登录参数；默认 dry-run，confirm 才会发真实请求",
-    "/start_monitor <账户ID|all> - 启动监听",
-    "/stop_monitor <账户ID|all> - 停止监听",
-    "/notify <账户ID|all> <on|off> - 开关 Telegram 通知",
-    "/set_note <账户ID> <备注> - 修改账户备注，支持中英文",
-    "/clear_note <账户ID> - 清空账户备注",
-    "/set_phone_note <账户ID> <号码ID|手机号> <备注> - 修改号码备注并同步到 app",
-    "/clear_phone_note <账户ID> <号码ID|手机号> - 清空号码备注并同步到 app",
-    "/status - 查看面板运行概览",
-    "/refresh_account <账户ID> - 刷新账户资料和积分",
-    "/refresh_phones <账户ID> - 刷新已购号码",
-    "/renew_phone <账户ID> <号码ID|手机号> confirm - 续费号码，会扣费",
-    "/pause_phone <账户ID> <号码ID|手机号> confirm - 暂停号码",
-    "/resume_phone <账户ID> <号码ID|手机号> confirm - 恢复号码",
-    "/cancel_phone <账户ID> <号码ID|手机号> confirm - 取消号码，谨慎使用"
-  ].join("\n");
+function helpReply(): BotReply {
+  return { text: formatCommandHelp(), replyMarkup: mainPanelKeyboard(), parseMode: "HTML" };
 }
 
-async function panelText() {
-  return [
-    await panelStatusText(),
-    "",
-    "常用操作可以点下面按钮；指定账户、指定号码的操作仍用命令，避免误购号或误取消。"
-  ].join("\n");
+export async function loadTelegramPanelStats(db: TelegramBotDb = prisma) {
+  const [accountCount, onlineCount, monitorCount, telegramCount, phoneCount, unreadCount] = await Promise.all([
+    db.dtAccount.count(),
+    db.dtAccount.count({ where: { status: AccountStatus.online } }),
+    db.dtAccount.count({ where: { monitorEnabled: true } }),
+    db.dtAccount.count({ where: { telegramNotify: true } }),
+    db.phoneNumber.count(),
+    db.message.count({
+      where: {
+        direction: MessageDirection.incoming,
+        msgType: { not: MessageType.system },
+        isRead: false
+      }
+    })
+  ]);
+  return { accountCount, onlineCount, monitorCount, telegramCount, phoneCount, unreadCount };
 }
 
-function panelMarkup() {
-  return {
-    inline_keyboard: [
-      [
-        { text: "账户列表", callback_data: "panel:accounts" },
-        { text: "运行状态", callback_data: "panel:status" }
-      ],
-      [
-        { text: "开启全部监听", callback_data: "panel:start_all" },
-        { text: "停止全部监听", callback_data: "panel:stop_all" }
-      ],
-      [
-        { text: "开启全部通知", callback_data: "panel:notify_on_all" },
-        { text: "关闭全部通知", callback_data: "panel:notify_off_all" }
-      ],
-      [
-        { text: "命令帮助", callback_data: "panel:help" }
-      ]
-    ]
-  };
-}
-
-async function handlePanelCallback(data: string | undefined): Promise<BotReply> {
-  const parsed = parsePanelCallback(data);
-  if (parsed) {
-    const account = await prisma.dtAccount.findUnique({ where: { id: parsed.accountId } });
-    if (!account) {
-      return { text: "账户不存在。", replyMarkup: await accountsMarkup() };
-    }
-    switch (parsed.action) {
-      case "detail":
-        return { text: await accountDetailText(parsed.accountId), replyMarkup: accountActionMarkup(account) };
-      case "messages":
-        return { text: await messageListText(parsed.accountId, 5), replyMarkup: accountActionMarkup(account) };
-      case "code":
-        return { text: await collectCodeText(parsed.accountId), replyMarkup: accountActionMarkup(await reloadAccount(parsed.accountId, account)) };
-      case "phones":
-        return { text: await refreshPhonesText(parsed.accountId), replyMarkup: accountActionMarkup(await reloadAccount(parsed.accountId, account)) };
-      case "monitor":
-        return {
-          text: await toggleMonitorText(String(parsed.accountId), !account.monitorEnabled),
-          replyMarkup: accountActionMarkup(await reloadAccount(parsed.accountId, account))
-        };
-      case "notify":
-        return {
-          text: await toggleNotifyText(String(parsed.accountId), account.telegramNotify ? "off" : "on"),
-          replyMarkup: accountActionMarkup(await reloadAccount(parsed.accountId, account))
-        };
-      case "clear_note":
-        return {
-          text: await clearNoteText(parsed.accountId),
-          replyMarkup: accountActionMarkup(await reloadAccount(parsed.accountId, account))
-        };
-      default:
-        return { text: "未知账户操作。", replyMarkup: accountActionMarkup(account) };
-    }
-  }
-
-  switch (data) {
-    case "panel:accounts":
-      return { text: await listAccountsText(), replyMarkup: await accountsMarkup() };
-    case "panel:status":
-      return { text: await panelStatusText(), replyMarkup: panelMarkup() };
-    case "panel:start_all":
-      return { text: await toggleMonitorText("all", true), replyMarkup: panelMarkup() };
-    case "panel:stop_all":
-      return { text: await toggleMonitorText("all", false), replyMarkup: panelMarkup() };
-    case "panel:notify_on_all":
-      return { text: await toggleNotifyText("all", "on"), replyMarkup: panelMarkup() };
-    case "panel:notify_off_all":
-      return { text: await toggleNotifyText("all", "off"), replyMarkup: panelMarkup() };
-    case "panel:help":
-      return { text: helpText(), replyMarkup: panelMarkup() };
-    default:
-      return { text: "未知面板操作。发送 /panel 重新打开控制面板。", replyMarkup: panelMarkup() };
-  }
-}
-
-async function handlePanelCallbackSafe(data: string | undefined): Promise<BotReply> {
-  try {
-    return await handlePanelCallback(data);
-  } catch (error) {
-    logger.warn("Telegram bot callback failed", {
-      data,
-      error: errorMessage(error)
-    });
-    return {
-      text: `操作失败：${errorMessage(error)}`,
-      replyMarkup: panelMarkup()
-    };
-  }
-}
-
-async function listAccountsText() {
-  const accounts = await prisma.dtAccount.findMany({
-    orderBy: { id: "asc" },
-    take: 30,
+export async function loadTelegramAccountPage(requestedPage: number, db: TelegramBotDb = prisma) {
+  const total = await db.dtAccount.count();
+  const pagination = telegramPagination(total, requestedPage, TELEGRAM_ACCOUNT_PAGE_SIZE);
+  const items = await db.dtAccount.findMany({
+    orderBy: [{ sortOrder: "asc" }, { id: "asc" }],
+    skip: pagination.skip,
+    take: TELEGRAM_ACCOUNT_PAGE_SIZE,
     select: {
       id: true,
       nickname: true,
@@ -451,138 +479,340 @@ async function listAccountsText() {
       phone: true,
       dtUserId: true,
       status: true,
-      monitorEnabled: true,
-      telegramNotify: true
+      _count: { select: { phoneNumbers: true } }
     }
   });
-  if (accounts.length === 0) {
-    return "暂无账户。";
-  }
-  return accounts
-    .map((item) => `${item.id}. ${accountName(item)} | ${item.status} | 监听:${item.monitorEnabled ? "开" : "关"} | TG:${item.telegramNotify ? "开" : "关"}`)
-    .join("\n");
+  return { items, page: pagination.page, totalPages: pagination.totalPages };
 }
 
-async function accountsMarkup() {
-  const accounts = await prisma.dtAccount.findMany({
-    orderBy: { id: "asc" },
-    take: 12,
+export async function loadTelegramPhoneAccountPage(requestedPage: number, db: TelegramBotDb = prisma) {
+  const where = { phoneNumbers: { some: {} } };
+  const total = await db.dtAccount.count({ where });
+  const pagination = telegramPagination(total, requestedPage, TELEGRAM_PHONE_ACCOUNT_PAGE_SIZE);
+  const items = await db.dtAccount.findMany({
+    where,
+    orderBy: [{ sortOrder: "asc" }, { id: "asc" }],
+    skip: pagination.skip,
+    take: TELEGRAM_PHONE_ACCOUNT_PAGE_SIZE,
     select: {
       id: true,
       nickname: true,
       email: true,
       phone: true,
-      dtUserId: true
+      dtUserId: true,
+      status: true,
+      _count: { select: { phoneNumbers: true } }
     }
   });
-  const rows = accounts.map((item) => [
-    {
-      text: `${item.id}. ${truncateButtonText(accountName(item), 24)}`,
-      callback_data: `acct:${item.id}:detail`
+  return { items, page: pagination.page, totalPages: pagination.totalPages };
+}
+
+export async function loadTelegramAccountPhonePage(accountId: number, requestedPage: number, db: TelegramBotDb = prisma) {
+  const where = { accountId };
+  const total = await db.phoneNumber.count({ where });
+  const pagination = telegramPagination(total, requestedPage, TELEGRAM_ACCOUNT_PHONE_PAGE_SIZE);
+  const items = await db.phoneNumber.findMany({
+    where,
+    orderBy: [{ isPrimary: "desc" }, { createdAt: "desc" }, { id: "desc" }],
+    skip: pagination.skip,
+    take: TELEGRAM_ACCOUNT_PHONE_PAGE_SIZE,
+    select: { id: true, phoneNumber: true, status: true }
+  });
+  return { items, page: pagination.page, totalPages: pagination.totalPages };
+}
+
+export async function loadTelegramRecentMessages(accountId: number | undefined, limit = 5, db: TelegramBotDb = prisma) {
+  const safeLimit = Number.isSafeInteger(limit) ? Math.min(Math.max(limit, 1), 10) : 5;
+  return db.message.findMany({
+    where: {
+      direction: MessageDirection.incoming,
+      msgType: { not: MessageType.system },
+      ...(accountId === undefined ? {} : { accountId })
+    },
+    orderBy: [{ receivedAt: "desc" }, { id: "desc" }],
+    take: safeLimit,
+    select: {
+      id: true,
+      accountId: true,
+      fromNumber: true,
+      toNumber: true,
+      content: true,
+      receivedAt: true,
+      account: {
+        select: { id: true, nickname: true, email: true, phone: true, dtUserId: true }
+      }
     }
-  ]);
-  rows.push([{ text: "返回面板", callback_data: "panel:status" }]);
-  return { inline_keyboard: rows };
+  });
 }
 
-function accountActionMarkup(account: { id: number; monitorEnabled: boolean; telegramNotify: boolean }) {
-  return {
-    inline_keyboard: [
-      [
-        { text: "详情", callback_data: `acct:${account.id}:detail` },
-        { text: "最近消息", callback_data: `acct:${account.id}:messages` }
-      ],
-      [
-        { text: "收验证码", callback_data: `acct:${account.id}:code` },
-        { text: "刷新号码", callback_data: `acct:${account.id}:phones` }
-      ],
-      [
-        { text: account.monitorEnabled ? "停止监听" : "启动监听", callback_data: `acct:${account.id}:monitor` },
-        { text: account.telegramNotify ? "关闭通知" : "开启通知", callback_data: `acct:${account.id}:notify` }
-      ],
-      [
-        { text: "清空备注", callback_data: `acct:${account.id}:clear_note` }
-      ],
-      [
-        { text: "账户列表", callback_data: "panel:accounts" },
-        { text: "返回面板", callback_data: "panel:status" }
-      ]
-    ]
-  };
-}
-
-function parsePanelCallback(data: string | undefined) {
-  const match = data?.match(/^acct:(\d+):(detail|messages|code|phones|monitor|notify|clear_note)$/);
-  if (!match) {
-    return null;
-  }
-  return {
-    accountId: Number(match[1]),
-    action: match[2] as "detail" | "messages" | "code" | "phones" | "monitor" | "notify" | "clear_note"
-  };
-}
-
-async function reloadAccount(accountId: number, fallback: DtAccount) {
-  return (await prisma.dtAccount.findUnique({ where: { id: accountId } })) ?? fallback;
-}
-
-async function accountDetailText(accountId: number) {
-  if (!Number.isInteger(accountId)) {
-    return "用法：/account <账户ID>";
-  }
-  const account = await prisma.dtAccount.findUnique({
+export async function loadTelegramAccountDetail(accountId: number, db: TelegramBotDb = prisma) {
+  return db.dtAccount.findUnique({
     where: { id: accountId },
-    include: { _count: { select: { phoneNumbers: true, messages: true } } }
+    select: {
+      id: true,
+      nickname: true,
+      email: true,
+      phone: true,
+      dtUserId: true,
+      appVariant: true,
+      status: true,
+      monitorEnabled: true,
+      telegramNotify: true,
+      lastError: true,
+      _count: {
+        select: {
+          phoneNumbers: true,
+          messages: {
+            where: {
+              direction: MessageDirection.incoming,
+              msgType: { not: MessageType.system },
+              isRead: false
+            }
+          }
+        }
+      }
+    }
   });
-  if (!account) {
-    return "账户不存在。";
-  }
-  return [
-    `账户: ${accountName(account)}`,
-    `ID: ${account.id}`,
-    `说道用户ID: ${account.dtUserId ?? "-"}`,
-    `说道号: ${account.phone ?? "-"}`,
-    `邮箱: ${account.email ?? "-"}`,
-    `状态: ${account.status}`,
-    `监听: ${account.monitorEnabled ? "开" : "关"}`,
-    `Telegram: ${account.telegramNotify ? "开" : "关"}`,
-    `手机号: ${account._count.phoneNumbers}`,
-    `消息: ${account._count.messages}`,
-    `最后错误: ${account.lastError ?? "-"}`
-  ].join("\n");
 }
 
-async function phoneListText(accountId: number) {
-  if (!Number.isInteger(accountId)) {
-    return "用法：/phones <账户ID>";
-  }
-  const phones = await prisma.phoneNumber.findMany({
-    where: { accountId },
-    orderBy: { id: "asc" },
-    take: 30
-  });
-  if (phones.length === 0) {
-    return "该账户暂无手机号。";
-  }
-  return phones.map(formatPhoneLine).join("\n");
+export async function loadTelegramPhoneDetail(accountId: number, phoneId: number, db: TelegramBotDb = prisma) {
+  const phone = await db.phoneNumber.findFirst({ where: { id: phoneId, accountId } });
+  if (!phone) return null;
+  const { allow_receive_sms: allowReceiveSms } = serializePhoneNumber(phone);
+  return {
+    id: phone.id,
+    accountId: phone.accountId,
+    phoneNumber: phone.phoneNumber,
+    displayName: phone.displayName,
+    status: phone.status,
+    countryCode: phone.countryCode,
+    providerId: phone.providerId,
+    expiredTime: phone.expiredTime,
+    autoRenew: phone.autoRenew,
+    allowReceiveSms
+  };
 }
 
-async function messageListText(accountId: number, limitInput: number) {
-  if (!Number.isInteger(accountId)) {
-    return "用法：/messages <账户ID> [数量]";
+async function rootPanelReply(): Promise<BotReply> {
+  return { text: formatPanelStatusCard(await loadTelegramPanelStats()), replyMarkup: mainPanelKeyboard(), parseMode: "HTML" };
+}
+
+async function statusPanelReply(): Promise<BotReply> {
+  const reply = await rootPanelReply();
+  return { ...reply, text: `${reply.text}\n刷新时间：${escapeTelegramHtml(new Date().toISOString())}` };
+}
+
+async function accountListReply(page: number): Promise<BotReply> {
+  const result = await loadTelegramAccountPage(page);
+  const items = result.items.map((item) => ({
+    id: item.id,
+    name: accountName(item),
+    status: String(item.status),
+    phoneCount: item._count.phoneNumbers
+  }));
+  return {
+    text: formatAccountListCard(items, result.page, result.totalPages),
+    replyMarkup: accountListKeyboard(items, result.page, result.totalPages),
+    parseMode: "HTML"
+  };
+}
+
+async function phoneAccountListReply(page: number): Promise<BotReply> {
+  const result = await loadTelegramPhoneAccountPage(page);
+  const items = result.items.map((item) => ({ id: item.id, name: accountName(item), phoneCount: item._count.phoneNumbers }));
+  return {
+    text: formatPhoneAccountListCard(items, result.page, result.totalPages),
+    replyMarkup: phoneAccountKeyboard(items, result.page, result.totalPages),
+    parseMode: "HTML"
+  };
+}
+
+async function accountDetailReply(accountId: number): Promise<BotReply> {
+  if (!Number.isSafeInteger(accountId) || accountId <= 0) return htmlNotice("用法：/account <账户ID>");
+  const account = await loadTelegramAccountDetail(accountId);
+  if (!account) return htmlNotice("账户不存在。");
+  return {
+    text: formatAccountCard({
+      id: account.id,
+      name: accountName(account),
+      appVariant: String(account.appVariant),
+      status: String(account.status),
+      monitorEnabled: account.monitorEnabled,
+      telegramNotify: account.telegramNotify,
+      phoneCount: account._count.phoneNumbers,
+      unreadCount: account._count.messages,
+      lastError: sanitizeTelegramError(account.lastError ?? "-")
+    }),
+    replyMarkup: accountActionKeyboard(account),
+    parseMode: "HTML"
+  };
+}
+
+async function accountPhoneListReply(accountId: number, page: number): Promise<BotReply> {
+  if (!Number.isSafeInteger(accountId) || accountId <= 0) return htmlNotice("用法：/phones <账户ID>");
+  const [account, result] = await Promise.all([loadTelegramAccountDetail(accountId), loadTelegramAccountPhonePage(accountId, page)]);
+  if (!account) return htmlNotice("账户不存在。");
+  const items = result.items.map((item) => ({ id: item.id, phoneNumber: item.phoneNumber, status: String(item.status) }));
+  return {
+    text: formatPhoneListCard(accountName(account), items, result.page, result.totalPages),
+    replyMarkup: phoneListKeyboard(accountId, items, result.page, result.totalPages),
+    parseMode: "HTML"
+  };
+}
+
+async function phoneDetailReply(accountId: number, phoneId: number): Promise<BotReply> {
+  const phone = await loadTelegramPhoneDetail(accountId, phoneId);
+  if (!phone) return htmlNotice("号码不存在。");
+  return { text: formatPhoneCard(phone), replyMarkup: phoneDetailKeyboard(accountId, phoneId), parseMode: "HTML" };
+}
+
+async function recentMessagesReply(accountId?: number, limitInput?: number): Promise<BotReply> {
+  if (accountId !== undefined && (!Number.isSafeInteger(accountId) || accountId <= 0)) {
+    return htmlNotice("用法：/messages <账户ID> [数量]");
   }
-  const limit = Number.isInteger(limitInput) ? Math.min(Math.max(limitInput, 1), 10) : 5;
-  const messages = await prisma.message.findMany({
-    where: { accountId, direction: "incoming" },
-    orderBy: { receivedAt: "desc" },
-    take: limit
-  });
-  if (messages.length === 0) {
-    return "该账户暂无消息。";
+  const messages = await loadTelegramRecentMessages(accountId, limitInput);
+  const items = messages.map((item) => ({
+    accountName: accountName(item.account),
+    toNumber: item.toNumber,
+    fromNumber: item.fromNumber,
+    content: item.content,
+    receivedAt: item.receivedAt
+  }));
+  const account = accountId === undefined ? null : await loadTelegramAccountDetail(accountId);
+  return {
+    text: formatRecentMessagesCard(items),
+    replyMarkup: account ? accountActionKeyboard(account) : mainPanelKeyboard(),
+    parseMode: "HTML"
+  };
+}
+
+export async function handleTelegramCallback(callback: TelegramPanelCallback): Promise<BotReply> {
+  if (callback.scope === "panel") {
+    if (callback.action === "accounts") return accountListReply(callback.page);
+    if (callback.action === "phones") return phoneAccountListReply(callback.page);
+    if (callback.action === "messages") return recentMessagesReply();
+    if (callback.action === "help") return helpReply();
+    if (callback.action === "status") return statusPanelReply();
+    return rootPanelReply();
   }
-  return messages
-    .map((item) => [`${item.receivedAt.toISOString()}`, `来源: ${item.fromNumber ?? "-"}`, `内容: ${item.content}`].join("\n"))
-    .join("\n\n");
+  if (callback.scope === "phone") {
+    if (callback.action === "note") return phoneNoteCommandReply(callback.accountId, callback.phoneId);
+    return phoneDetailReply(callback.accountId, callback.phoneId);
+  }
+  if (callback.action === "detail") return accountDetailReply(callback.accountId);
+  if (callback.action === "messages") return recentMessagesReply(callback.accountId, 5);
+  if (callback.action === "phones") return accountPhoneListReply(callback.accountId, callback.page);
+  if (callback.action === "refresh") return accountMutationReply(callback.accountId, () => refreshAccountText(callback.accountId));
+  if (callback.action === "refresh_phones") return accountMutationReply(callback.accountId, () => refreshPhonesText(callback.accountId));
+  return applyTelegramAccountTargetState({ accountId: callback.accountId, action: callback.action });
+}
+
+async function handleTelegramCallbackSafe(callback: TelegramPanelCallback): Promise<BotReply> {
+  try {
+    return await handleTelegramCallback(callback);
+  } catch (error) {
+    logger.warn("Telegram bot callback failed", { callback, error: sanitizeTelegramError(errorMessage(error)) });
+    return htmlNotice(telegramUserErrorText(error));
+  }
+}
+
+type TelegramAccountTargetAction = "monitor_on" | "monitor_off" | "notify_on" | "notify_off";
+type TelegramAccountState = { monitorEnabled: boolean; telegramNotify: boolean };
+type TelegramAccountStateDeps = {
+  loadAccount: (accountId: number) => Promise<TelegramAccountState | null>;
+  setMonitor: (accountId: number, enabled: boolean) => Promise<void>;
+  setNotify: (accountId: number, enabled: boolean) => Promise<void>;
+  renderAccount: (accountId: number) => Promise<BotReply>;
+};
+
+const telegramAccountStateDeps: TelegramAccountStateDeps = {
+  loadAccount: loadTelegramAccountDetail,
+  setMonitor: async (accountId, enabled) => {
+    if (enabled) await accountMonitorService.start(accountId);
+    else await accountMonitorService.stop(accountId);
+  },
+  setNotify: async (accountId, enabled) => {
+    await prisma.dtAccount.update({ where: { id: accountId }, data: { telegramNotify: enabled } });
+  },
+  renderAccount: accountDetailReply
+};
+
+export async function applyTelegramAccountTargetState(
+  input: { accountId: number; action: TelegramAccountTargetAction },
+  deps: TelegramAccountStateDeps = telegramAccountStateDeps
+) {
+  const account = await deps.loadAccount(input.accountId);
+  if (!account) return htmlNotice("账户不存在。");
+  const enabled = input.action.endsWith("_on");
+  if (input.action.startsWith("monitor_")) {
+    if (account.monitorEnabled !== enabled) await deps.setMonitor(input.accountId, enabled);
+  } else if (account.telegramNotify !== enabled) {
+    await deps.setNotify(input.accountId, enabled);
+  }
+  return deps.renderAccount(input.accountId);
+}
+
+function phoneNoteCommandReply(accountId: number, phoneId: number): BotReply {
+  const command = `/set_phone_note ${accountId} ${phoneId} 新备注`;
+  return {
+    text: `<b>修改号码备注</b>\n复制下面的命令并替换“新备注”：\n<code>${escapeTelegramHtml(command)}</code>`,
+    replyMarkup: phoneDetailKeyboard(accountId, phoneId),
+    parseMode: "HTML"
+  };
+}
+
+async function accountMutationReply(accountId: number, operation: () => Promise<string>): Promise<BotReply> {
+  const result = await operation();
+  const detail = await accountDetailReply(accountId);
+  return {
+    text: `<b>操作结果</b>\n${escapeTelegramHtml(sanitizeTelegramError(result))}\n\n${detail.text}`,
+    replyMarkup: detail.replyMarkup,
+    parseMode: "HTML"
+  };
+}
+
+function htmlNotice(text: string): BotReply {
+  return { text: `<b>${escapeTelegramHtml(sanitizeTelegramError(text))}</b>`, replyMarkup: mainPanelKeyboard(), parseMode: "HTML" };
+}
+
+export function sanitizeTelegramError(value: unknown) {
+  return String(value ?? "")
+    .replace(/\bbearer\s+[^\s"',;}]+/gi, "Bearer [redacted]")
+    .replace(
+      /(["']?(?:authorization|(?:dt_?)?token|password|device_?id|dt_?device_?id|imei|mac|serial|dt_?track_?code|local_?ip|wifi)["']?\s*[:=]\s*)(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\{[^}\r\n]*\}|\[[^\]\r\n]*\]|[^\s,;}]+)/gi,
+      "$1[redacted]"
+    );
+}
+
+export function telegramSafeFailureText(_error?: unknown) {
+  return "操作失败，请查看后端日志。";
+}
+
+export function telegramUserErrorText(error: unknown) {
+  const raw = `${error instanceof Error ? error.name : "Error"}: ${errorMessage(error)}`;
+  if (/timeout|timed out|超时|aborterror/i.test(raw)) return "操作超时，请稍后重试。";
+  if (/missing confirm|confirm required|缺少.*确认|需要.*confirm/i.test(raw)) return "缺少确认参数，请按提示添加 confirm。";
+  if (/unauthori[sz]ed|登录.*(?:失效|过期)|token.*(?:invalid|expired)|session.*expired/i.test(raw)) {
+    return "登录已失效，请重新登录账户。";
+  }
+  if (/(?:direct )?会话.*(?:缺失|不完整)|缺少.*(?:direct )?会话|session.*(?:missing|incomplete)/i.test(raw)) {
+    return "账户会话缺失，请重新登录后重试。";
+  }
+  if (/账户.*不存在|account.*not found/i.test(raw)) return "账户不存在，请刷新列表后重试。";
+  if (/号码.*不存在|未找到.*号码|phone.*not found/i.test(raw)) return "号码不存在，请刷新号码列表后重试。";
+  if (/参数|用法|格式错误|invalid.*(?:argument|parameter|format)|must be/i.test(raw)) return "参数错误，请检查命令格式。";
+  return telegramSafeFailureText(error);
+}
+
+function isSlowTelegramCallback(callback: TelegramPanelCallback) {
+  return callback.scope === "account" && (callback.action === "refresh" || callback.action === "refresh_phones");
+}
+
+function telegramPagination(total: number, requestedPage: number, pageSize: number) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const normalized = Number.isSafeInteger(requestedPage) ? requestedPage : 1;
+  const page = Math.min(Math.max(normalized, 1), totalPages);
+  return { page, totalPages, skip: (page - 1) * pageSize };
 }
 
 async function countryListText(accountId: number) {
@@ -641,7 +871,8 @@ async function toggleMonitorText(target: string | undefined, enabled: boolean) {
       }
       results.push(`${id}: ${enabled ? "已启动监听" : "已停止监听"}`);
     } catch (error) {
-      results.push(`${id}: 失败 ${errorMessage(error)}`);
+      logger.warn("Telegram monitor command failed", { accountId: id, error: sanitizeTelegramError(errorMessage(error)) });
+      results.push(`${id}: ${telegramUserErrorText(error)}`);
     }
   }
   return results.join("\n") || "没有匹配账户。";
@@ -736,24 +967,6 @@ async function updatePhoneNoteText(accountId: number, phoneRef: string, displayN
       ? `已更新号码备注：${formatPhoneLine(updated)} | 备注:${displayName}`
       : `已清空号码备注：${formatPhoneLine(updated)}`;
   });
-}
-
-async function panelStatusText() {
-  const [accounts, monitoring, notifyOn, phones, unread] = await Promise.all([
-    prisma.dtAccount.count(),
-    prisma.dtAccount.count({ where: { monitorEnabled: true } }),
-    prisma.dtAccount.count({ where: { telegramNotify: true } }),
-    prisma.phoneNumber.count({ where: { status: PhoneStatus.active } }),
-    prisma.message.count({ where: { direction: "incoming", isRead: false } })
-  ]);
-  return [
-    "面板概览：",
-    `账户: ${accounts}`,
-    `监听中: ${monitoring}`,
-    `Telegram 通知开启: ${notifyOn}`,
-    `活跃手机号: ${phones}`,
-    `未读消息: ${unread}`
-  ].join("\n");
 }
 
 async function collectCodeText(accountId: number, phoneRef?: string) {
@@ -1070,7 +1283,7 @@ async function buyNumberText(accountId: number, isoCountryCode: string | undefin
       logger.warn("Failed to send Telegram notification for purchased phone from bot", {
         accountId,
         phoneNumber: confirmed.phoneNumber,
-        error: errorMessage(error)
+        error: sanitizeTelegramError(errorMessage(error))
       });
     });
     return [
@@ -1201,7 +1414,7 @@ async function phoneActionText(
         accountId,
         phoneNumber: updated.phoneNumber,
         action,
-        error: errorMessage(error)
+        error: sanitizeTelegramError(errorMessage(error))
       });
     });
     return [
@@ -1238,9 +1451,9 @@ async function withTelegramCommandError(operation: () => Promise<string>) {
     return await operation();
   } catch (error) {
     logger.warn("Telegram bot command failed", {
-      error: errorMessage(error)
+      error: sanitizeTelegramError(errorMessage(error))
     });
-    return `操作失败：${errorMessage(error)}`;
+    return telegramUserErrorText(error);
   }
 }
 
@@ -1383,7 +1596,7 @@ async function verifyPhoneStatus(
       lastError = error;
       logger.warn("Phone action verification failed in Telegram bot", {
         phoneNumber,
-        error: errorMessage(error)
+        error: sanitizeTelegramError(errorMessage(error))
       });
     }
   }
@@ -1545,10 +1758,6 @@ function errorMessage(error: unknown) {
 
 function trimTelegramText(text: string) {
   return text.length <= 3900 ? text : `${text.slice(0, 3900)}\n...`;
-}
-
-function truncateButtonText(value: string, maxLength: number) {
-  return value.length <= maxLength ? value : `${value.slice(0, Math.max(1, maxLength - 1))}…`;
 }
 
 function safeParseJson(value: string) {

@@ -8,6 +8,7 @@ import {
   DesktopOutlined,
   LogoutOutlined,
   MoonOutlined,
+  PhoneOutlined,
   PlusOutlined,
   SettingOutlined,
   SunOutlined,
@@ -32,6 +33,7 @@ type MenuItem = Required<MenuProps>['items'][number];
 const menuItems: MenuItem[] = [
   { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
   { key: '/accounts', icon: <UserOutlined />, label: '账户列表' },
+  { key: '/phone-numbers', icon: <PhoneOutlined />, label: '手机号管理' },
   { key: '/accounts/new', icon: <PlusOutlined />, label: '添加账户' },
   { key: '/settings', icon: <SettingOutlined />, label: '系统设置' },
 ];
@@ -81,6 +83,7 @@ export default function AppLayout() {
   const selectedKey = (() => {
     const path = location.pathname;
     if (path === '/') return '/';
+    if (path.startsWith('/phone-numbers')) return '/phone-numbers';
     if (path.startsWith('/accounts/new')) return '/accounts/new';
     if (path.startsWith('/accounts')) return '/accounts';
     if (path.startsWith('/settings')) return '/settings';

@@ -1,7 +1,8 @@
 import type { PrismaClient } from "@prisma/client";
 import type { DingtonePhoneNumber } from "./dingtone/types.js";
 import { getSettingsMap } from "./settings.service.js";
-import { telegramService } from "./telegram.js";
+import { TelegramApiError, telegramService } from "./telegram.js";
+import { escapeTelegramHtml, limitTelegramMessage } from "./telegram-bot-ui.js";
 
 type TelegramDb = Pick<PrismaClient, "dtAccount">;
 
@@ -43,40 +44,15 @@ type PointStoreNotificationInput = {
 
 export async function sendSmsTelegramNotification(input: SmsNotificationInput) {
   const code = extractVerificationCode(input.content);
-  return sendAccountTelegramNotification(
-    input.account,
-    code ? "验证码短信" : "新短信",
-    [
-      ["账号", deriveAccountName(input.account)],
-      ["面板账号ID", input.account.id],
-      ["说道用户ID", input.account.dtUserId],
-      ["接收号码", input.toNumber ?? input.account.phone],
-      ["发送方", input.fromNumber],
-      ["验证码", code],
-      ["短信内容", input.content],
-      ["接收时间", formatTelegramTime(input.receivedAt)]
-    ],
-    code ? buildCopyCodeReplyMarkup(code) : undefined
-  );
+  return sendPreparedTelegramNotification(input.account, buildSmsTelegramNotificationText(input), code ? buildCopyCodeReplyMarkup(code) : undefined);
 }
 
 export async function sendPhoneTelegramNotification(input: PhoneNotificationInput) {
-  return sendAccountTelegramNotification(input.account, phoneActionTitle(input.action ?? "purchase"), buildPhoneTelegramNotificationFields(input));
+  return sendPreparedTelegramNotification(input.account, buildPhoneTelegramNotificationText(input));
 }
 
 export async function sendPointStoreTelegramNotification(input: PointStoreNotificationInput) {
-  return sendAccountTelegramNotification(input.account, pointStoreNotificationTitle(input.status), [
-    ["账号", deriveAccountName(input.account)],
-    ["面板账号ID", input.account.id],
-    ["说道用户ID", input.account.dtUserId],
-    ["兑换邮箱", input.email],
-    ["兑换商品", input.productName],
-    ["商品 ID", input.productId],
-    ["消耗积分", input.productPrice],
-    ["订单 ID", input.orderId],
-    ["订单状态", input.status],
-    ["兑换时间", formatTelegramTime(input.orderTime)]
-  ]);
+  return sendPreparedTelegramNotification(input.account, buildPointStoreTelegramNotificationText(input));
 }
 
 export function pointStoreNotificationTitle(status: string) {
@@ -98,12 +74,35 @@ export function buildPhoneTelegramNotificationText(input: PhoneNotificationInput
   return formatAccountNotification(input.account, phoneActionTitle(action), buildPhoneTelegramNotificationFields(input));
 }
 
+export function buildSmsTelegramNotificationText(input: SmsNotificationInput) {
+  const code = extractVerificationCode(input.content);
+  return [
+    `<b>🔐 ${code ? "验证码短信" : "新短信"}</b>`,
+    formatAccountLine(input.account),
+    `目标号码：<code>${escapeTelegramHtml(input.toNumber ?? "-")}</code>`,
+    `发送方：${escapeTelegramHtml(input.fromNumber ?? "-")}`,
+    ...(code ? [`验证码：<code>${escapeTelegramHtml(code)}</code>`] : []),
+    `内容：${escapeTelegramHtml(input.content)}`,
+    `接收时间：${escapeTelegramHtml(formatTelegramTime(input.receivedAt))}`
+  ].join("\n");
+}
+
+export function buildPointStoreTelegramNotificationText(input: PointStoreNotificationInput) {
+  return formatAccountNotification(input.account, pointStoreNotificationTitle(input.status), [
+    ["兑换邮箱", input.email],
+    ["兑换商品", input.productName],
+    ["商品 ID", input.productId],
+    ["消耗积分", input.productPrice],
+    ["订单 ID", input.orderId],
+    ["订单状态", input.status],
+    ["兑换时间", formatTelegramTime(input.orderTime)]
+  ]);
+}
+
 function buildPhoneTelegramNotificationFields(input: PhoneNotificationInput): Array<[string, string | number | null | undefined]> {
   const action = input.action ?? "purchase";
   const title = phoneActionTitle(action);
   return [
-    ["通知类型", title],
-    ["面板账号ID", input.account.id],
     ["说道用户ID", input.account.dtUserId],
     ["绑定手机", input.account.phone],
     ["邮箱", input.account.email],
@@ -123,6 +122,10 @@ export async function sendAccountTelegramNotification(
   fields: Array<[string, string | number | null | undefined]>,
   replyMarkup?: unknown
 ) {
+  return sendPreparedTelegramNotification(account, formatAccountNotification(account, type, fields), replyMarkup);
+}
+
+async function sendPreparedTelegramNotification(account: NotifyAccount, text: string, replyMarkup?: unknown) {
   if (!account.telegramNotify) {
     return "";
   }
@@ -134,18 +137,34 @@ export async function sendAccountTelegramNotification(
   const payload = {
     botToken: settings.telegram_bot_token,
     chatId: settings.telegram_chat_id,
-    text: formatAccountNotification(account, type, fields),
+    text: limitTelegramMessage(text),
     apiBaseUrl: settings.telegram_api_base_url,
-    replyMarkup
+    replyMarkup,
+    parseMode: "HTML" as const
   };
+  return sendTelegramNotificationWithMarkupFallback(payload);
+}
+
+export async function sendTelegramNotificationWithMarkupFallback(
+  payload: Parameters<typeof telegramService.sendMessage>[0],
+  api: Pick<typeof telegramService, "sendMessage"> = telegramService
+) {
   try {
-    return await telegramService.sendMessage(payload);
+    return await api.sendMessage(payload);
   } catch (error) {
-    if (replyMarkup) {
-      return telegramService.sendMessage({ ...payload, replyMarkup: undefined });
+    if (payload.replyMarkup && isUnsupportedTelegramCopyMarkup(error)) {
+      return api.sendMessage({ ...payload, replyMarkup: undefined });
     }
     throw error;
   }
+}
+
+function isUnsupportedTelegramCopyMarkup(error: unknown) {
+  if (!(error instanceof TelegramApiError)) return false;
+  if (error.status !== 400 && error.telegramErrorCode !== 400) return false;
+  return /copy_text|button[_\s-]*type(?:[_\s-]+is)?[_\s-]*(?:invalid|unsupported|not[_\s-]*supported)|(?:invalid|unsupported|not supported)[^\r\n]*button[_\s-]*type/i.test(
+    error.description
+  );
 }
 
 export async function findNotifyAccount(db: TelegramDb, accountId: number) {
@@ -167,13 +186,25 @@ function formatAccountNotification(
   type: string,
   fields: Array<[string, string | number | null | undefined]>
 ) {
-  const title = `${deriveAccountName(account)} - ${type}`;
-  const lines = [`【${title}】`, ""];
+  const lines = [`<b>🔔 ${escapeTelegramHtml(type)}</b>`, formatAccountLine(account)];
   for (const [label, value] of fields) {
     const normalized = value === null || value === undefined || value === "" ? "-" : String(value);
-    lines.push(`${label}: ${normalized}`);
+    lines.push(formatNotificationField(label, normalized));
   }
   return lines.join("\n");
+}
+
+function formatAccountLine(account: NotifyAccount) {
+  return `账号：${escapeTelegramHtml(deriveAccountName(account))} <code>#${account.id}</code>`;
+}
+
+function formatNotificationField(label: string, value: string) {
+  const escapedLabel = escapeTelegramHtml(label);
+  const escapedValue = escapeTelegramHtml(value);
+  if (/手机号|号码|验证码/.test(label) && value !== "-") {
+    return `${escapedLabel}：<code>${escapedValue}</code>`;
+  }
+  return `${escapedLabel}：${escapedValue}`;
 }
 
 function deriveAccountName(input: { nickname?: string | null; email?: string | null; phone?: string | null; dtUserId?: string | null }) {
@@ -233,7 +264,7 @@ function extractVerificationCode(content: string) {
   return content.match(/\b\d{4,8}\b/)?.[0] ?? null;
 }
 
-function buildCopyCodeReplyMarkup(code: string) {
+export function buildCopyCodeReplyMarkup(code: string) {
   return {
     inline_keyboard: [
       [

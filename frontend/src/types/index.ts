@@ -264,6 +264,50 @@ export interface PhoneNumber {
   updated_at: string;
 }
 
+export interface PhoneInventoryPhone extends Omit<PhoneNumber, 'raw_json'> {
+  area_code: number | null;
+  package_service_id: string | null;
+  price: number | null;
+  iso_country_code: string | null;
+  city_name: string | null;
+  state_name: string | null;
+}
+
+export interface PhoneInventoryGroup {
+  account: {
+    id: number;
+    nickname: string | null;
+    app_variant: AppVariant;
+    status: AccountStatus;
+    monitor_enabled: boolean;
+    telegram_notify: boolean;
+    sort_order: number;
+  };
+  phones: PhoneInventoryPhone[];
+}
+
+export interface PhoneInventoryResponse {
+  summary: {
+    total: number;
+    active: number;
+    account_count: number;
+    expiring_soon: number;
+  };
+  groups: PhoneInventoryGroup[];
+}
+
+export interface PhoneInventoryRefreshResult {
+  success: number;
+  failed: number;
+  skipped: number;
+  results: Array<{
+    account_id: number;
+    status: 'success' | 'failed' | 'skipped';
+    phone_count: number;
+    error: string | null;
+  }>;
+}
+
 export interface PhoneSmsReceptionRepairResult {
   checked: number;
   repaired: number;

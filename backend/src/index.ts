@@ -8,7 +8,8 @@ import { prisma } from "./lib/prisma.js";
 import { authRouter } from "./routes/auth.js";
 import { dashboardRouter } from "./routes/dashboard.js";
 import { eventsRouter } from "./routes/events.js";
-import { accountsRouter } from "./routes/accounts.js";
+import { accountsRouter, syncPhoneNumbersFromRemote } from "./routes/accounts.js";
+import { createPhoneNumbersRouter } from "./routes/phone-numbers.js";
 import { codeReceiverRouter } from "./routes/code-receiver.js";
 import { settingsRouter } from "./routes/settings.js";
 import { versionRouter } from "./routes/version.js";
@@ -44,6 +45,7 @@ process.on("uncaughtException", (error) => {
 });
 
 const app = express();
+const phoneNumbersRouter = createPhoneNumbersRouter(syncPhoneNumbersFromRemote);
 
 app.use(helmet());
 app.use(
@@ -84,6 +86,7 @@ app.use("/api/auth", authRouter);
 app.use("/api/events", eventsRouter);
 app.use("/api/dashboard", requireAuth, dashboardRouter);
 app.use("/api/accounts", requireAuth, accountsRouter);
+app.use("/api/phone-numbers", requireAuth, phoneNumbersRouter);
 app.use("/api/code-receiver", codeReceiverRouter);
 app.use("/api/settings", requireAuth, settingsRouter);
 app.use("/api/version", requireAuth, versionRouter);

@@ -14,6 +14,9 @@ import type {
   MonitorSession,
   PagedData,
   PhoneNumber,
+  PhoneInventoryRefreshResult,
+  PhoneInventoryResponse,
+  PhoneStatus,
   PhoneActionResult,
   PhoneSmsReceptionRepairResult,
   PhoneCountryOption,
@@ -40,6 +43,19 @@ import type {
 } from '../types';
 type CacheOptions = { force?: boolean };
 const PAGE_NAVIGATION_TIMEOUT_MS = 30_000;
+
+export function createLatestRequestGuard() {
+  let latestRequestId = 0;
+  return {
+    begin() {
+      latestRequestId += 1;
+      return latestRequestId;
+    },
+    isLatest(requestId: number) {
+      return requestId === latestRequestId;
+    },
+  };
+}
 
 export const CACHE_TTL_MS = {
   dashboard: 60_000,
@@ -69,6 +85,7 @@ export const cacheKeys = {
     },
   ) => makeCacheKey(`account:${accountId}:messages`, params ?? {}),
   phoneNumbers: (accountId: number) => `account:${accountId}:phone-numbers`,
+  phoneInventory: (params?: Record<string, unknown>) => makeCacheKey('phone-inventory:all', params ?? {}),
   settings: 'settings:all',
 };
 
@@ -77,6 +94,7 @@ export { invalidateCachedData, isCachedDataFresh, readCachedData };
 function invalidateAccountCaches(accountId?: number) {
   invalidateCachedData('dashboard:');
   invalidateCachedData('accounts:');
+  invalidateCachedData('phone-inventory:');
   if (accountId !== undefined) {
     invalidateCachedData(`account:${accountId}:`);
   }
@@ -439,11 +457,35 @@ export async function getPhoneNumbers(accountId: number, options?: CacheOptions)
   }, options);
 }
 
+export async function getPhoneInventory(
+  params?: { keyword?: string; status?: PhoneStatus; country_code?: number; provider_id?: number },
+  options?: CacheOptions,
+) {
+  return fetchCachedData(cacheKeys.phoneInventory(params), CACHE_TTL_MS.phoneNumbers, async () => {
+    const res = await api.get<ApiResponse<PhoneInventoryResponse>>('/phone-numbers', {
+      params,
+      timeout: PAGE_NAVIGATION_TIMEOUT_MS,
+    });
+    return res.data.data;
+  }, options);
+}
+
+export async function refreshAllPhoneNumbers() {
+  const res = await api.post<ApiResponse<PhoneInventoryRefreshResult>>(
+    '/phone-numbers/refresh-all',
+    { confirm: true },
+    { timeout: 180_000 },
+  );
+  invalidateAccountCaches();
+  invalidateCachedData('account:');
+  return res.data.data;
+}
+
 export async function syncPhoneNumbers(accountId: number) {
   const res = await api.post<ApiResponse<{ phone_numbers: PhoneNumber[]; refresh_error: string | null; cached: boolean }>>(
     `/accounts/${accountId}/phone-numbers/sync`,
     undefined,
-    { timeout: 12_000 },
+    { timeout: 120_000 },
   );
   invalidateAccountCaches(accountId);
   return res.data.data;

@@ -1,4 +1,4 @@
-import { PhoneStatus, type Prisma, type AccountSnapshot } from "@prisma/client";
+import type { AccountSnapshot } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { AppError, assertFound } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
@@ -7,6 +7,7 @@ import { decryptText } from "../utils/crypto.js";
 import { dingtoneGateway } from "./dingtone/index.js";
 import { RealDingtoneGateway } from "./dingtone/real-gateway.js";
 import type { DingtoneGateway, DingtonePhoneNumber, DingtoneSnapshot } from "./dingtone/types.js";
+import { syncPhoneNumbers } from "./phone-number-store.js";
 import { enrichSnapshotWithPublicData } from "./public-account-enrichment.js";
 import { getGatewayMode } from "./settings.service.js";
 import { readPointSnapshotFromAdb } from "./adb-point-snapshot.js";
@@ -169,41 +170,6 @@ export async function refreshAccountRuntimeData(
       membershipType: gatewaySnapshot?.membershipType ?? gatewaySnapshot?.membershipLevelLabel ?? null
     }
   };
-}
-
-async function syncPhoneNumbers(accountId: number, phoneNumbers: DingtonePhoneNumber[]) {
-  const remoteSet = new Set<string>();
-  for (const item of phoneNumbers) {
-    if (!item.phoneNumber) {
-      continue;
-    }
-    remoteSet.add(item.phoneNumber);
-    await prisma.phoneNumber.upsert({
-      where: {
-        accountId_phoneNumber: {
-          accountId,
-          phoneNumber: item.phoneNumber
-        }
-      },
-      update: mapPhoneNumberPatch(item),
-      create: mapPhoneNumberCreate(accountId, item)
-    });
-  }
-
-  const missingCount = remoteSet.size
-    ? await prisma.phoneNumber.count({
-        where: {
-          accountId,
-          phoneNumber: { notIn: Array.from(remoteSet) }
-        }
-      })
-    : 0;
-  if (missingCount > 0) {
-    logger.warn("Remote phone list did not include some local phone records; keeping them until an explicit cancel/expire action verifies removal", {
-      accountId,
-      missingCount
-    });
-  }
 }
 
 function mapSnapshot(snapshot: DingtoneSnapshot, previousSnapshot?: AccountSnapshot | null) {
@@ -411,37 +377,6 @@ function pickStringFromRecord(record: Record<string, unknown> | null, keys: stri
     }
   }
   return null;
-}
-
-function mapPhoneNumberBase(item: Partial<DingtonePhoneNumber>) {
-  return {
-    countryCode: item.countryCode,
-    providerId: item.providerId,
-    displayName: item.displayName,
-    status: item.status ? (item.status as PhoneStatus) : undefined,
-    purchaseType: item.purchaseType,
-    payType: item.payType,
-    validPeriodDays: item.validPeriodDays,
-    gainTime: item.gainTime,
-    expiredTime: item.expiredTime,
-    autoRenew: item.autoRenew ?? false,
-    isPrimary: item.isPrimary ?? false,
-    isGoodNumber: item.isGoodNumber ?? false,
-    portoutInfo: item.portoutInfo,
-    rawJson: item.rawJson ?? JSON.stringify(item)
-  };
-}
-
-function mapPhoneNumberCreate(accountId: number, item: DingtonePhoneNumber): Prisma.PhoneNumberUncheckedCreateInput {
-  return {
-    accountId,
-    phoneNumber: item.phoneNumber,
-    ...mapPhoneNumberBase(item)
-  };
-}
-
-function mapPhoneNumberPatch(item: Partial<DingtonePhoneNumber>): Prisma.PhoneNumberUncheckedUpdateInput {
-  return mapPhoneNumberBase(item);
 }
 
 function normalizeOptionalString(value: string | null | undefined) {

@@ -824,12 +824,15 @@ function checkTelegramCommandErrorWrapping() {
   ];
   const missing = wrappedFunctions.filter((name) => !functionBodyIncludes(botText, name, "withTelegramCommandError"));
   const callbackSafe =
-    botText.includes("await handlePanelCallbackSafe(callback.data)") &&
-    functionBodyIncludes(botText, "handlePanelCallbackSafe", "Telegram bot callback failed") &&
-    functionBodyIncludes(botText, "handlePanelCallbackSafe", "操作失败：${errorMessage(error)}");
+    botText.includes("parseTelegramCallback(callback.data)") &&
+    botText.includes("await handleTelegramCallbackSafe(parsed)") &&
+    botText.includes("replyToCallback") &&
+    botText.includes("editMessageText") &&
+    functionBodyIncludes(botText, "handleTelegramCallbackSafe", "Telegram bot callback failed") &&
+    functionBodyIncludes(botText, "handleTelegramCallbackSafe", "sanitizeTelegramError(errorMessage(error))");
   return {
     name: "telegram_command_error_wrapping",
-    ok: missing.length === 0 && callbackSafe && botText.includes("操作失败：${errorMessage(error)}"),
+    ok: missing.length === 0 && callbackSafe && botText.includes("if (!parsed)") && botText.includes("rootPanelReply"),
     detail: {
       missing,
       callbackSafe
@@ -1762,32 +1765,19 @@ function checkPhoneTelegramNotifications() {
     verificationNote: "Action was confirmed by polling the remote purchased phone list until the number disappeared or returned cancelled."
   });
   const currentNotificationCopyOk =
-    purchaseText.includes("新手机号: 33700000000") &&
-    purchaseText.includes("验证来源: remote_phone_list") &&
-    pauseText.includes("通知类型: 暂停号码") &&
-    pauseText.includes("号码状态: paused") &&
-    renewText.includes("通知类型: 续费号码") &&
-    renewText.includes("号码状态: active") &&
-    cancelText.includes("通知类型: 取消号码") &&
-    cancelText.includes("号码状态: cancelled");
+    purchaseText.includes("获取新号码") &&
+    purchaseText.includes("<code>33700000000</code>") &&
+    purchaseText.includes("remote_phone_list") &&
+    pauseText.includes("暂停号码") &&
+    pauseText.includes("<code>paused</code>") &&
+    renewText.includes("续费号码") &&
+    renewText.includes("<code>active</code>") &&
+    cancelText.includes("取消号码") &&
+    cancelText.includes("<code>cancelled</code>");
 
   return {
     name: "phone_telegram_notifications",
-    ok: currentNotificationCopyOk ||
-      purchaseText.includes("3700000000") &&
-      purchaseText.includes("鏂版墜鏈哄彿锛?3700000000") &&
-      purchaseText.includes("楠岃瘉鏉ユ簮锛歳emote_phone_list") &&
-      pauseText.includes("鏆傚仠鍙风爜") &&
-      pauseText.includes("鎵嬫満鍙凤細33700000000") &&
-      pauseText.includes("鍙风爜鐘舵€侊細paused") &&
-      pauseText.includes("楠岃瘉璇存槑锛欰ction was confirmed") &&
-      renewText.includes("缁垂鍙风爜") &&
-      renewText.includes("鎵嬫満鍙凤細33700000000") &&
-      renewText.includes("鍙风爜鐘舵€侊細active") &&
-      renewText.includes("expiry time advanced") &&
-      cancelText.includes("鍙栨秷鍙风爜") &&
-      cancelText.includes("鍙风爜鐘舵€侊細cancelled") &&
-      cancelText.includes("disappeared or returned cancelled"),
+    ok: currentNotificationCopyOk,
     detail: {
       purchaseText,
       pauseText,

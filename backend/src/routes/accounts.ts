@@ -21,6 +21,12 @@ import { dingtoneGateway } from "../services/dingtone/index.js";
 import { RealDingtoneGateway } from "../services/dingtone/real-gateway.js";
 import { dumpHelperSmsMessages, executeHelperAction, executeHelperActionWithRetry, getCachedPrivateNumberEvent } from "../services/helper-bridge.js";
 import { refreshAccountRuntimeData } from "../services/account-runtime.js";
+import {
+  mapPhoneNumberBase,
+  mapPhoneNumberCreate,
+  mapPhoneNumberPatch,
+  syncPhoneNumbers
+} from "../services/phone-number-store.js";
 import { getAccountPoint } from "../services/point.js";
 import {
   getAccountPointStore,
@@ -1564,7 +1570,11 @@ accountsRouter.post("/:id/phone-numbers/sync", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);
     const phoneNumbers = await syncPhoneNumbersFromRemote(accountId);
-    ok(res, phoneNumbers.map(serializePhoneNumber));
+    ok(res, {
+      phone_numbers: phoneNumbers.map(serializePhoneNumber),
+      refresh_error: null,
+      cached: false
+    });
   } catch (error) {
     next(error);
   }
@@ -2781,7 +2791,7 @@ async function previewPhoneNumbers(accountId: number, payload: unknown) {
   }
 }
 
-async function syncPhoneNumbersFromRemote(accountId: number) {
+export async function syncPhoneNumbersFromRemote(accountId: number) {
   const account = await assertAccount(accountId);
   const directAccount = {
     dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
@@ -4307,41 +4317,6 @@ function formatRefreshSampleTime(sample: HelperSmsMessageRecord | null) {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
-async function syncPhoneNumbers(accountId: number, phoneNumbers: DingtonePhoneNumber[]) {
-  const remoteSet = new Set<string>();
-  for (const item of phoneNumbers) {
-    if (!item.phoneNumber) {
-      continue;
-    }
-    remoteSet.add(item.phoneNumber);
-    await prisma.phoneNumber.upsert({
-      where: {
-        accountId_phoneNumber: {
-          accountId,
-          phoneNumber: item.phoneNumber
-        }
-      },
-      update: mapPhoneNumberPatch(item),
-      create: mapPhoneNumberCreate(accountId, item)
-    });
-  }
-
-  const missingCount = remoteSet.size
-    ? await prisma.phoneNumber.count({
-        where: {
-          accountId,
-          phoneNumber: { notIn: Array.from(remoteSet) }
-        }
-      })
-    : 0;
-  if (missingCount > 0) {
-    logger.warn("Remote phone sync omitted local phone records; keeping local rows instead of deleting them", {
-      accountId,
-      missingCount
-    });
-  }
-}
-
 function chooseMergedAccountStatus(current: AccountStatus, duplicate: AccountStatus) {
   const order: AccountStatus[] = [
     AccountStatus.online,
@@ -5067,25 +5042,6 @@ function pickNextNumber(next: number | null | undefined, previous: number | null
   return Number.isFinite(next) ? next : Number.isFinite(previous) ? previous : null;
 }
 
-function mapPhoneNumberBase(item: Partial<DingtonePhoneNumber>) {
-  return {
-    countryCode: item.countryCode,
-    providerId: item.providerId,
-    displayName: item.displayName,
-    status: item.status ? (item.status as PhoneStatus) : undefined,
-    purchaseType: item.purchaseType,
-    payType: item.payType,
-    validPeriodDays: item.validPeriodDays,
-    gainTime: item.gainTime,
-    expiredTime: item.expiredTime,
-    autoRenew: item.autoRenew ?? false,
-    isPrimary: item.isPrimary ?? false,
-    isGoodNumber: item.isGoodNumber ?? false,
-    portoutInfo: item.portoutInfo,
-    rawJson: item.rawJson ?? JSON.stringify(item)
-  };
-}
-
 function mapStoredPhoneNumber(phone: {
   countryCode: number | null;
   providerId: number | null;
@@ -5168,18 +5124,6 @@ function mapStoredSnapshot(snapshot: {
     profileVerCode: snapshot.profileVerCode,
     rawJson: snapshot.rawJson
   };
-}
-
-function mapPhoneNumberCreate(accountId: number, item: DingtonePhoneNumber): Prisma.PhoneNumberUncheckedCreateInput {
-  return {
-    accountId,
-    phoneNumber: item.phoneNumber,
-    ...mapPhoneNumberBase(item)
-  };
-}
-
-function mapPhoneNumberPatch(item: Partial<DingtonePhoneNumber>): Prisma.PhoneNumberUncheckedUpdateInput {
-  return mapPhoneNumberBase(item);
 }
 
 async function assertAccount(accountId: number) {

@@ -1,0 +1,153 @@
+export type TelegramPanelCallback =
+  | { scope: "panel"; action: "root" | "status" | "messages" | "help" }
+  | { scope: "panel"; action: "accounts" | "phones"; page: number }
+  | {
+      scope: "account";
+      action:
+        | "detail"
+        | "messages"
+        | "refresh"
+        | "refresh_phones"
+        | "monitor_on"
+        | "monitor_off"
+        | "notify_on"
+        | "notify_off";
+      accountId: number;
+    }
+  | { scope: "account"; action: "phones"; accountId: number; page: number }
+  | { scope: "phone"; action: "detail" | "note"; accountId: number; phoneId: number };
+
+const PANEL_CODES = {
+  root: "r",
+  status: "s",
+  messages: "m",
+  help: "h",
+  accounts: "a",
+  phones: "n"
+} as const;
+
+const ACCOUNT_CODES = {
+  detail: "d",
+  messages: "m",
+  phones: "n",
+  refresh: "r",
+  refresh_phones: "f",
+  monitor_on: "o1",
+  monitor_off: "o0",
+  notify_on: "t1",
+  notify_off: "t0"
+} as const;
+
+const PHONE_CODES = {
+  detail: "d",
+  note: "e"
+} as const;
+
+export function encodeTelegramCallback(callback: TelegramPanelCallback) {
+  let encoded: string;
+  if (callback.scope === "panel") {
+    const base = `p:${PANEL_CODES[callback.action]}`;
+    encoded = "page" in callback ? `${base}:${positiveInteger(callback.page, "page")}` : base;
+  } else if (callback.scope === "account") {
+    const accountId = positiveInteger(callback.accountId, "accountId");
+    const base = `a:${accountId}:${ACCOUNT_CODES[callback.action]}`;
+    encoded = "page" in callback ? `${base}:${positiveInteger(callback.page, "page")}` : base;
+  } else {
+    encoded = `n:${positiveInteger(callback.accountId, "accountId")}:${positiveInteger(callback.phoneId, "phoneId")}:${PHONE_CODES[callback.action]}`;
+  }
+
+  if (Buffer.byteLength(encoded, "utf8") > 64) {
+    throw new RangeError("Telegram callback_data exceeds 64 bytes");
+  }
+  return encoded;
+}
+
+export function parseTelegramCallback(value: string | undefined): TelegramPanelCallback | null {
+  if (!value) return null;
+  const parts = value.split(":");
+
+  if (parts[0] === "p") {
+    const action = panelAction(parts[1]);
+    if (!action) return null;
+    if (action === "accounts" || action === "phones") {
+      const page = parsePositiveInteger(parts[2]);
+      return parts.length === 3 && page ? { scope: "panel", action, page } : null;
+    }
+    return parts.length === 2 ? { scope: "panel", action } : null;
+  }
+
+  if (parts[0] === "a") {
+    const accountId = parsePositiveInteger(parts[1]);
+    const action = accountAction(parts[2]);
+    if (!accountId || !action) return null;
+    if (action === "phones") {
+      const page = parsePositiveInteger(parts[3]);
+      return parts.length === 4 && page ? { scope: "account", action, accountId, page } : null;
+    }
+    return parts.length === 3 ? { scope: "account", action, accountId } : null;
+  }
+
+  if (parts[0] === "n") {
+    const accountId = parsePositiveInteger(parts[1]);
+    const phoneId = parsePositiveInteger(parts[2]);
+    const action = phoneAction(parts[3]);
+    return parts.length === 4 && accountId && phoneId && action
+      ? { scope: "phone", action, accountId, phoneId }
+      : null;
+  }
+
+  return null;
+}
+
+export function paginateTelegramItems<T>(items: readonly T[], requestedPage: number, pageSize: number) {
+  if (!Number.isSafeInteger(pageSize) || pageSize <= 0) {
+    throw new RangeError("Telegram page size must be a positive integer");
+  }
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const normalizedPage = Number.isSafeInteger(requestedPage) ? requestedPage : 1;
+  const page = Math.min(Math.max(normalizedPage, 1), totalPages);
+  const start = (page - 1) * pageSize;
+  return { items: items.slice(start, start + pageSize), page, totalPages };
+}
+
+function positiveInteger(value: number, field: string) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new RangeError(`${field} must be a positive integer`);
+  }
+  return value;
+}
+
+function parsePositiveInteger(value: string | undefined) {
+  if (!value || !/^[1-9]\d*$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function panelAction(value: string | undefined) {
+  if (value === PANEL_CODES.root) return "root" as const;
+  if (value === PANEL_CODES.status) return "status" as const;
+  if (value === PANEL_CODES.messages) return "messages" as const;
+  if (value === PANEL_CODES.help) return "help" as const;
+  if (value === PANEL_CODES.accounts) return "accounts" as const;
+  if (value === PANEL_CODES.phones) return "phones" as const;
+  return null;
+}
+
+function accountAction(value: string | undefined) {
+  if (value === ACCOUNT_CODES.detail) return "detail" as const;
+  if (value === ACCOUNT_CODES.messages) return "messages" as const;
+  if (value === ACCOUNT_CODES.phones) return "phones" as const;
+  if (value === ACCOUNT_CODES.refresh) return "refresh" as const;
+  if (value === ACCOUNT_CODES.refresh_phones) return "refresh_phones" as const;
+  if (value === ACCOUNT_CODES.monitor_on) return "monitor_on" as const;
+  if (value === ACCOUNT_CODES.monitor_off) return "monitor_off" as const;
+  if (value === ACCOUNT_CODES.notify_on) return "notify_on" as const;
+  if (value === ACCOUNT_CODES.notify_off) return "notify_off" as const;
+  return null;
+}
+
+function phoneAction(value: string | undefined) {
+  if (value === PHONE_CODES.detail) return "detail" as const;
+  if (value === PHONE_CODES.note) return "note" as const;
+  return null;
+}

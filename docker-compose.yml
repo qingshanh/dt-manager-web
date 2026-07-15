@@ -13,7 +13,7 @@ services:
     environment:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: ${BACKEND_INTERNAL_PORT:-5174}
-      APP_VERSION: ${APP_VERSION:-0.2.4}
+      APP_VERSION: ${APP_VERSION:-0.2.5}
       DATABASE_URL: file:/app/data/dingtone.db
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173,http://127.0.0.1:5173}
     volumes:
@@ -35,8 +35,8 @@ services:
         NODE_IMAGE: ${DOCKER_NODE_IMAGE:-docker.hanxi.cc/library/node:22-alpine}
         NGINX_IMAGE: ${DOCKER_NGINX_IMAGE:-docker.hanxi.cc/library/nginx:1.27-alpine}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
-        APP_VERSION: ${APP_VERSION:-0.2.4}
-        VITE_APP_VERSION: ${VITE_APP_VERSION:-0.2.4}
+        APP_VERSION: ${APP_VERSION:-0.2.5}
+        VITE_APP_VERSION: ${VITE_APP_VERSION:-0.2.5}
     depends_on:
       - backend
     environment:

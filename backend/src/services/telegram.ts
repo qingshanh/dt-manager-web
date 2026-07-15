@@ -2,17 +2,64 @@ import { AppError } from "../utils/errors.js";
 
 const TELEGRAM_API_TIMEOUT_MS = 8_000;
 
+export type TelegramParseMode = "HTML";
+
+export class TelegramApiError extends AppError {
+  readonly status: number;
+  readonly description: string;
+  readonly telegramErrorCode: number | null;
+  readonly method: string;
+
+  constructor(input: {
+    method: string;
+    status: number;
+    description?: string;
+    telegramErrorCode?: number | null;
+  }) {
+    const telegramErrorCode = input.telegramErrorCode ?? null;
+    super(`Telegram ${input.method} failed: ${telegramErrorCode ?? input.status}`, 502, 502);
+    this.name = "TelegramApiError";
+    this.method = input.method;
+    this.status = input.status;
+    this.description = input.description ?? "";
+    this.telegramErrorCode = telegramErrorCode;
+  }
+}
+
+type TelegramMessageInput = {
+  botToken: string;
+  chatId: string;
+  text: string;
+  apiBaseUrl?: string | null;
+  replyMarkup?: unknown;
+  parseMode?: TelegramParseMode;
+};
+
 export class TelegramService {
-  async sendMessage(input: { botToken: string; chatId: string; text: string; apiBaseUrl?: string | null; replyMarkup?: unknown }) {
+  async sendMessage(input: TelegramMessageInput) {
     if (!input.botToken || !input.chatId) {
       throw new AppError("Telegram config is incomplete", 400, 400);
     }
     const json = await this.callApi<{ result?: { message_id?: number } }>(input.botToken, "sendMessage", {
       chat_id: input.chatId,
       text: input.text,
+      ...(input.parseMode ? { parse_mode: input.parseMode } : {}),
       ...(input.replyMarkup ? { reply_markup: input.replyMarkup } : {})
     }, input.apiBaseUrl);
     return json.result?.message_id?.toString() ?? "";
+  }
+
+  async editMessageText(input: TelegramMessageInput & { messageId: number }) {
+    if (!input.botToken || !input.chatId || !Number.isSafeInteger(input.messageId) || input.messageId <= 0) {
+      throw new AppError("Telegram edit config is incomplete", 400, 400);
+    }
+    await this.callApi(input.botToken, "editMessageText", {
+      chat_id: input.chatId,
+      message_id: input.messageId,
+      text: input.text,
+      ...(input.parseMode ? { parse_mode: input.parseMode } : {}),
+      ...(input.replyMarkup ? { reply_markup: input.replyMarkup } : {})
+    }, input.apiBaseUrl);
   }
 
   async setMyCommands(input: {
@@ -62,10 +109,26 @@ export class TelegramService {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(TELEGRAM_API_TIMEOUT_MS)
     });
-    if (!response.ok) {
-      throw new AppError(`Telegram ${method} failed: ${response.status}`, 502, 502);
+
+    let json: unknown;
+    try {
+      json = await response.json();
+    } catch (error) {
+      if (!response.ok) {
+        throw new TelegramApiError({ method, status: response.status });
+      }
+      throw error;
     }
-    return (await response.json()) as T;
+
+    if (!response.ok || isTelegramFailureResponse(json)) {
+      throw new TelegramApiError({
+        method,
+        status: response.status,
+        description: telegramDescription(json),
+        telegramErrorCode: telegramErrorCode(json)
+      });
+    }
+    return json as T;
   }
 }
 
@@ -113,4 +176,22 @@ export type TelegramUpdate = {
 function normalizeTelegramBaseUrl(value?: string | null) {
   const trimmed = value?.trim();
   return trimmed ? trimmed.replace(/\/+$/, "") : "https://api.telegram.org";
+}
+
+function isTelegramFailureResponse(value: unknown) {
+  return isRecord(value) && value.ok === false;
+}
+
+function telegramDescription(value: unknown) {
+  return isRecord(value) && typeof value.description === "string" ? value.description : "";
+}
+
+function telegramErrorCode(value: unknown) {
+  if (!isRecord(value)) return null;
+  const errorCode = value.error_code;
+  return typeof errorCode === "number" && Number.isSafeInteger(errorCode) && errorCode > 0 ? errorCode : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

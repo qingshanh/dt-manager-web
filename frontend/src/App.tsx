@@ -9,6 +9,7 @@ const Dashboard = lazy(() => import('./pages/Dashboard'));
 const AccountList = lazy(() => import('./pages/AccountList'));
 const AccountAdd = lazy(() => import('./pages/AccountAdd'));
 const AccountDetail = lazy(() => import('./pages/AccountDetail'));
+const PhoneInventory = lazy(() => import('./pages/PhoneInventory'));
 const PointStore = lazy(() => import('./pages/PointStore'));
 const Settings = lazy(() => import('./pages/Settings'));
 
@@ -98,6 +99,7 @@ export default function App() {
         <Route path="accounts" element={<AccountList />} />
         <Route path="accounts/new" element={<AccountAdd />} />
         <Route path="accounts/:id" element={<AccountDetail />} />
+        <Route path="phone-numbers" element={<PhoneInventory />} />
         <Route path="accounts/:id/point-store" element={<PointStore />} />
         <Route path="settings" element={<Settings />} />
       </Route>
