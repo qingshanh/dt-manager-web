@@ -35,7 +35,7 @@ export default defineConfig(({ mode }) => {
   const devPort = Number(env.VITE_DEV_PORT ?? env.FRONTEND_PORT ?? 5173);
   const previewPort = Number(env.VITE_PREVIEW_PORT ?? env.FRONTEND_PREVIEW_PORT ?? 5176);
   const backendTarget = env.VITE_BACKEND_URL ?? env.BACKEND_URL ?? 'http://localhost:5174';
-  const appVersion = env.VITE_APP_VERSION || env.APP_VERSION || '0.2.5';
+  const appVersion = env.VITE_APP_VERSION || env.APP_VERSION || '0.2.6';
 
   return {
     plugins: [react()],
