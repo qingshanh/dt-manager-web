@@ -11,6 +11,7 @@ import {
   DirectDingtoneGateway,
   listenDirectSessionPushes,
   preemptDirectSessionPushListener,
+  releaseDirectAccountRuntime,
   type DirectProbeResult,
   type DirectProbePushResult,
   type DirectWebOfflineMessage
@@ -23,6 +24,8 @@ import { dumpSmsMessagesFromNotifications } from "./adb-notification-ui.js";
 import { dumpSmsMessagesFromUi, openMessagesInbox } from "./adb-message-ui.js";
 import { getGatewayMode, getSettingsMap } from "./settings.service.js";
 import { transferMonitorRunnerInPlace } from "./account-monitor-runner-transfer.js";
+import { runtimeWorkQueue } from "./runtime-work-queue.js";
+import { AppFallbackProbeGate } from "./app-fallback-gate.js";
 
 type MonitorConfig = {
   pollIntervalMs: number;
@@ -78,7 +81,18 @@ type DirectMonitorFrameState = {
 
 const directMonitorGateway = new DirectDingtoneGateway();
 let activeDirectMonitorPolls = 0;
-let appFallbackScanQueue = Promise.resolve() as Promise<unknown>;
+let offlineCatchupSequence = 0;
+const appFallbackProbeGate = new AppFallbackProbeGate({ cooldownMs: 5 * 60_000 });
+
+export type AccountMonitorRuntimeSnapshot = {
+  runnerCount: number;
+  runningCount: number;
+  shuttingDown: boolean;
+  activeDirectMonitorPolls: number;
+  appFallbackAllowed: boolean;
+  appFallbackCooldownUntil: number;
+  appFallbackProbeInFlight: boolean;
+};
 
 function monitorFailureRetryDelay(consecutiveFailures: number) {
   if (consecutiveFailures <= 0) {
@@ -93,8 +107,11 @@ export function monitorFailureRetryDelayForTest(consecutiveFailures: number) {
 
 export class AccountMonitorService {
   private runners = new Map<number, MonitorRunner>();
+  private shuttingDown = false;
+  private stopAllPromise: Promise<void> | null = null;
 
   async start(accountId: number) {
+    this.assertAcceptingNewRunners();
     const account = assertFound(
       await prisma.dtAccount.findUnique({
         where: { id: accountId }
@@ -114,6 +131,7 @@ export class AccountMonitorService {
     await this.stopDuplicateDtUserIdMonitors(accountId, account.adminId, account.dtUserId);
     await this.stop(accountId, { preserveMonitorEnabled: true, targetStatus: AccountStatus.offline, emitStatus: false });
     const monitorConfig = await this.loadMonitorConfig();
+    this.assertAcceptingNewRunners();
     const session = await prisma.monitorSession.create({
       data: {
         accountId,
@@ -122,6 +140,13 @@ export class AccountMonitorService {
         serverPort: config.DT_SERVER_PORT
       }
     });
+    if (this.shuttingDown) {
+      await prisma.monitorSession.update({
+        where: { id: session.id },
+        data: { status: MonitorStatus.stopped, stoppedAt: new Date() }
+      });
+      this.assertAcceptingNewRunners();
+    }
 
     const runner: MonitorRunner = {
       accountId,
@@ -193,6 +218,10 @@ export class AccountMonitorService {
         deviceId: account.dtDeviceId,
         appVariant: account.appVariant
       });
+      await releaseDirectAccountRuntime({
+        dtUserId: account.dtUserId,
+        deviceId: account.dtDeviceId
+      });
     }
 
     const targetStatus = options?.targetStatus ?? AccountStatus.offline;
@@ -235,6 +264,40 @@ export class AccountMonitorService {
     return Boolean(runner && !runner.stopped);
   }
 
+  snapshot(): AccountMonitorRuntimeSnapshot {
+    const fallback = appFallbackProbeGate.snapshot();
+    return {
+      runnerCount: this.runners.size,
+      runningCount: Array.from(this.runners.values()).filter((runner) => runner.running && !runner.stopped).length,
+      shuttingDown: this.shuttingDown,
+      activeDirectMonitorPolls,
+      appFallbackAllowed: config.DT_ALLOW_APP_FALLBACK,
+      appFallbackCooldownUntil: fallback.cooldownUntil,
+      appFallbackProbeInFlight: fallback.probeInFlight
+    };
+  }
+
+  async stopAll() {
+    this.shuttingDown = true;
+    if (!this.stopAllPromise) {
+      const accountIds = Array.from(this.runners.keys());
+      this.stopAllPromise = Promise.allSettled(
+        accountIds.map((accountId) => this.stop(accountId, {
+          preserveMonitorEnabled: true,
+          targetStatus: AccountStatus.offline,
+          emitStatus: false
+        }))
+      ).then(() => undefined);
+    }
+    await this.stopAllPromise;
+  }
+
+  private assertAcceptingNewRunners() {
+    if (this.shuttingDown) {
+      throw new AppError("Account monitor service is shutting down", 503, 503);
+    }
+  }
+
   async restart(accountId: number) {
     await this.stop(accountId);
     return this.start(accountId);
@@ -260,6 +323,9 @@ export class AccountMonitorService {
   }
 
   async restoreEnabled() {
+    if (this.shuttingDown) {
+      return;
+    }
     const accounts = await prisma.dtAccount.findMany({
       where: {
         monitorEnabled: true,
@@ -295,6 +361,9 @@ export class AccountMonitorService {
     const restoreTasks = accountsToRestore.map(async (account, index) => {
       if (index > 0) {
         await new Promise<void>((resolve) => setTimeout(resolve, index * restoreDelayMs));
+      }
+      if (this.shuttingDown) {
+        return;
       }
       try {
         await this.start(account.id);
@@ -385,7 +454,7 @@ export class AccountMonitorService {
   }
 
   private scheduleNext(runner: MonitorRunner, delayMs?: number) {
-    if (runner.stopped) {
+    if (runner.stopped || this.shuttingDown) {
       return;
     }
     if (runner.timer) {
@@ -399,7 +468,7 @@ export class AccountMonitorService {
 
   private async tick(accountId: number) {
     const runner = this.runners.get(accountId);
-    if (!runner || runner.stopped) {
+    if (!runner || runner.stopped || this.shuttingDown) {
       return;
     }
     if (runner.running) {
@@ -422,7 +491,7 @@ export class AccountMonitorService {
       });
     } finally {
       runner.running = false;
-      if (!runner.stopped) {
+      if (!runner.stopped && !this.shuttingDown) {
         const elapsed = Date.now() - startedAt;
         const nextDelay = runner.consecutiveFailures > 0
           ? monitorFailureRetryDelay(runner.consecutiveFailures)
@@ -471,7 +540,9 @@ export class AccountMonitorService {
       const useDirectFlow = await shouldUseDirectAccountFlow(account);
 
       if (shouldRefreshRuntimeData(runner) && !useDirectFlow) {
-        const result = await refreshAccountRuntimeData(runner.accountId, dingtoneGateway);
+        const result = await runtimeWorkQueue.run(`account-refresh:${runner.accountId}`, () =>
+          refreshAccountRuntimeData(runner.accountId, dingtoneGateway)
+        );
         phoneCount = result.phoneCount;
         runner.lastRefreshAt = Date.now();
       }
@@ -642,7 +713,8 @@ export class AccountMonitorService {
     const refreshIntervalSeconds = parsePositiveIntSetting(settings.auto_refresh_interval, config.DEFAULT_AUTO_REFRESH_INTERVAL);
     const maxRetryCount = parsePositiveIntSetting(settings.max_retry_count, config.DEFAULT_MAX_RETRY_COUNT);
     const maxConcurrentDirectPolls = parsePositiveIntSetting(settings.direct_monitor_max_concurrent, 10);
-    const appCatchupEnabled = parseBooleanSetting(settings.direct_monitor_app_catchup_enabled, true);
+    const appCatchupEnabled = config.DT_ALLOW_APP_FALLBACK
+      && parseBooleanSetting(settings.direct_monitor_app_catchup_enabled, false);
     const appUiFallbackEnabled = parseBooleanSetting(settings.direct_monitor_app_ui_fallback_enabled, false);
     const appCatchupIntervalSeconds = parsePositiveIntSetting(settings.direct_monitor_app_catchup_seconds, 45);
     return {
@@ -748,7 +820,7 @@ export class AccountMonitorService {
       }
       appCatchupInFlight = true;
       try {
-        const result = await runSerializedAppFallbackScan(() =>
+        const result = await runtimeWorkQueue.run(`app-fallback:${runner.accountId}`, () =>
           this.pollAppFallbackMessages(runner, account)
         );
         appCatchupScanned += result.scanned;
@@ -788,12 +860,6 @@ export class AccountMonitorService {
       appCatchupState.promise = promise;
       void promise;
     };
-    const appCatchupTimer = runner.appCatchupEnabled
-      ? setInterval(() => {
-          scheduleAppCatchup("interval");
-        }, runner.appCatchupIntervalMs)
-      : null;
-    appCatchupTimer?.unref?.();
     try {
       if (runner.appCatchupEnabled) {
         scheduleAppCatchup("startup");
@@ -846,9 +912,11 @@ export class AccountMonitorService {
         },
         onWebOfflineMessages: async (messages: DirectWebOfflineMessage[]) => {
           try {
-            createdMessages += await storeHelperSmsMessages(runner.accountId, messages, {
-              sendTelegram: false
-            });
+            const sequence = offlineCatchupSequence += 1;
+            createdMessages += await runtimeWorkQueue.run(
+              `offline-catchup:${runner.accountId}:${sequence}`,
+              () => storeHelperSmsMessages(runner.accountId, messages, { sendTelegram: false })
+            );
             await updateLiveDiagnostic(true);
           } catch (error) {
             logger.warn("Direct web-offline team messages could not be stored", {
@@ -947,9 +1015,6 @@ export class AccountMonitorService {
         });
       }
     } finally {
-      if (appCatchupTimer) {
-        clearInterval(appCatchupTimer);
-      }
       const pendingAppCatchup = appCatchupState.promise;
       if (pendingAppCatchup) {
         await pendingAppCatchup.catch(() => undefined);
@@ -994,8 +1059,18 @@ export class AccountMonitorService {
     account: { dtUserId: string; appVariant: AppVariant }
   ) {
     const appVariant = account.appVariant;
-    const session = await exportSessionFromAdbConfig(appVariant).catch(() => null);
-    if (!session || session.dtUserId !== account.dtUserId) {
+    const sessionProbe = await appFallbackProbeGate.probe(() =>
+      exportSessionFromAdbConfig(appVariant).catch(() => null)
+    );
+    if (sessionProbe.status !== "available") {
+      return {
+        source: sessionProbe.status === "cooldown" ? "app-probe-cooldown" : "app-unavailable",
+        scanned: 0,
+        imported: 0
+      };
+    }
+    const session = sessionProbe.value;
+    if (session.dtUserId !== account.dtUserId) {
       return { source: "app-session-mismatch", scanned: 0, imported: 0 };
     }
     const limit = Math.max(20, runner.maxRetryCount * 20);
@@ -1051,13 +1126,6 @@ export class AccountMonitorService {
       imported: 0
     };
   }
-}
-
-function runSerializedAppFallbackScan<T>(run: () => Promise<T>): Promise<T> {
-  appFallbackScanQueue = appFallbackScanQueue.then(run, run);
-  const next = appFallbackScanQueue as Promise<T>;
-  appFallbackScanQueue = appFallbackScanQueue.then(() => undefined, () => undefined);
-  return next;
 }
 function shouldScheduleAppCatchupForFrame(state: DirectMonitorFrameState) {
   return state.smsPushes === 0 && (state.missedStatus0103Sample !== null || state.nonSmsPushFrames >= 2);

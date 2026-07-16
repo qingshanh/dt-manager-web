@@ -6,6 +6,64 @@ import type { AppEvent } from "../services/event-bus.js";
 
 export const eventsRouter = Router();
 
+type SseEventSource = {
+  once(event: string, listener: (...args: unknown[]) => void): unknown;
+};
+
+type SseResponse = SseEventSource & {
+  writableEnded?: boolean;
+  destroyed?: boolean;
+  end(): unknown;
+};
+
+const activeSseCleanups = new Map<SseResponse, () => void>();
+
+export function attachSseCleanup(input: {
+  req: SseEventSource;
+  res: SseResponse;
+  clearHeartbeat: () => void;
+  removeListener: () => void;
+}) {
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) {
+      return;
+    }
+    cleaned = true;
+    activeSseCleanups.delete(input.res);
+    input.clearHeartbeat();
+    input.removeListener();
+    if (!input.res.writableEnded && !input.res.destroyed) {
+      input.res.end();
+    }
+  };
+  activeSseCleanups.set(input.res, cleanup);
+  input.req.once("close", cleanup);
+  input.res.once("close", cleanup);
+  input.res.once("error", cleanup);
+  return cleanup;
+}
+
+export function closeAllSseConnections() {
+  for (const cleanup of [...activeSseCleanups.values()]) {
+    cleanup();
+  }
+}
+
+export function getActiveSseConnectionCountForTest() {
+  return activeSseCleanups.size;
+}
+
+export function writeSseEvent(
+  response: { write(chunk: string): boolean },
+  type: string,
+  payload: unknown
+) {
+  const eventWritten = response.write(`event: ${type}\n`);
+  const dataWritten = response.write(`data: ${JSON.stringify(payload)}\n\n`);
+  return eventWritten && dataWritten;
+}
+
 eventsRouter.get("/", (req: Request, res: Response) => {
   const token = String(req.query.token ?? "");
   if (!token) {
@@ -24,12 +82,12 @@ eventsRouter.get("/", (req: Request, res: Response) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
+  let cleanup: () => void = () => undefined;
   const send = (type: string, payload: unknown) => {
-    res.write(`event: ${type}\n`);
-    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    if (!writeSseEvent(res, type, payload)) {
+      cleanup();
+    }
   };
-
-  send("connected", { time: new Date().toISOString() });
 
   const listener = (event: AppEvent) => {
     if (event.adminId !== auth.userId) {
@@ -43,9 +101,11 @@ eventsRouter.get("/", (req: Request, res: Response) => {
     send("heartbeat", { time: new Date().toISOString() });
   }, 30000);
 
-  req.on("close", () => {
-    clearInterval(timer);
-    eventBus.off("event", listener);
-    res.end();
+  cleanup = attachSseCleanup({
+    req,
+    res,
+    clearHeartbeat: () => clearInterval(timer),
+    removeListener: () => eventBus.off("event", listener)
   });
+  send("connected", { time: new Date().toISOString() });
 });

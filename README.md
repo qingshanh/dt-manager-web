@@ -34,7 +34,7 @@ notepad .env
 .\start.bat
 ```
 
-带 helper 启动：
+逆向测试时带 helper 启动：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\start.ps1 -WithHelper -HelperDeviceMode remote -HelperRemoteHost 127.0.0.1:27042
@@ -46,6 +46,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -WithHelper -HelperDeviceMo
 .\stop.bat
 ```
 
+`start.ps1` 会为本次实例写入 `_tmp/runtime/processes.json`，`stop.ps1` 只停止该清单中经过 PID、创建时间和实例标识校验的进程，不会批量结束其它 Node 进程。普通本地启动默认设置 `DT_ALLOW_APP_FALLBACK=false`；只有逆向或设备测试需要 helper/ADB 时才使用 `-WithHelper`。
+
 默认地址：
 
 - 前端：`http://localhost:5173`
@@ -53,6 +55,8 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1 -WithHelper -HelperDeviceMo
 - helper：`http://127.0.0.1:5175`
 
 ## Docker Compose 部署
+
+正式部署建议后端至少分配 `1GB` 内存，并保持 `DT_ALLOW_APP_FALLBACK=false`。详细资源限制、停止和数据安全说明见 [Docker 部署](docs/deployment-docker.md)；不用 Docker 的 Linux 服务器可参考 [systemd 部署](docs/deployment-linux-systemd.md)。
 
 ### Windows
 
@@ -154,9 +158,9 @@ DT_HELPER_REMOTE_HOST=172.17.0.1:27042
 
 ### VPS 内存参考
 
-只跑 `direct` 模式时，常驻进程主要是后端 Node.js、前端 nginx 和 SQLite 文件，空闲通常约 `180-300 MB`，有少量监听任务时建议给 VPS 预留 `512 MB` 以上内存。开启 `real` profile 的 helper + Frida 后，额外内存取决于设备连接和 Frida 会话，建议 `1 GB` 起步。
+只跑 `direct` 模式时，常驻进程主要是后端 Node.js、前端 nginx 和 SQLite。根据当前多账户监听实测，正式部署先给后端 `1GB` 内存上限，Node 堆使用 `512MB`；完成至少 24 小时稳定采样后再评估下调。开启 `real` profile 的 helper + Frida 只用于逆向测试，额外内存取决于设备连接和 Frida 会话。
 
-小内存 VPS 建议保持 `.env` 中 `NODE_OPTIONS=--max-old-space-size=192`，并优先使用 `direct` 模式，不启动 helper profile。后端 Docker 镜像已只保留生产依赖，能减少镜像体积和运行时文件扫描开销。
+正式环境保持 `.env` 中 `NODE_OPTIONS=--max-old-space-size=512`、`DT_ALLOW_APP_FALLBACK=false`，并使用 `direct` 模式，不启动 helper profile。后端 Docker 镜像只保留生产依赖，Compose 同时限制 CPU、总内存、PID 数和日志大小。
 
 ### Docker 拉取卡住
 
@@ -193,7 +197,8 @@ docker compose up -d
 - `DT_GATEWAY_MODE`：`mock`、`real`、`direct`
 - `JWT_SECRET`：后台登录 JWT 密钥，生产环境必须改
 - `ENCRYPTION_KEY`：账号密码和 token 入库加密密钥，生产环境必须改
-- `NODE_OPTIONS`：限制 Node.js 最大堆内存，小内存 VPS 可设为 `--max-old-space-size=192`
+- `NODE_OPTIONS`：限制 Node.js 最大堆内存，正式部署初始使用 `--max-old-space-size=512`
+- `DT_ALLOW_APP_FALLBACK`：是否允许 App/helper/ADB 回退；正式部署必须为 `false`
 - `DOCKER_NODE_IMAGE`、`DOCKER_NGINX_IMAGE`、`DOCKER_PYTHON_IMAGE`：Docker 基础镜像地址，Docker Hub 拉取慢时可换成可访问的镜像源
 - `NPM_REGISTRY`、`PIP_INDEX_URL`：Docker 构建时安装 npm / pip 依赖使用的镜像源
 - `DATABASE_URL`：本地开发数据库地址；Docker Compose 默认覆盖为 `file:/app/data/dingtone.db`

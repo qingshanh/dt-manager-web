@@ -27,7 +27,7 @@ test("direct message listener keeps two paired gateway workers active within a w
   assert.match(source, /runPushLinkRegistration\(linkSession, runtime, input\.account\)/);
   assert.match(source, /pushSession\.waitForPushes/);
   assert.match(source, /currentLinkSession\.waitForPushes/);
-  assert.match(source, /while \(!listener\.preempted && hasRemainingListenWindow\(\) && pushes\.length < maxPushFrames\)/);
+  assert.match(source, /while \(!listener\.preempted && hasRemainingListenWindow\(\) && diagnostics\.totalPushes\(\) < maxPushFrames\)/);
   assert.match(source, /const waitUntil = Math\.min\([\s\S]*nextOfflineCatchupAt[\s\S]*nextWebOfflinePollAt/);
   assert.doesNotMatch(source, /discoverDirectPushHostsOnSession/);
   assert.doesNotMatch(source, /Direct account RTC host discovery completed/);
@@ -54,8 +54,8 @@ test("primary routing is deterministic and backup registration requires promotio
   assert.match(source, /const routeCoordinator = createDirectRouteCoordinator\(registrationOwnerHost\)/);
   assert.match(source, /if \(!routeCoordinator\.shouldClaim\(host\)\)/);
   assert.match(source, /routeCoordinator\.markPrimaryUnavailable\(\)/);
-  assert.match(source, /calls\.push\(await runPushLinkRegistration/);
-  assert.match(source, /const registration = calls\[calls\.length - 1\]/);
+  assert.match(source, /const registration = await runPushLinkRegistration/);
+  assert.match(source, /diagnostics\.recordCall\(registration\)/);
   assert.match(source, /secondary paired workers stay authenticated without replacing the primary SMS route/);
 });
 
@@ -126,14 +126,14 @@ test("direct message listener reports paired gateway lifecycle before frames arr
 test("direct message listener prioritizes gateways that delivered SMS", () => {
   assert.match(source, /"20\.97\.117\.109"/);
   assert.match(source, /"206\.189\.228\.89"/);
-  assert.match(source, /const directSmsHostAffinity = new Map/);
+  assert.match(source, /const directSmsHostAffinity = new TtlLruCache/);
   assert.match(source, /rememberDirectSmsHost\(input\.account, frameHost\)/);
   assert.match(source, /getPrioritizedDirectPushHosts\(runtime, input\.account\)/);
   assert.match(source, /uniqueHosts\(\[\.\.\.preferredHosts, \.\.\.APP_DIRECT_PUSH_HOSTS, runtime\.primaryHost, runtime\.backupHost\]\)/);
 });
 
 test("direct message listener fails the monitor cycle when no gateway session opens", () => {
-  assert.match(source, /const hostErrors: unknown\[\] = \[\]/);
+  assert.match(source, /diagnostics\.recordHostError\(host, error\)/);
   assert.match(source, /if \(attempts === 0 && lastError\)/);
   assert.match(source, /throw normalizeDirectError\(lastError\)/);
 });
@@ -341,7 +341,7 @@ test("direct frame wait yields while draining queued frames", () => {
   assert.doesNotMatch(source, /predicate\(parseFrame\(raw\)\)/);
 });
 test("direct listener avoids expensive decoders when no JSON or SMS payload is needed", () => {
-  assert.match(source, /const shouldExtractJsonPayload = parsed\.type === 0x8107 && parsed\.status === 0x0102 && \(this\.jsonResolvers\.length > 0 \|\| Date\.now\(\) <= this\.jsonCaptureUntil\)/);
+  assert.match(source, /const shouldExtractJsonPayload = parsed\.type === 0x8107 && parsed\.status === 0x0102 && \(this\.jsonWaiters\.size > 0 \|\| Date\.now\(\) <= this\.jsonCaptureUntil\)/);
   assert.match(source, /const jsonPayload = shouldExtractJsonPayload \? extractJsonPayload\(parsed\.raw\) : null/);
   assert.match(source, /const smsPush = parsed\.type === 0x8107 && parsed\.status === 0x0103 \? tryParseSmsPush\(parsed\.raw\) \?\? tryParseSmsPush\(parsed\.body\) : null/);
   assert.match(source, /const candidatePush = frameToDirectPush\(frame\)/);
@@ -377,21 +377,22 @@ test("direct socket queue keeps handshake frames and active waiters while droppi
   assert.match(source, /const shouldQueueRawFrame =/);
   assert.match(source, /parsed\.status === 0x0101/);
   assert.match(source, /parsed\.status === 0x0103/);
-  assert.match(source, /this\.resolvers\.length > 0/);
-  assert.match(source, /if \(shouldQueueRawFrame\) \{\s*this\.queue\.push\(frame\);\s*this\.flushWaiters\(\);\s*\}/);
+  assert.match(source, /this\.rawWaiters\.size > 0/);
+  assert.match(source, /const enqueueResult = enqueueDirectRawFrame\(this\.queue, frame, this\.queueBytes\)/);
+  assert.match(source, /directResourceCounters\.rawQueueDrops \+= enqueueResult\.dropped;\s*this\.flushWaiters\(\)/);
 });
 test("direct socket keeps handshake frames while dropping only idle non-SMS data frames", () => {
   assert.match(source, /const shouldQueueRawFrame =/);
   assert.match(source, /parsed\.status === 0x0101/);
   assert.match(source, /parsed\.status === 0x0103/);
-  assert.match(source, /this\.resolvers\.length > 0/);
+  assert.match(source, /this\.rawWaiters\.size > 0/);
   assert.doesNotMatch(source, /parsed\.type === 0x8107 && parsed\.status !== 0x0103\) \{\s*continue;/);
 });
 
 test("direct JSON capture is armed before request writes to avoid fast-response races", () => {
   assert.match(source, /private jsonCaptureUntil = 0/);
   assert.match(source, /private beginJsonCapture\(timeoutMs: number\)/);
-  assert.match(source, /const shouldExtractJsonPayload = parsed\.type === 0x8107 && parsed\.status === 0x0102 && \(this\.jsonResolvers\.length > 0 \|\| Date\.now\(\) <= this\.jsonCaptureUntil\)/);
+  assert.match(source, /const shouldExtractJsonPayload = parsed\.type === 0x8107 && parsed\.status === 0x0102 && \(this\.jsonWaiters\.size > 0 \|\| Date\.now\(\) <= this\.jsonCaptureUntil\)/);
   assert.match(source, /this\.clearJsonQueue\(\);\s*this\.beginJsonCapture\(timeoutMs\);\s*await this\.write\(request\);/);
   assert.match(source, /async callJsonFromTemplate\([\s\S]*timeoutMs = this\.runtime\.ioTimeoutMs[\s\S]*this\.beginJsonCapture\(timeoutMs\)[\s\S]*this\.waitForJsonPayload\(timeoutMs/);
 });

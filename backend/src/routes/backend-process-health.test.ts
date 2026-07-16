@@ -20,14 +20,32 @@ test("backend logs process-level failures instead of disappearing silently", () 
   assert.match(indexSource, /server\.on\("error"/);
 });
 test("backend dev supervisor restarts the service after unexpected exits", () => {
-  assert.match(supervisorSource, /backend exited; restarting/);
+  assert.match(supervisorSource, /nextRestartDecision/);
+  assert.match(supervisorSource, /backend exited; restart scheduled/);
   assert.match(supervisorSource, /setTimeout\(\(\) => \{/);
   assert.doesNotMatch(supervisorSource, /restartTimer\.unref/);
   assert.match(supervisorSource, /spawn\(process\.execPath, \["--import", "tsx", "src\/index\.ts"\]/);
   assert.match(supervisorSource, /process\.on\("SIGTERM"/);
+  assert.match(supervisorSource, /clearTimeout\(restartTimer\)/);
+  assert.match(supervisorSource, /circuit-breaker/);
 });
 test("backend exits nonzero for HTTP listen failures", () => {
   assert.match(indexSource, /error: NodeJS\.ErrnoException/);
   assert.match(indexSource, /error\.code === "EADDRINUSE" \|\| error\.code === "EACCES"/);
-  assert.match(indexSource, /process\.exit\(1\)/);
+  assert.match(indexSource, /FATAL_LISTEN_EXIT_CODE/);
+  assert.match(indexSource, /requestRuntimeShutdown\?\.\("listen-fatal", FATAL_LISTEN_EXIT_CODE\)/);
+  assert.doesNotMatch(indexSource, /process\.exit\(\)/);
+});
+
+test("backend wires SIGTERM through the idempotent shutdown coordinator", () => {
+  assert.match(indexSource, /new RuntimeLifecycle\(/);
+  assert.match(indexSource, /process\.once\("SIGINT"/);
+  assert.match(indexSource, /process\.once\("SIGTERM"/);
+  assert.match(indexSource, /telegramBotService\.stop\(\)/);
+  assert.match(indexSource, /runtimeWorkQueue\.stop\(\)/);
+  assert.match(indexSource, /closeAllSseConnections/);
+  assert.match(indexSource, /prisma\.\$disconnect\(\)/);
+  assert.match(indexSource, /const hardExitTimer = setTimeout/);
+  assert.match(indexSource, /hardExitTimer\.unref\(\)/);
+  assert.match(indexSource, /process\.exit\(shutdownExitCode\)/);
 });

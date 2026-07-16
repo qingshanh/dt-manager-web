@@ -6,6 +6,7 @@ import { logger } from "../utils/logger.js";
 import { serializePhoneNumber } from "../utils/serializers.js";
 import { accountMonitorService } from "./account-monitor.js";
 import { refreshAccountRuntimeData } from "./account-runtime.js";
+import { BackgroundLoop } from "./background-loop.js";
 import {
   DirectDingtoneGateway,
   buildDirectAccessCodeDryRun,
@@ -68,46 +69,37 @@ type BotReply = {
 };
 
 export class TelegramBotService {
-  private timer: NodeJS.Timeout | null = null;
-  private running = false;
+  private readonly loop = new BackgroundLoop({
+    initialDelayMs: 3_000,
+    defaultDelayMs: 10_000,
+    task: () => this.tick(),
+    unref: true,
+    onError: (error) => {
+      logger.warn("Telegram bot polling failed", {
+        error: sanitizeTelegramError(errorMessage(error))
+      });
+    }
+  });
 
   start() {
-    if (this.timer) {
-      return;
-    }
-    this.timer = setTimeout(() => void this.tick(), 3_000);
-    this.timer.unref?.();
+    this.loop.start();
   }
 
   stop() {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-  }
-
-  private schedule(seconds: number) {
-    this.stop();
-    this.timer = setTimeout(() => void this.tick(), Math.max(5, seconds) * 1000);
-    this.timer.unref?.();
+    return this.loop.stop();
   }
 
   private async tick() {
-    if (this.running) {
-      this.schedule(10);
-      return;
-    }
-    this.running = true;
     let pollSeconds = 10;
     try {
       const settings = await getSettingsMap();
       pollSeconds = parsePositiveInt(settings.telegram_bot_poll_interval_seconds, 10);
       if (settings.telegram_bot_enabled !== "true") {
-        return;
+        return Math.max(5, pollSeconds) * 1000;
       }
       const botToken = settings.telegram_bot_token;
       if (!botToken) {
-        return;
+        return Math.max(5, pollSeconds) * 1000;
       }
       await ensureBotCommands(botToken, settings.telegram_api_base_url);
       const lastUpdateId = parsePositiveInt(settings.telegram_bot_last_update_id, 0);
@@ -135,10 +127,8 @@ export class TelegramBotService {
       logger.warn("Telegram bot polling failed", {
         error: sanitizeTelegramError(errorMessage(error))
       });
-    } finally {
-      this.running = false;
-      this.schedule(pollSeconds);
     }
+    return Math.max(5, pollSeconds) * 1000;
   }
 
   private async handleUpdate(update: TelegramUpdate, settings: Record<string, string>) {

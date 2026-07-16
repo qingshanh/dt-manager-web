@@ -18,6 +18,7 @@ tools/*.log
 tools/frida-server*
 tools/__pycache__/
 _tmp/
+_tmp/runtime/
 _unused_review/
 null/
 .playwright-mcp/

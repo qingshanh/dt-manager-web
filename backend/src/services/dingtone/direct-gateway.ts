@@ -4,8 +4,10 @@ import zlib from "node:zlib";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { config } from "../../config.js";
+import { BoundedBuffer } from "../../utils/bounded-buffer.js";
 import { AppError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
+import { TtlLruCache } from "../../utils/ttl-lru-cache.js";
 import { getSettingsMap } from "../settings.service.js";
 import { buildTeamMessageEnvelope, parseTeamMessageMeta } from "../team-message-normalizer.js";
 import { parseDirectActionTemplate, type DirectActionTemplate, type DirectTemplateParams } from "./direct-template.js";
@@ -180,6 +182,18 @@ export type DirectProbeResult = {
   offlineTemplateSendCount?: number;
   offlineTemplateError?: string | null;
   preempted?: boolean;
+  counters?: DirectListenerCounters;
+};
+
+export type DirectListenerCounters = {
+  pushes: number;
+  calls: number;
+  traceFrames: number;
+  hostErrors: number;
+  frames: number;
+  smsFrames: number;
+  connectionAttempts: number;
+  reconnects: number;
 };
 export type DirectAccessCodeProbeResult = {
   ok: boolean;
@@ -258,6 +272,21 @@ type ActiveDirectPushListener = {
 
 const CONNECT_REQUEST = Buffer.from("01070000000e820100000000c88d", "hex");
 const MAX_DIRECT_TRACE_FRAMES = 80;
+const MAX_DIRECT_LISTENER_PUSHES = 100;
+const MAX_DIRECT_LISTENER_CALLS = 100;
+const MAX_DIRECT_LISTENER_TRACE_FRAMES = 160;
+const MAX_DIRECT_LISTENER_ERROR_HOSTS = 32;
+const MAX_DIRECT_FRAME_BYTES = 2 * 1024 * 1024;
+const MAX_DIRECT_BUFFER_BYTES = 4 * 1024 * 1024;
+const MAX_DIRECT_RAW_QUEUE = 512;
+const MAX_DIRECT_RAW_QUEUE_BYTES = 16 * 1024 * 1024;
+const MAX_DIRECT_JSON_QUEUE = 256;
+const MAX_DIRECT_JSON_QUEUE_BYTES = 8 * 1024 * 1024;
+const DIRECT_PUSH_READ_BATCH_LIMIT = 100;
+const DIRECT_ACCOUNT_CACHE_MAX_ENTRIES = 500;
+const DIRECT_PHONE_COUNTRY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const DIRECT_SMS_HOST_AFFINITY_TTL_MS = 6 * 60 * 60 * 1000;
+const DIRECT_WEB_OFFLINE_TRACKER_TTL_MS = 24 * 60 * 60 * 1000;
 const APP_DIRECT_PUSH_HOSTS = [
   // These hosts delivered real SMS frames in production monitor sessions.
   "20.97.117.109",
@@ -318,9 +347,158 @@ const CAPTURED_OFFLINE_FIELDS = {
 } as const;
 const activeDirectPushListeners = new Map<string, ActiveDirectPushListener>();
 const directSessionOperationLocks = new Map<string, Promise<void>>();
-const directAccountPhoneCountryKeyCache = new Map<string, Set<string>>();
-const directWebOfflineDeliveryTrackers = new Map<string, DirectWebOfflineDeliveryTracker>();
-const directSmsHostAffinity = new Map<string, string[]>();
+const directAccountPhoneCountryKeyCache = new TtlLruCache<string, Set<string>>({
+  maxEntries: DIRECT_ACCOUNT_CACHE_MAX_ENTRIES,
+  ttlMs: DIRECT_PHONE_COUNTRY_CACHE_TTL_MS
+});
+const directWebOfflineDeliveryTrackers = new TtlLruCache<string, DirectWebOfflineDeliveryTracker>({
+  maxEntries: DIRECT_ACCOUNT_CACHE_MAX_ENTRIES,
+  ttlMs: DIRECT_WEB_OFFLINE_TRACKER_TTL_MS
+});
+const directSmsHostAffinity = new TtlLruCache<string, string[]>({
+  maxEntries: DIRECT_ACCOUNT_CACHE_MAX_ENTRIES,
+  ttlMs: DIRECT_SMS_HOST_AFFINITY_TTL_MS
+});
+const directResourceCounters = {
+  socketBufferOverflows: 0,
+  oversizedFrames: 0,
+  rawQueueDrops: 0,
+  jsonQueueDrops: 0
+};
+let activeDirectSessionCount = 0;
+
+type DirectListenerHostError = {
+  count: number;
+  lastAt: string;
+  lastMessage: string;
+  fatal: boolean;
+};
+
+class DirectListenerDiagnostics {
+  private readonly recentPushes = new BoundedBuffer<DirectProbePushResult>(MAX_DIRECT_LISTENER_PUSHES);
+  private readonly recentCalls = new BoundedBuffer<DirectProbeCallResult>(MAX_DIRECT_LISTENER_CALLS);
+  private readonly recentTrace = new BoundedBuffer<DirectProbeFrameTrace>(MAX_DIRECT_LISTENER_TRACE_FRAMES);
+  private readonly recentHostErrors = new Map<string, DirectListenerHostError>();
+  private fatalError: unknown;
+  private readonly attemptedHosts = new Set<string>();
+  private readonly counters: DirectListenerCounters = {
+    pushes: 0,
+    calls: 0,
+    traceFrames: 0,
+    hostErrors: 0,
+    frames: 0,
+    smsFrames: 0,
+    connectionAttempts: 0,
+    reconnects: 0
+  };
+
+  recordPush(push: DirectProbePushResult) {
+    this.recentPushes.push(push);
+    this.counters.pushes += 1;
+  }
+
+  recordPushes(pushes: Iterable<DirectProbePushResult>) {
+    for (const push of pushes) {
+      this.recordPush(push);
+    }
+  }
+
+  recordCall(call: DirectProbeCallResult) {
+    this.recentCalls.push(call);
+    this.counters.calls += 1;
+  }
+
+  recordCalls(calls: Iterable<DirectProbeCallResult>) {
+    for (const call of calls) {
+      this.recordCall(call);
+    }
+  }
+
+  recordTrace(frame: DirectProbeFrameTrace) {
+    this.recentTrace.push(frame);
+    this.counters.traceFrames += 1;
+  }
+
+  recordTraces(frames: Iterable<DirectProbeFrameTrace>) {
+    for (const frame of frames) {
+      this.recordTrace(frame);
+    }
+  }
+
+  recordFrame(frame: DirectProbePushResult) {
+    this.counters.frames += 1;
+    if (frame.sms) {
+      this.counters.smsFrames += 1;
+    }
+  }
+
+  recordConnectionAttempt(host: string) {
+    if (this.attemptedHosts.has(host)) {
+      this.counters.reconnects += 1;
+    } else {
+      this.attemptedHosts.add(host);
+    }
+    this.counters.connectionAttempts += 1;
+  }
+
+  recordHostError(host: string, error: unknown) {
+    const previous = this.recentHostErrors.get(host);
+    const fatal = isFatalDirectSessionError(error);
+    this.recentHostErrors.delete(host);
+    this.recentHostErrors.set(host, {
+      count: (previous?.count ?? 0) + 1,
+      lastAt: new Date().toISOString(),
+      lastMessage: redactSensitiveText(error instanceof Error ? error.message : String(error)),
+      fatal
+    });
+    while (this.recentHostErrors.size > MAX_DIRECT_LISTENER_ERROR_HOSTS) {
+      const oldest = this.recentHostErrors.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.recentHostErrors.delete(oldest);
+    }
+    this.counters.hostErrors += 1;
+    if (fatal) {
+      this.fatalError = error;
+    }
+  }
+
+  totalPushes() {
+    return this.counters.pushes;
+  }
+
+  getFatalError() {
+    return this.fatalError;
+  }
+
+  snapshot() {
+    return {
+      pushes: this.recentPushes.values(),
+      calls: this.recentCalls.values(),
+      trace: this.recentTrace.values(),
+      hostErrors: new Map(this.recentHostErrors),
+      counters: { ...this.counters }
+    };
+  }
+}
+
+export function createDirectListenerDiagnosticsForTest() {
+  return new DirectListenerDiagnostics();
+}
+
+function sliceDirectRetainedTrace<T>(retained: readonly T[], totalProduced: number, totalSeen: number) {
+  const firstRetainedIndex = Math.max(0, totalProduced - retained.length);
+  const retainedOffset = Math.max(0, totalSeen - firstRetainedIndex);
+  return {
+    frames: retained.slice(retainedOffset),
+    totalSeen: totalProduced
+  };
+}
+
+export function sliceDirectRetainedTraceForTest<T>(retained: readonly T[], totalProduced: number, totalSeen: number) {
+  return sliceDirectRetainedTrace(retained, totalProduced, totalSeen);
+}
 const LOGIN_INIT_PACKET = Buffer.from(
   "010700000399810727c6004700000389010200000389d33d000300502788000000000000000108010000000001000000010000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e3031000000090000032a0000002b416e642e30303030303030303030303030303030303030303030303030303030303030302e647474616c6b0000000f3130303030303030303030303030300000002030303030303030303030303030303030303030303030303030303030303030300000000932303334303431393700000016706c616365686f6c646572406578616d706c652e696fd33d0003005027880000000002000000117b227374617475734f6666223a2230227d0000027764657669636549643d416e642e30303030303030303030303030303030303030303030303030303030303030302e647474616c6b267573657249643d31303030303030303030303030303026746f6b656e3d3030303030303030303030303030303030303030303030303030303030303030266d616769633d35343037372677536974653d33266477486f73743d3532353330303026616464724368616e67653d3026547261636b436f64653d343030353131383533303132393130313126634150494c6576656c3d31264c433d7a68266a736f6e3d253762253232436c69656e7456657273696f6e2532322533612d31363130323138373531253263253232436f6e6e65637456657273696f6e253232253361313638343533313425326325323250726573656e63654d6573736167652532322533612532322537622535632532327374617475734f66662535632532322533612535632532323025356325323225376425323225326325323250726573656e63655374617475732532322533613225326325323274696d657a6f6e65253232253361253232474d542532623038253361303025323225376426636c69656e74496e666f3d25376225323270696e6754696d65253232253361253232313030303030253362313030303030253232253263253232636f6e6e65637465645625323225336130253263253232686173562532322533613025326325323261707049642532322533612532326d652e74616c6b796f752e6170702e696d2532322532632532327369676e4d643525323225336125323263333830656335626638383731626164646133383764343137396262376134312532322537642641736b41636b3d310107000000fa810727c60047000000ea0102000000ead33d000300502788000000000000000101010000000001000000020000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e3031000000080000008b0000000000000012676574496e666f4265666f72654c6f67696e0000006600000065789c0dccb10a84300c00d0bfe9589268aeedd0419cdce5f6d0e4a02855b4dcf7ebf2c6a7f6afc516cd53531fc9e49388852c618c2fe9c71858690802685e7b977d73eb25659b0fb53c023062e4019012230427e7f96eaeecd55affda75d7a3e5071a051edd00000000",
   "hex"
@@ -1208,7 +1386,9 @@ export async function listenDirectSessionPushes(input: {
 }) {
   const runtime = await getDirectRuntimeConfig();
   const baseHosts = getPrioritizedDirectPushHosts(runtime, input.account);
-  const maxPushFrames = input.maxPushFrames ?? Number.MAX_SAFE_INTEGER;
+  const maxPushFrames = input.maxPushFrames === undefined
+    ? Number.POSITIVE_INFINITY
+    : Math.max(0, Math.trunc(input.maxPushFrames));
   const listenWindowMs = Math.max(1, input.listenSeconds) * 1000;
   let deadline = Date.now() + listenWindowMs;
   const hasRemainingListenWindow = () => {
@@ -1228,8 +1408,7 @@ export async function listenDirectSessionPushes(input: {
     return true;
   };
   const isWithinCurrentListenWindow = () => Date.now() < deadline;
-  const pushes: DirectProbePushResult[] = [];
-  const trace: DirectProbeFrameTrace[] = [];
+  const diagnostics = new DirectListenerDiagnostics();
   let offlineTemplateSent = false;
   let offlineTemplateError: string | null = null;
   let offlineTemplateAttempted = false;
@@ -1363,8 +1542,6 @@ export async function listenDirectSessionPushes(input: {
     await webOfflinePollInFlight;
   };
 
-  const hostErrors: unknown[] = [];
-
   try {
     const discoveredHosts = input.shouldContinue
       ? await (async () => {
@@ -1392,7 +1569,7 @@ export async function listenDirectSessionPushes(input: {
     const registrationOwnerHost = workerHosts[0] ?? runtime.primaryHost;
     const routeCoordinator = createDirectRouteCoordinator(registrationOwnerHost);
     const runPairedHostWorker = async (host: string) => {
-      while (!listener.preempted && hasRemainingListenWindow() && pushes.length < maxPushFrames) {
+      while (!listener.preempted && hasRemainingListenWindow() && diagnostics.totalPushes() < maxPushFrames) {
       const operationIdle = await waitForDirectSessionOperationIdle(input.account, DIRECT_SESSION_OPERATION_IDLE_WAIT_MS);
       if (!operationIdle) {
         logger.warn("Direct session operation remained busy; starting SMS listener anyway", {
@@ -1400,7 +1577,7 @@ export async function listenDirectSessionPushes(input: {
           waitMs: DIRECT_SESSION_OPERATION_IDLE_WAIT_MS
         });
       }
-      if (listener.preempted || !isWithinCurrentListenWindow() || pushes.length >= maxPushFrames) {
+      if (listener.preempted || !isWithinCurrentListenWindow() || diagnostics.totalPushes() >= maxPushFrames) {
         break;
       }
 
@@ -1415,18 +1592,19 @@ export async function listenDirectSessionPushes(input: {
         break;
       }
       attempts += 1;
+      diagnostics.recordConnectionAttempt(host);
       selectedHost = host;
       await reportHostStatus(host, "connecting", null);
       let pushTraceCount = 0;
       let linkTraceCount = 0;
       const collectPairTrace = () => {
-        const pushTrace = pushSession.getTrace();
-        trace.push(...pushTrace.slice(pushTraceCount));
-        pushTraceCount = pushTrace.length;
+        const pushTrace = pushSession.getTraceSince(pushTraceCount);
+        diagnostics.recordTraces(pushTrace.frames);
+        pushTraceCount = pushTrace.totalSeen;
         if (linkSession) {
-          const linkTrace = linkSession.getTrace();
-          trace.push(...linkTrace.slice(linkTraceCount));
-          linkTraceCount = linkTrace.length;
+          const linkTrace = linkSession.getTraceSince(linkTraceCount);
+          diagnostics.recordTraces(linkTrace.frames);
+          linkTraceCount = linkTrace.totalSeen;
         }
       };
       const closeLinkSession = async () => {
@@ -1463,8 +1641,8 @@ export async function listenDirectSessionPushes(input: {
           if (!isActiveDirectPushListener(listener)) {
             throw new Error("Direct listener was preempted before route registration");
           }
-          calls.push(await runPushLinkRegistration(currentLinkSession, runtime, input.account));
-          const registration = calls[calls.length - 1];
+          const registration = await runPushLinkRegistration(currentLinkSession, runtime, input.account);
+          diagnostics.recordCall(registration);
           if (!registration?.ok) {
             throw new Error(registration?.error ?? "Direct paired link registration failed");
           }
@@ -1500,7 +1678,7 @@ export async function listenDirectSessionPushes(input: {
           if (!isActiveDirectPushListener(listener)) {
             throw new Error("Direct listener was preempted after link authentication");
           }
-          calls.push(...(await runPushMaintenanceCalls(linkSession, runtime, input.account)));
+          diagnostics.recordCalls(await runPushMaintenanceCalls(linkSession, runtime, input.account));
           if (!isActiveDirectPushListener(listener)) {
             throw new Error("Direct listener was preempted during private-number refresh");
           }
@@ -1539,6 +1717,7 @@ export async function listenDirectSessionPushes(input: {
         }
       };
       const handlePairedFrame = async (push: DirectProbePushResult, frameHost: string) => {
+        diagnostics.recordFrame(push);
         if (push.sms) {
           rememberDirectSmsHost(input.account, frameHost);
         }
@@ -1560,7 +1739,7 @@ export async function listenDirectSessionPushes(input: {
       try {
         await pushSession.openPush(input.account);
 
-        while (!listener.preempted && isWithinCurrentListenWindow() && pushes.length < maxPushFrames) {
+        while (!listener.preempted && isWithinCurrentListenWindow() && diagnostics.totalPushes() < maxPushFrames) {
           let currentLinkSession: DirectSession;
           try {
             currentLinkSession = await ensureLinkSession();
@@ -1568,7 +1747,7 @@ export async function listenDirectSessionPushes(input: {
             lastError = undefined;
           } catch (error) {
             lastError = error;
-            hostErrors.push(error);
+            diagnostics.recordHostError(host, error);
             logger.warn("Direct paired link registration failed; keeping push socket open", {
               host,
               pushAttempt: attempts,
@@ -1580,7 +1759,9 @@ export async function listenDirectSessionPushes(input: {
             await delay(Math.min(DIRECT_RECONNECT_BACKOFF_MAX_MS, 500));
             continue;
           }
-          const remainingFrames = Math.max(0, maxPushFrames - pushes.length);
+          const remainingFrames = Number.isFinite(maxPushFrames)
+            ? Math.min(DIRECT_PUSH_READ_BATCH_LIMIT, Math.max(0, maxPushFrames - diagnostics.totalPushes()))
+            : DIRECT_PUSH_READ_BATCH_LIMIT;
           if (remainingFrames <= 0) {
             break;
           }
@@ -1603,7 +1784,7 @@ export async function listenDirectSessionPushes(input: {
             );
           } catch (error) {
             lastError = error;
-            hostErrors.push(error);
+            diagnostics.recordHostError(host, error);
             logger.warn("Direct registered link read failed; keeping prelogin socket open", {
               host,
               pushAttempt: attempts,
@@ -1623,10 +1804,10 @@ export async function listenDirectSessionPushes(input: {
               ...(await pushSession.waitForPushes(pushWaitMs, remainingAfterLink, input.onPush, handlePairedFrame))
             );
           }
-          pushes.push(...nextPushes);
+          diagnostics.recordPushes(nextPushes);
           collectPairTrace();
           lastError = undefined;
-          if (listener.preempted || !isWithinCurrentListenWindow() || pushes.length >= maxPushFrames) {
+          if (listener.preempted || !isWithinCurrentListenWindow() || diagnostics.totalPushes() >= maxPushFrames) {
             break;
           }
           if (Date.now() >= nextOfflineCatchupAt) {
@@ -1640,7 +1821,7 @@ export async function listenDirectSessionPushes(input: {
         }
       } catch (error) {
         lastError = error;
-        hostErrors.push(error);
+        diagnostics.recordHostError(host, error);
         if (host === registrationOwnerHost) {
           routeCoordinator.markPrimaryUnavailable();
         }
@@ -1673,7 +1854,7 @@ export async function listenDirectSessionPushes(input: {
 
     await Promise.allSettled(workerHosts.map(runPairedHostWorker));
 
-    const fatalError = hostErrors.find((error) => isFatalDirectSessionError(error));
+    const fatalError = diagnostics.getFatalError();
     if (fatalError && successfulPairs === 0) {
       throw normalizeDirectError(fatalError);
     }
@@ -1695,14 +1876,16 @@ export async function listenDirectSessionPushes(input: {
     throw normalizeDirectError(lastError);
   }
 
+  const diagnosticSnapshot = diagnostics.snapshot();
   return {
-    ok: pushes.length > 0,
+    ok: diagnosticSnapshot.counters.pushes > 0,
     host: selectedHost,
     dtUserId: input.account.dtUserId,
     deviceId: input.account.deviceId,
-    calls,
-    pushes,
-    trace,
+    calls: diagnosticSnapshot.calls,
+    pushes: diagnosticSnapshot.pushes,
+    trace: diagnosticSnapshot.trace,
+    counters: diagnosticSnapshot.counters,
     offlineTemplateAttempted,
     offlineTemplateSent,
     offlineTemplateSendCount,
@@ -1763,7 +1946,7 @@ export async function probeDirectPushSocket(input: {
 }) {
   const runtime = await getDirectRuntimeConfig();
   const host = input.host ?? getPrioritizedDirectPushHosts(runtime, input.account)[0] ?? runtime.primaryHost;
-  const maxPushFrames = input.maxPushFrames ?? Number.MAX_SAFE_INTEGER;
+  const maxPushFrames = input.maxPushFrames ?? MAX_DIRECT_LISTENER_PUSHES;
   const deadline = Date.now() + Math.max(1, input.listenSeconds) * 1_000;
   const startedAt = Date.now();
   const pushSession = new DirectSession(runtime, host);
@@ -1905,6 +2088,34 @@ function getDirectWebOfflineDeliveryTracker(account: DirectSessionAccount) {
     directWebOfflineDeliveryTrackers.set(key, tracker);
   }
   return tracker;
+}
+
+function directRuntimeCacheSizes() {
+  return {
+    phoneCountries: directAccountPhoneCountryKeyCache.size,
+    smsHostAffinity: directSmsHostAffinity.size,
+    webOfflineTrackers: directWebOfflineDeliveryTrackers.size
+  };
+}
+
+export function directRuntimeCacheSizesForTest() {
+  return directRuntimeCacheSizes();
+}
+
+export function seedDirectRuntimeCachesForTest(account: { dtUserId: string; deviceId?: string | null }) {
+  directAccountPhoneCountryKeyCache.set(account.dtUserId, new Set(["US"]));
+  directSmsHostAffinity.set(directSessionAccountKey(account), ["20.97.117.109"]);
+  directWebOfflineDeliveryTrackers.set(directSessionAccountKey(account), new DirectWebOfflineDeliveryTracker());
+}
+
+export function getDirectRuntimeResourceSnapshot() {
+  return {
+    activeListeners: activeDirectPushListeners.size,
+    activeSessions: activeDirectSessionCount,
+    operationLocks: directSessionOperationLocks.size,
+    caches: directRuntimeCacheSizes(),
+    counters: { ...directResourceCounters }
+  };
 }
 
 async function deliverDirectWebOfflineMessages<T extends DirectWebOfflineDeliveryCandidate>(
@@ -2523,15 +2734,214 @@ function buildDirectSessionKeepaliveFrame(session: Buffer) {
   return frame;
 }
 
+type DirectSocketBufferAppendResult = {
+  buffer: Buffer;
+  overflow: boolean;
+};
+
+function appendDirectSocketBuffer(current: Buffer, chunk: Buffer, maxBytes = MAX_DIRECT_BUFFER_BYTES): DirectSocketBufferAppendResult {
+  if (chunk.length === 0) {
+    return { buffer: current, overflow: false };
+  }
+  if (current.length + chunk.length > maxBytes) {
+    return { buffer: Buffer.alloc(0), overflow: true };
+  }
+  return { buffer: current.length === 0 ? chunk : Buffer.concat([current, chunk]), overflow: false };
+}
+
+function directRawFramePriority(frame: Buffer) {
+  if (frame.length < 8) {
+    return 0;
+  }
+  const parsed = parseFrame(frame);
+  if (parsed.type === 0x8107 && parsed.status === 0x0103) {
+    return 2;
+  }
+  if (parsed.type !== 0x8107 || parsed.status === 0x0101) {
+    return 1;
+  }
+  return 0;
+}
+
+type DirectQueueEnqueueResult = {
+  dropped: number;
+  totalBytes: number;
+  accepted: boolean;
+};
+
+function enqueueDirectRawFrame(
+  queue: Buffer[],
+  frame: Buffer,
+  currentBytes: number,
+  maxEntries = MAX_DIRECT_RAW_QUEUE,
+  maxBytes = MAX_DIRECT_RAW_QUEUE_BYTES
+): DirectQueueEnqueueResult {
+  if (frame.length > maxBytes) {
+    return { dropped: 1, totalBytes: currentBytes, accepted: false };
+  }
+  const incomingPriority = directRawFramePriority(frame);
+  let dropped = 0;
+  let totalBytes = currentBytes;
+  while (queue.length >= maxEntries || totalBytes + frame.length > maxBytes) {
+    if (queue.length === 0) {
+      return { dropped: dropped + 1, totalBytes, accepted: false };
+    }
+    let evictionIndex = 0;
+    let lowestPriority = directRawFramePriority(queue[0]!);
+    for (let index = 1; index < queue.length; index += 1) {
+      const priority = directRawFramePriority(queue[index]!);
+      if (priority < lowestPriority) {
+        lowestPriority = priority;
+        evictionIndex = index;
+        if (priority === 0) {
+          break;
+        }
+      }
+    }
+    if (incomingPriority < lowestPriority) {
+      return { dropped: dropped + 1, totalBytes, accepted: false };
+    }
+    const [removed] = queue.splice(evictionIndex, 1);
+    totalBytes -= removed?.length ?? 0;
+    dropped += 1;
+  }
+  queue.push(frame);
+  totalBytes += frame.length;
+  return { dropped, totalBytes, accepted: true };
+}
+
+function directJsonPayloadBytes(payload: unknown) {
+  return Buffer.byteLength(safeJsonStringify(payload), "utf8");
+}
+
+function enqueueDirectJsonPayload<T>(
+  queue: T[],
+  sizes: number[],
+  payload: T,
+  currentBytes: number,
+  maxEntries = MAX_DIRECT_JSON_QUEUE,
+  maxBytes = MAX_DIRECT_JSON_QUEUE_BYTES
+): DirectQueueEnqueueResult {
+  const payloadBytes = directJsonPayloadBytes(payload);
+  if (payloadBytes > maxBytes) {
+    return { dropped: 1, totalBytes: currentBytes, accepted: false };
+  }
+  let dropped = 0;
+  let totalBytes = currentBytes;
+  while (queue.length >= maxEntries || totalBytes + payloadBytes > maxBytes) {
+    queue.shift();
+    totalBytes -= sizes.shift() ?? 0;
+    dropped += 1;
+  }
+  queue.push(payload);
+  sizes.push(payloadBytes);
+  totalBytes += payloadBytes;
+  return { dropped, totalBytes, accepted: true };
+}
+
+type DirectWaiter<T> = {
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
+};
+
+class DirectWaiterQueue<T> {
+  private readonly waiters: DirectWaiter<T>[] = [];
+
+  wait(timeoutMs: number, timeoutError: () => Error) {
+    return new Promise<T>((resolve, reject) => {
+      let timer: NodeJS.Timeout;
+      const waiter: DirectWaiter<T> = {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      };
+      this.waiters.push(waiter);
+      timer = setTimeout(() => {
+        if (this.remove(waiter)) {
+          waiter.reject(timeoutError());
+        }
+      }, timeoutMs);
+    });
+  }
+
+  resolveNext(value: T) {
+    const waiter = this.waiters.shift();
+    if (!waiter) {
+      return false;
+    }
+    waiter.resolve(value);
+    return true;
+  }
+
+  rejectAll(error: Error) {
+    for (const waiter of this.waiters.splice(0)) {
+      waiter.reject(error);
+    }
+  }
+
+  get size() {
+    return this.waiters.length;
+  }
+
+  private remove(waiter: DirectWaiter<T>) {
+    const index = this.waiters.indexOf(waiter);
+    if (index < 0) {
+      return false;
+    }
+    this.waiters.splice(index, 1);
+    return true;
+  }
+}
+
+export function isDirectFrameLengthAllowedForTest(totalLength: number) {
+  return totalLength >= 12 && totalLength <= MAX_DIRECT_FRAME_BYTES;
+}
+
+export function appendDirectSocketBufferForTest(current: Buffer, chunk: Buffer) {
+  return appendDirectSocketBuffer(current, chunk);
+}
+
+export function enqueueDirectRawFrameForTest(queue: Buffer[], frame: Buffer, maxEntries?: number, maxBytes?: number) {
+  return enqueueDirectRawFrame(
+    queue,
+    frame,
+    queue.reduce((total, item) => total + item.length, 0),
+    maxEntries,
+    maxBytes
+  ).dropped;
+}
+
+export function enqueueDirectJsonPayloadForTest<T>(queue: T[], payload: T, maxEntries?: number, maxBytes?: number) {
+  const sizes = queue.map(directJsonPayloadBytes);
+  return enqueueDirectJsonPayload(
+    queue,
+    sizes,
+    payload,
+    sizes.reduce((total, size) => total + size, 0),
+    maxEntries,
+    maxBytes
+  ).dropped;
+}
+
+export function createDirectWaiterQueueForTest<T>() {
+  return new DirectWaiterQueue<T>();
+}
+
 class DirectSession {
   private socket: net.Socket | tls.TLSSocket | null = null;
-  private buffer = Buffer.alloc(0);
+  private buffer: Buffer = Buffer.alloc(0);
   private queue: Buffer[] = [];
-  private resolvers: Array<(value: Buffer) => void> = [];
-  private rejectors: Array<(error: Error) => void> = [];
+  private queueBytes = 0;
+  private readonly rawWaiters = new DirectWaiterQueue<Buffer>();
   private jsonQueue: ApiResult[] = [];
-  private jsonResolvers: Array<(value: ApiResult) => void> = [];
-  private jsonRejectors: Array<(error: Error) => void> = [];
+  private jsonQueueSizes: number[] = [];
+  private jsonQueueBytes = 0;
+  private readonly jsonWaiters = new DirectWaiterQueue<ApiResult>();
   private jsonCaptureUntil = 0;
   private skippedNonSmsLogCount = 0;
   private idleDroppedNonSmsFrameCount = 0;
@@ -2549,11 +2959,15 @@ class DirectSession {
   private sessionId = Buffer.alloc(4);
   private route = Buffer.alloc(8);
   private trace: DirectProbeFrameTrace[] = [];
+  private traceTotal = 0;
   private bootstrapPayloads: ApiResult[] = [];
   private pushDeliveryConfirmSerial = 6;
   private trackCodeGenerator: (() => string) | null = null;
+  private resourceReleased = false;
 
-  constructor(private runtime: DirectRuntimeConfig, private host: string) {}
+  constructor(private runtime: DirectRuntimeConfig, private host: string) {
+    activeDirectSessionCount += 1;
+  }
 
   async open(account: DirectSessionAccount) {
     await this.openPrelogin(account);
@@ -2846,6 +3260,7 @@ class DirectSession {
     this.clearJsonQueue();
     this.beginJsonCapture(this.runtime.ioTimeoutMs);
     this.queue = [];
+    this.queueBytes = 0;
     dumpDirectDebugFrame(label, frame);
     await this.write(frame);
     return this.waitForJsonPayload(this.runtime.ioTimeoutMs, `${label} native activation response`, (payload) => {
@@ -3008,6 +3423,10 @@ class DirectSession {
       this.socket.destroy();
     }
     this.socket = null;
+    if (!this.resourceReleased) {
+      this.resourceReleased = true;
+      activeDirectSessionCount = Math.max(0, activeDirectSessionCount - 1);
+    }
   }
 
   isOpen() {
@@ -3016,6 +3435,10 @@ class DirectSession {
 
   getTrace() {
     return [...this.trace];
+  }
+
+  getTraceSince(totalSeen: number) {
+    return sliceDirectRetainedTrace(this.trace, this.traceTotal, totalSeen);
   }
 
   private async connectSocket(host: string, port: number, timeoutMs: number) {
@@ -3083,8 +3506,14 @@ class DirectSession {
   }
 
   private consume(chunk: Buffer) {
-    if (chunk.length > 0) {
-      this.buffer = Buffer.concat([this.buffer, chunk]);
+    const appended = appendDirectSocketBuffer(this.buffer, chunk);
+    this.buffer = appended.buffer;
+    if (appended.overflow) {
+      directResourceCounters.socketBufferOverflows += 1;
+      const error = new Error(`Direct gateway socket buffer exceeded ${MAX_DIRECT_BUFFER_BYTES} bytes`);
+      this.socket?.destroy(error);
+      this.failWaiters(error);
+      return;
     }
     while (this.buffer[0] === 0xff) {
       this.buffer = this.buffer.subarray(1);
@@ -3103,20 +3532,28 @@ class DirectSession {
       }
 
       const totalLen = this.buffer.readUInt32BE(2);
-      if (totalLen < 12 || this.buffer.length < totalLen) {
+      if (!isDirectFrameLengthAllowedForTest(totalLen)) {
+        directResourceCounters.oversizedFrames += 1;
+        const error = new Error(`Direct gateway declared invalid frame length ${totalLen}`);
+        this.buffer = Buffer.alloc(0);
+        this.socket?.destroy(error);
+        this.failWaiters(error);
+        return;
+      }
+      if (this.buffer.length < totalLen) {
         return;
       }
 
       const frame = this.buffer.subarray(0, totalLen);
       this.buffer = this.buffer.subarray(totalLen);
       const parsed = parseFrame(frame);
-      const shouldExtractJsonPayload = parsed.type === 0x8107 && parsed.status === 0x0102 && (this.jsonResolvers.length > 0 || Date.now() <= this.jsonCaptureUntil);
+      const shouldExtractJsonPayload = parsed.type === 0x8107 && parsed.status === 0x0102 && (this.jsonWaiters.size > 0 || Date.now() <= this.jsonCaptureUntil);
       const jsonPayload = shouldExtractJsonPayload ? extractJsonPayload(parsed.raw) : null;
       const shouldQueueRawFrame =
         parsed.type !== 0x8107 ||
         parsed.status === 0x0101 ||
         parsed.status === 0x0103 ||
-        this.resolvers.length > 0;
+        this.rawWaiters.size > 0;
       const shouldTraceFrame = shouldQueueRawFrame || Boolean(jsonPayload) || Boolean(process.env.DT_DIRECT_DEBUG_DUMP_DIR);
       if (!shouldTraceFrame) {
         this.pauseIdleSocketAfterDroppedFrame(parsed);
@@ -3145,11 +3582,19 @@ class DirectSession {
         bodyHexPreview: parsed.body.subarray(0, 160).toString("hex"),
         jsonPayload
       });
+      this.traceTotal += 1;
       if (this.trace.length > MAX_DIRECT_TRACE_FRAMES) {
         this.trace.splice(0, this.trace.length - MAX_DIRECT_TRACE_FRAMES);
       }
       if (jsonPayload) {
-        this.jsonQueue.push(jsonPayload);
+        const enqueueResult = enqueueDirectJsonPayload(
+          this.jsonQueue,
+          this.jsonQueueSizes,
+          jsonPayload,
+          this.jsonQueueBytes
+        );
+        this.jsonQueueBytes = enqueueResult.totalBytes;
+        directResourceCounters.jsonQueueDrops += enqueueResult.dropped;
         this.flushJsonWaiters();
       }
         const smsPush = parsed.type === 0x8107 && parsed.status === 0x0103 ? tryParseSmsPush(parsed.raw) ?? tryParseSmsPush(parsed.body) : null;
@@ -3165,7 +3610,9 @@ class DirectSession {
         });
       }
       if (shouldQueueRawFrame) {
-        this.queue.push(frame);
+        const enqueueResult = enqueueDirectRawFrame(this.queue, frame, this.queueBytes);
+        this.queueBytes = enqueueResult.totalBytes;
+        directResourceCounters.rawQueueDrops += enqueueResult.dropped;
         this.flushWaiters();
       }
       processedFrames += 1;
@@ -3390,7 +3837,7 @@ class DirectSession {
   ): Promise<ParsedFrame> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const queuedRaw = this.queue.shift();
+      const queuedRaw = this.shiftRawQueue();
       if (queuedRaw) {
         const parsed = parseFrame(queuedRaw);
         if (predicate(parsed)) {
@@ -3412,32 +3859,16 @@ class DirectSession {
   }
 
   private nextRawFrame(timeoutMs: number, label: string) {
-    if (this.queue.length > 0) {
-      return Promise.resolve(this.queue.shift()!);
+    const queued = this.shiftRawQueue();
+    if (queued) {
+      return Promise.resolve(queued);
     }
 
     if (this.closed) {
       return Promise.reject(new Error(`Direct gateway socket closed while waiting for ${label}`));
     }
 
-    return new Promise<Buffer>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.removeResolver(resolve, reject);
-        reject(new AppError(`Timed out waiting for ${label}`, 504, 504));
-      }, timeoutMs);
-
-      const resolver = (value: Buffer) => {
-        clearTimeout(timer);
-        resolve(value);
-      };
-      const rejector = (error: Error) => {
-        clearTimeout(timer);
-        reject(error);
-      };
-
-      this.resolvers.push(resolver);
-      this.rejectors.push(rejector);
-    });
+    return this.rawWaiters.wait(timeoutMs, () => new AppError(`Timed out waiting for ${label}`, 504, 504));
   }
 
   private async waitForJsonPayload(timeoutMs: number, label: string, predicate: (payload: ApiResult) => boolean = () => true) {
@@ -3445,14 +3876,14 @@ class DirectSession {
     while (Date.now() < deadline) {
       const queuedIndex = this.jsonQueue.findIndex((payload) => predicate(payload));
       if (queuedIndex >= 0) {
-        const [payload] = this.jsonQueue.splice(queuedIndex, 1);
+        const payload = this.removeJsonQueueAt(queuedIndex);
         if (payload) {
           return payload;
         }
       }
 
       if (this.jsonQueue.length > 0) {
-        const skipped = this.jsonQueue.shift();
+        const skipped = this.shiftJsonQueue();
         logger.debug("Skipped unrelated direct JSON payload while waiting for typed response", {
           host: this.host,
           label,
@@ -3481,47 +3912,26 @@ class DirectSession {
       return Promise.reject(new Error(`Direct gateway socket closed while waiting for ${label}`));
     }
 
-    return new Promise<ApiResult>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.removeJsonResolver(resolve, reject);
-        reject(new AppError(`Timed out waiting for ${label}`, 504, 504));
-      }, timeoutMs);
-
-      const resolver = (value: ApiResult) => {
-        clearTimeout(timer);
-        resolve(value);
-      };
-      const rejector = (error: Error) => {
-        clearTimeout(timer);
-        reject(error);
-      };
-
-      this.jsonResolvers.push(resolver);
-      this.jsonRejectors.push(rejector);
-    });
+    return this.jsonWaiters.wait(timeoutMs, () => new AppError(`Timed out waiting for ${label}`, 504, 504));
   }
 
   private flushWaiters() {
-    while (this.queue.length > 0 && this.resolvers.length > 0) {
-      const frame = this.queue.shift()!;
-      const resolver = this.resolvers.shift()!;
-      this.rejectors.shift();
-      resolver(frame);
+    while (this.queue.length > 0 && this.rawWaiters.size > 0) {
+      const frame = this.shiftRawQueue()!;
+      this.rawWaiters.resolveNext(frame);
     }
   }
 
   private flushJsonWaiters() {
-    while (this.jsonQueue.length > 0 && this.jsonResolvers.length > 0) {
-      const payload = this.jsonQueue.shift()!;
-      const resolver = this.jsonResolvers.shift()!;
-      this.jsonRejectors.shift();
-      resolver(payload);
+    while (this.jsonQueue.length > 0 && this.jsonWaiters.size > 0) {
+      const payload = this.shiftJsonQueue()!;
+      this.jsonWaiters.resolveNext(payload);
     }
   }
 
 
   private pauseIdleSocketAfterDroppedFrame(parsed: ParsedFrame) {
-    if (parsed.type !== 0x8107 || parsed.status === 0x0101 || parsed.status === 0x0103 || this.resolvers.length > 0 || this.jsonResolvers.length > 0) {
+    if (parsed.type !== 0x8107 || parsed.status === 0x0101 || parsed.status === 0x0103 || this.rawWaiters.size > 0 || this.jsonWaiters.size > 0) {
       this.idleDroppedNonSmsFrameCount = 0;
       return;
     }
@@ -3540,44 +3950,27 @@ class DirectSession {
     this.idleSocketPauseTimer.unref?.();
   }
   private failWaiters(error: Error) {
-    while (this.rejectors.length > 0) {
-      const rejector = this.rejectors.shift()!;
-      this.resolvers.shift();
-      rejector(error);
-    }
-    while (this.jsonRejectors.length > 0) {
-      const rejector = this.jsonRejectors.shift()!;
-      this.jsonResolvers.shift();
-      rejector(error);
-    }
+    this.rawWaiters.rejectAll(error);
+    this.jsonWaiters.rejectAll(error);
   }
 
-  private removeResolver(resolver: (value: Buffer) => void, rejector: (error: Error) => void) {
-    const index = this.resolvers.indexOf(resolver);
-    if (index >= 0) {
-      this.resolvers.splice(index, 1);
-      this.rejectors.splice(index, 1);
-      return;
+  private shiftRawQueue() {
+    const frame = this.queue.shift();
+    if (frame) {
+      this.queueBytes = Math.max(0, this.queueBytes - frame.length);
     }
-    const rejectIndex = this.rejectors.indexOf(rejector);
-    if (rejectIndex >= 0) {
-      this.resolvers.splice(rejectIndex, 1);
-      this.rejectors.splice(rejectIndex, 1);
-    }
+    return frame;
   }
 
-  private removeJsonResolver(resolver: (value: ApiResult) => void, rejector: (error: Error) => void) {
-    const index = this.jsonResolvers.indexOf(resolver);
-    if (index >= 0) {
-      this.jsonResolvers.splice(index, 1);
-      this.jsonRejectors.splice(index, 1);
-      return;
-    }
-    const rejectIndex = this.jsonRejectors.indexOf(rejector);
-    if (rejectIndex >= 0) {
-      this.jsonResolvers.splice(rejectIndex, 1);
-      this.jsonRejectors.splice(rejectIndex, 1);
-    }
+  private shiftJsonQueue() {
+    return this.removeJsonQueueAt(0);
+  }
+
+  private removeJsonQueueAt(index: number) {
+    const [payload] = this.jsonQueue.splice(index, 1);
+    const [payloadBytes] = this.jsonQueueSizes.splice(index, 1);
+    this.jsonQueueBytes = Math.max(0, this.jsonQueueBytes - (payloadBytes ?? 0));
+    return payload;
   }
 
   private beginJsonCapture(timeoutMs: number) {
@@ -3586,6 +3979,8 @@ class DirectSession {
 
   private clearJsonQueue() {
     this.jsonQueue = [];
+    this.jsonQueueSizes = [];
+    this.jsonQueueBytes = 0;
     this.jsonCaptureUntil = 0;
   }
 }
@@ -8092,6 +8487,14 @@ async function preemptActiveDirectPushListener(account: { dtUserId: string; devi
   }
   await active.done;
   return true;
+}
+
+export async function releaseDirectAccountRuntime(account: { dtUserId: string; deviceId?: string | null }) {
+  await preemptActiveDirectPushListener(account);
+  const accountKey = directSessionAccountKey(account);
+  directAccountPhoneCountryKeyCache.delete(account.dtUserId);
+  directSmsHostAffinity.delete(accountKey);
+  directWebOfflineDeliveryTrackers.delete(accountKey);
 }
 
 async function runWithDirectSessionOperationLock<T>(account: { dtUserId: string; deviceId?: string | null }, task: () => Promise<T>) {

@@ -54,7 +54,7 @@ const defaultSettings = [
   ["direct_message_listen_seconds", "900", "Direct SMS push listen window in seconds"],
   ["direct_message_refresh_wait_seconds", "8", "Direct SMS refresh wait window in seconds"],
   ["direct_monitor_max_concurrent", "10", "Maximum concurrent direct SMS monitor sockets"],
-  ["direct_monitor_app_catchup_enabled", "true", "Allow direct monitors to scan app/helper/ADB messages as a fallback"],
+  ["direct_monitor_app_catchup_enabled", "false", "Allow direct monitors to scan app/helper/ADB messages as a fallback"],
   ["direct_monitor_app_catchup_seconds", "15", "Interval for direct monitors to scan app/helper/ADB messages as a fallback"],
   ["code_receiver_api_tokens", "", "Comma/newline separated code receiver API tokens. Use token or adminId:token."],
   ["auto_refresh_interval", String(config.DEFAULT_AUTO_REFRESH_INTERVAL), "Account auto refresh interval in seconds"],
@@ -89,7 +89,6 @@ const legacySettingRewrites = [
   ["direct_monitor_max_concurrent", "3", "10"],
   ["direct_monitor_max_concurrent", "2", "10"],
   ["direct_monitor_max_concurrent", "0", "10"],
-  ["direct_monitor_app_catchup_enabled", "false", "true"],
   ["dt_adb_dingdong_package", "me.talkyou.app.im", "me.dingtone.app.im"],
   ["dt_adb_dingtone_main_activity", ".activity.TalkuMainActivity", ".activity.TalkuSplashActivity"],
   ["dt_adb_dingdong_main_activity", ".activity.DTActivity", ".activity.SplashActivity"]

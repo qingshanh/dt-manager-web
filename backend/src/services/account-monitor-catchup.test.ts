@@ -5,23 +5,27 @@ import test from "node:test";
 const monitorSource = readFileSync(new URL("./account-monitor.ts", import.meta.url), "utf8");
 const settingsSource = readFileSync(new URL("./settings.service.ts", import.meta.url), "utf8");
 
-test("direct monitor enables app catch-up by default for intermittent SMS pushes", () => {
-  assert.match(settingsSource, /\["direct_monitor_app_catchup_enabled", "true"/);
-  assert.match(monitorSource, /parseBooleanSetting\(settings\.direct_monitor_app_catchup_enabled, true\)/);
+test("direct monitor app catch-up requires both the environment gate and the persisted setting", () => {
+  assert.match(settingsSource, /\["direct_monitor_app_catchup_enabled", "false"/);
+  assert.match(monitorSource, /config\.DT_ALLOW_APP_FALLBACK\s*&&\s*parseBooleanSetting\(settings\.direct_monitor_app_catchup_enabled, false\)/);
+  assert.doesNotMatch(settingsSource, /\["direct_monitor_app_catchup_enabled", "false", "true"\]/);
 });
 
 test("direct monitor schedules app catch-up after non-SMS push activity", () => {
   assert.match(monitorSource, /shouldScheduleAppCatchupForFrame\(liveState\)/);
   assert.match(monitorSource, /scheduleAppCatchup\("direct-frame-gap"\)/);
 });
-test("direct monitor serializes app fallback scans across accounts", () => {
-  assert.match(monitorSource, /let appFallbackScanQueue = Promise\.resolve\(\)/);
-  assert.match(monitorSource, /runSerializedAppFallbackScan/);
-  assert.match(monitorSource, /appFallbackScanQueue = appFallbackScanQueue\.then\(run, run\)/);
+test("direct monitor sends explicit app fallback work through the shared bounded queue", () => {
+  assert.match(monitorSource, /import \{ runtimeWorkQueue \} from "\.\/runtime-work-queue\.js"/);
   assert.match(
     monitorSource,
-    /await runSerializedAppFallbackScan\(\(\) =>\s*this\.pollAppFallbackMessages\(runner, account\)\s*\)/
+    /runtimeWorkQueue\.run\(`app-fallback:\$\{runner\.accountId\}`, \(\) =>\s*this\.pollAppFallbackMessages\(runner, account\)\s*\)/
   );
+});
+
+test("direct monitor does not create a periodic ADB scan timer", () => {
+  assert.doesNotMatch(monitorSource, /const appCatchupTimer = runner\.appCatchupEnabled/);
+  assert.doesNotMatch(monitorSource, /scheduleAppCatchup\("interval"\)/);
 });
 
 test("app fallback only scans the account currently logged into the matching app", () => {

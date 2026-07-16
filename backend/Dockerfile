@@ -26,9 +26,12 @@ COPY package.json package-lock.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/prisma ./prisma
+COPY docker-entrypoint.sh /usr/local/bin/dt-manager-entrypoint
 
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data && chmod 755 /usr/local/bin/dt-manager-entrypoint
 
 EXPOSE 5174
 
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["dt-manager-entrypoint"]
+CMD ["node", "dist/index.js"]

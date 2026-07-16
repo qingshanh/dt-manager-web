@@ -1,6 +1,7 @@
 import { PhoneStatus } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { logger } from "../utils/logger.js";
+import { BackgroundLoop } from "./background-loop.js";
 import { sendAccountTelegramNotification } from "./telegram-notifier.js";
 
 const CHECK_INTERVAL_MS = 60 * 60_000;
@@ -8,42 +9,27 @@ const CHECK_INTERVAL_MS = 60 * 60_000;
 type ExpiryMilestone = "7d" | "3d" | "1d" | "expired";
 
 class PhoneExpiryReminderService {
-  private timer: NodeJS.Timeout | null = null;
-  private running = false;
+  private readonly loop = new BackgroundLoop({
+    initialDelayMs: 20_000,
+    defaultDelayMs: CHECK_INTERVAL_MS,
+    task: () => this.runCycle(),
+    onError: (error) => {
+      logger.warn("Phone expiry reminder cycle failed", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  });
 
   start() {
-    if (this.timer) {
-      return;
-    }
-    this.schedule(20_000);
+    this.loop.start();
   }
 
   stop() {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-  }
-
-  private schedule(delayMs: number) {
-    this.stop();
-    this.timer = setTimeout(() => {
-      void this.runCycle().catch((error) => {
-        logger.warn("Phone expiry reminder cycle failed", {
-          error: error instanceof Error ? error.message : String(error)
-        });
-      });
-    }, delayMs);
+    return this.loop.stop();
   }
 
   private async runCycle() {
-    if (this.running) {
-      this.schedule(CHECK_INTERVAL_MS);
-      return;
-    }
-    this.running = true;
-    try {
-      const phones = await prisma.phoneNumber.findMany({
+    const phones = await prisma.phoneNumber.findMany({
         where: { status: { in: [PhoneStatus.active, PhoneStatus.expired] } },
         include: {
           account: {
@@ -57,8 +43,8 @@ class PhoneExpiryReminderService {
             }
           }
         }
-      });
-      for (const phone of phones) {
+    });
+    for (const phone of phones) {
         const expiresAt = parseEpoch(phone.expiredTime);
         if (!expiresAt || !phone.account.telegramNotify) {
           continue;
@@ -97,10 +83,6 @@ class PhoneExpiryReminderService {
             create: { key: settingKey, value: String(expiresAt), description: "Phone expiry Telegram notice checkpoint" }
           });
         }
-      }
-    } finally {
-      this.running = false;
-      this.schedule(CHECK_INTERVAL_MS);
     }
   }
 }

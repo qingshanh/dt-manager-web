@@ -1,6 +1,6 @@
 {
     "name":  "dt-manager-backend",
-    "version":  "0.2.8",
+    "version":  "0.2.9",
     "private":  true,
     "type":  "module",
     "scripts":  {
@@ -10,6 +10,7 @@
                     "start":  "node dist/index.js",
                     "verify:direct-session":  "tsx src/scripts/verify-direct-session.ts",
                     "verify:direct-regression":  "tsx src/scripts/verify-direct-regression.ts",
+                    "verify:runtime-bounds":  "node --import tsx --test src/services/dingtone/direct-resource-bounds.test.ts src/services/dingtone/direct-session-queue.test.ts src/services/runtime-work-queue.test.ts src/routes/events-lifecycle.test.ts",
                     "verify:direct-phone-actions":  "tsx src/scripts/verify-direct-phone-actions.ts",
                     "probe:direct-access-code":  "tsx src/scripts/probe-direct-access-code.ts",
                     "import:direct-template":  "tsx src/scripts/import-direct-template.ts",

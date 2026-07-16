@@ -1,4 +1,5 @@
 import { AccountStatus, MonitorStatus } from "@prisma/client";
+import type { Server } from "node:http";
 import cors from "cors";
 import express from "express";
 import helmet from "helmet";
@@ -7,12 +8,13 @@ import { config } from "./config.js";
 import { prisma } from "./lib/prisma.js";
 import { authRouter } from "./routes/auth.js";
 import { dashboardRouter } from "./routes/dashboard.js";
-import { eventsRouter } from "./routes/events.js";
+import { closeAllSseConnections, eventsRouter } from "./routes/events.js";
 import { accountsRouter, syncPhoneNumbersFromRemote } from "./routes/accounts.js";
 import { createPhoneNumbersRouter } from "./routes/phone-numbers.js";
 import { codeReceiverRouter } from "./routes/code-receiver.js";
 import { settingsRouter } from "./routes/settings.js";
 import { versionRouter } from "./routes/version.js";
+import { createRuntimeRouter } from "./routes/runtime.js";
 import { requireAuth } from "./middleware/auth.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { ensureDefaultAdmin } from "./services/admin.service.js";
@@ -21,9 +23,19 @@ import { ensureDefaultSettings, getGatewayMode, getSettingsMap } from "./service
 import { telegramBotService } from "./services/telegram-bot.js";
 import { accountAutoRefreshService } from "./services/account-auto-refresh.js";
 import { phoneExpiryReminderService } from "./services/phone-expiry-reminder.js";
+import { buildHealthPayload } from "./services/runtime-health.js";
+import { installJsonBodyParsers } from "./services/request-body-limits.js";
+import { buildRuntimeStatus } from "./services/runtime-status.js";
+import { runtimeMetrics } from "./services/runtime-metrics.js";
+import { runtimeWorkQueue } from "./services/runtime-work-queue.js";
+import { getDirectRuntimeResourceSnapshot } from "./services/dingtone/direct-gateway.js";
+import { RuntimeLifecycle } from "./services/runtime-lifecycle.js";
 import { logger } from "./utils/logger.js";
 
 logger.setLevel(config.LOG_LEVEL);
+const processStartedAt = new Date();
+const FATAL_LISTEN_EXIT_CODE = 78;
+let requestRuntimeShutdown: ((reason: string, exitCode: number) => Promise<void>) | null = null;
 
 function formatFatalError(error: unknown) {
   if (error instanceof Error) {
@@ -42,10 +54,46 @@ process.on("unhandledRejection", (reason) => {
 
 process.on("uncaughtException", (error) => {
   logger.error("Uncaught backend exception", formatFatalError(error));
+  if (requestRuntimeShutdown) {
+    void requestRuntimeShutdown("uncaughtException", 1);
+  } else {
+    process.exitCode = 1;
+  }
 });
 
 const app = express();
 const phoneNumbersRouter = createPhoneNumbersRouter(syncPhoneNumbersFromRemote);
+const runtimeRouter = createRuntimeRouter(() => {
+  const monitorWithSnapshot = accountMonitorService as typeof accountMonitorService & {
+    snapshot?: () => {
+      runnerCount: number;
+      runningCount: number;
+      shuttingDown: boolean;
+      activeDirectMonitorPolls: number;
+      appFallbackCooldownUntil: number;
+      appFallbackProbeInFlight: boolean;
+    };
+  };
+  return buildRuntimeStatus({
+    metrics: runtimeMetrics.snapshot(),
+    monitor: (() => {
+      const snapshot = monitorWithSnapshot.snapshot?.();
+      return snapshot
+        ? {
+            activeRunners: snapshot.runnerCount,
+            runningCount: snapshot.runningCount,
+            shuttingDown: snapshot.shuttingDown,
+            activeDirectMonitorPolls: snapshot.activeDirectMonitorPolls,
+            appFallbackCooldownUntil: snapshot.appFallbackCooldownUntil,
+            appFallbackProbeInFlight: snapshot.appFallbackProbeInFlight
+          }
+        : { activeRunners: 0, shuttingDown: false };
+    })(),
+    direct: getDirectRuntimeResourceSnapshot(),
+    queue: runtimeWorkQueue.snapshot(),
+    appFallbackAllowed: config.DT_ALLOW_APP_FALLBACK
+  });
+});
 
 app.use(helmet());
 app.use(
@@ -53,7 +101,7 @@ app.use(
     origin: config.CORS_ORIGIN.split(",").map((item) => item.trim())
   })
 );
-app.use(express.json({ limit: "100mb" }));
+installJsonBodyParsers(app, requireAuth);
 app.use(
   "/api/auth/login",
   rateLimit({
@@ -71,12 +119,12 @@ app.use(
 
 app.get("/health", async (_req, res, next) => {
   try {
-    res.json({
-      ok: true,
+    res.json(buildHealthPayload({
       version: config.APP_VERSION,
-      now: new Date().toISOString(),
-      gatewayMode: await getGatewayMode()
-    });
+      gatewayMode: await getGatewayMode(),
+      instanceId: config.DT_RUNTIME_INSTANCE_ID,
+      startedAt: processStartedAt
+    }));
   } catch (error) {
     next(error);
   }
@@ -90,6 +138,7 @@ app.use("/api/phone-numbers", requireAuth, phoneNumbersRouter);
 app.use("/api/code-receiver", codeReceiverRouter);
 app.use("/api/settings", requireAuth, settingsRouter);
 app.use("/api/version", requireAuth, versionRouter);
+app.use("/api/runtime", requireAuth, runtimeRouter);
 
 app.use(errorHandler);
 
@@ -138,7 +187,11 @@ async function bootstrap() {
   await prisma.$connect();
   await ensureDefaultAdmin();
   await ensureDefaultSettings();
+  let shuttingDown = false;
   const server = app.listen(config.PORT, () => {
+    if (shuttingDown) {
+      return;
+    }
     logger.info(`Backend listening on http://localhost:${config.PORT}`);
     void getSettingsMap()
       .then((settings) => {
@@ -156,11 +209,72 @@ async function bootstrap() {
     accountAutoRefreshService.start();
     phoneExpiryReminderService.start();
   });
+  const lifecycle = new RuntimeLifecycle({
+    markStopping: () => {
+      shuttingDown = true;
+      runtimeMetrics.setGauge("runtime.shuttingDown", 1);
+    },
+    stopTelegram: () => telegramBotService.stop(),
+    stopAutoRefresh: () => accountAutoRefreshService.stop(),
+    stopExpiryReminder: () => phoneExpiryReminderService.stop(),
+    stopWorkQueue: () => runtimeWorkQueue.stop(),
+    stopAccountMonitor: () => accountMonitorService.stopAll(),
+    closeHttp: () => closeHttpServer(server),
+    forceCloseHttp: () => server.closeAllConnections?.(),
+    closeSse: closeAllSseConnections,
+    disconnectPrisma: () => prisma.$disconnect(),
+    timeoutMs: 15_000
+  });
+  let shutdownExitCode = 0;
+  let shutdownPromise: Promise<void> | null = null;
+  requestRuntimeShutdown = (reason, exitCode) => {
+    shutdownExitCode = Math.max(shutdownExitCode, exitCode);
+    process.exitCode = shutdownExitCode;
+    if (shutdownPromise) {
+      return shutdownPromise;
+    }
+    shutdownPromise = (async () => {
+      const hardExitTimer = setTimeout(() => {
+        logger.error("Backend shutdown exceeded the hard exit deadline", { reason });
+        process.exit(shutdownExitCode);
+      }, 18_000);
+      hardExitTimer.unref();
+      try {
+        const result = await lifecycle.shutdown(reason);
+        if (result.warnings.length > 0) {
+          logger.warn("Backend shutdown completed with warnings", { reason, warnings: result.warnings });
+        } else {
+          logger.info("Backend shutdown completed", { reason });
+        }
+      } finally {
+        clearTimeout(hardExitTimer);
+        process.exit(shutdownExitCode);
+      }
+    })();
+    return shutdownPromise;
+  };
+  process.once("SIGINT", () => void requestRuntimeShutdown?.("SIGINT", 0));
+  process.once("SIGTERM", () => void requestRuntimeShutdown?.("SIGTERM", 0));
   server.on("error", (error: NodeJS.ErrnoException) => {
     logger.error("Backend HTTP server error", formatFatalError(error));
     if (error.code === "EADDRINUSE" || error.code === "EACCES") {
-      process.exit(1);
+      void requestRuntimeShutdown?.("listen-fatal", FATAL_LISTEN_EXIT_CODE);
     }
+  });
+}
+
+function closeHttpServer(server: Server) {
+  if (!server.listening) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
   });
 }
 

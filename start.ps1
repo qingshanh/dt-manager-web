@@ -17,8 +17,11 @@ $backendDir = Join-Path $root "backend"
 $frontendDir = Join-Path $root "frontend"
 $helperDir = Join-Path $backendDir "helper"
 $logDir = Join-Path $root "_tmp\logs"
+$runtimeDir = Join-Path $root "_tmp\runtime"
+$manifestPath = Join-Path $runtimeDir "processes.json"
 $powershellExe = (Get-Command powershell.exe).Source
 $envFile = Join-Path $root ".env"
+. (Join-Path $root "tools\runtime-process-lib.ps1")
 
 try {
   [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -141,7 +144,8 @@ function Wait-HttpEndpoint {
   param(
     [string]$Name,
     [string]$Url,
-    [int]$TimeoutSeconds = 30
+    [int]$TimeoutSeconds = 30,
+    [string]$ExpectedInstanceId = ""
   )
 
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -150,6 +154,14 @@ function Wait-HttpEndpoint {
     try {
       $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
       if ([int]$response.StatusCode -ge 200 -and [int]$response.StatusCode -lt 500) {
+        if ($ExpectedInstanceId) {
+          $health = $response.Content | ConvertFrom-Json
+          if ($health.instanceId -ne $ExpectedInstanceId) {
+            $lastError = "endpoint instance '$($health.instanceId)' does not match '$ExpectedInstanceId'"
+            Start-Sleep -Milliseconds 500
+            continue
+          }
+        }
         Write-Host ("[{0}] ready at {1}" -f $Name, $Url)
         return
       }
@@ -164,29 +176,10 @@ function Wait-HttpEndpoint {
   throw ("{0} did not become ready at {1}. Last error: {2}. Logs: {3}, {4}" -f $Name, $Url, $lastError, $stdoutPath, $stderrPath)
 }
 
-function Stop-ProcessTree {
-  param([int]$ProcessId)
-
-  $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue
-  foreach ($child in $children) {
-    Stop-ProcessTree -ProcessId $child.ProcessId | Out-Null
-  }
-
-  if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
-    return $true
-  }
-
-  try {
-    Stop-Process -Id $ProcessId -Force -ErrorAction Stop
-    Wait-Process -Id $ProcessId -Timeout 5 -ErrorAction SilentlyContinue
-    return -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
-  } catch {
-    return $false
-  }
-}
-
-function Stop-ProjectProcesses {
+function Legacy-CommandLineCleanupDisabled {
   param([string]$ProjectRoot)
+
+  throw "Legacy command-line process cleanup is disabled; use the runtime ownership manifest."
 
   $patterns = @(
     "Set-Location -LiteralPath '.*\\backend'",
@@ -237,7 +230,7 @@ function Stop-ProjectProcesses {
 
   foreach ($process in $targeted) {
     try {
-      Stop-ProcessTree -ProcessId $process.ProcessId | Out-Null
+      Legacy-StopProcessTreeDisabled -ProcessId $process.ProcessId | Out-Null
       Write-Host ("[cleanup] stopped old project process pid {0}" -f $process.ProcessId)
     } catch {
       Write-Host ("[cleanup] failed to stop pid {0}: {1}" -f $process.ProcessId, $_.Exception.Message)
@@ -266,6 +259,123 @@ function Stop-ProjectProcesses {
   } catch {
     Write-Host "[cleanup] 无法读取剩余进程列表，已跳过收尾清理"
   }
+}
+
+function Stop-RuntimeManifestServices {
+  param($Manifest)
+
+  if ($null -eq $Manifest) {
+    return
+  }
+  foreach ($service in @($Manifest.services)) {
+    $isLegacy = $null -ne $service.PSObject.Properties["legacy"] -and [bool]$service.legacy
+    $rootRecord = Get-RuntimeProcessRecord -ProcessId ([int]$service.rootPid)
+    $canCapture = if ($isLegacy) {
+      $null -ne $rootRecord -and (Test-RuntimeCreationTimeEqual -Expected ([string]$service.creationTime) -Actual $rootRecord.CreationDate)
+    } else {
+      Test-OwnedRuntimeProcess -ProcessId ([int]$service.rootPid) -CreationTime ([string]$service.creationTime) -InstanceId ([string]$Manifest.instanceId)
+    }
+    if ($canCapture) {
+      $descendantSnapshots = @(Get-DescendantProcessSnapshot -RootPid ([int]$service.rootPid))
+      Set-RuntimeServiceDescendantSnapshots -Service $service -Snapshots $descendantSnapshots | Out-Null
+    }
+  }
+  Write-RuntimeManifestAtomic -Path $manifestPath -Manifest $Manifest
+  foreach ($service in @($Manifest.services | Sort-Object { $_.name -eq "backend" } -Descending)) {
+    $isLegacy = $null -ne $service.PSObject.Properties["legacy"] -and [bool]$service.legacy
+    $stopped = if ($isLegacy) {
+      Stop-LegacyRuntimeService -Service $service
+    } else {
+      Stop-OwnedRuntimeService -Service $service -InstanceId $Manifest.instanceId
+    }
+    if (-not $stopped) {
+      throw "Refusing to stop unverified service '$($service.name)' PID $($service.rootPid)."
+    }
+  }
+  $residuals = @(Test-RuntimeManifestResiduals -Manifest $Manifest)
+  if ($residuals.Count -gt 0) {
+    throw ($residuals -join [Environment]::NewLine)
+  }
+}
+
+function Assert-PortAvailable {
+  param([int]$Port, [string]$Name)
+
+  $ownerPid = Get-PortOwnerProcessId -Port $Port
+  if ($null -ne $ownerPid) {
+    throw "$Name port $Port is already owned by unrelated PID $ownerPid."
+  }
+}
+
+function Register-RuntimeService {
+  param($Manifest, [string]$Name, $Process, [int]$Port, [string]$CreationTime = "")
+
+  if (-not $CreationTime) {
+    for ($attempt = 0; $attempt -lt 10 -and -not $CreationTime; $attempt++) {
+      $CreationTime = Get-ProcessCreationTime -ProcessId $Process.Id
+      if (-not $CreationTime) {
+        Start-Sleep -Milliseconds 100
+      }
+    }
+  }
+  if (-not $CreationTime) {
+    throw "Could not capture creation time for $Name PID $($Process.Id)."
+  }
+  $updated = Add-RuntimeService -Manifest $Manifest -Name $Name -RootPid $Process.Id -CreationTime $CreationTime -Port $Port
+  Write-RuntimeManifestAtomic -Path $manifestPath -Manifest $updated
+  return $updated
+}
+
+function Get-StartedRuntimeProcessSnapshot {
+  param($Process, [string]$Name, [int]$Port)
+
+  $creationTime = $null
+  try {
+    $creationTime = $Process.StartTime.ToUniversalTime().ToString("o")
+  } catch {
+  }
+  for ($attempt = 0; $attempt -lt 10 -and -not $creationTime; $attempt++) {
+    $creationTime = Get-ProcessCreationTime -ProcessId $Process.Id
+    if (-not $creationTime) {
+      Start-Sleep -Milliseconds 100
+    }
+  }
+  if (-not $creationTime) {
+    throw "Could not capture creation time for $Name PID $($Process.Id)."
+  }
+  return [pscustomobject]@{
+    name = $Name
+    port = $Port
+    processId = [int]$Process.Id
+    creationTime = $creationTime
+  }
+}
+
+function Stop-PendingRuntimeProcess {
+  param($Pending)
+
+  $descendantSnapshots = @(Get-DescendantProcessSnapshot -RootPid ([int]$Pending.processId))
+  if ($null -eq $Pending.PSObject.Properties["descendantSnapshots"]) {
+    $Pending | Add-Member -NotePropertyName descendantSnapshots -NotePropertyValue $descendantSnapshots
+  } else {
+    $Pending.descendantSnapshots = $descendantSnapshots
+  }
+  $rootStopped = Stop-RuntimeProcessIfUnchanged -Snapshot ([pscustomobject]@{
+    processId = [int]$Pending.processId
+    creationTime = [string]$Pending.creationTime
+  })
+  $descendantsStopped = $true
+  foreach ($snapshot in $descendantSnapshots) {
+    if (-not (Stop-RuntimeProcessIfUnchanged -Snapshot $snapshot)) {
+      $descendantsStopped = $false
+    }
+  }
+  foreach ($snapshot in $descendantSnapshots) {
+    if (Test-RuntimeProcessSnapshotUnchanged -Snapshot $snapshot) {
+      $descendantsStopped = $false
+    }
+  }
+  return $rootStopped -and $descendantsStopped
 }
 
 function Invoke-WithRetry {
@@ -349,10 +459,24 @@ if (@("usb", "local", "remote", "id") -notcontains $HelperDeviceMode) {
 }
 
 Assert-Command npm
-Assert-Command python
+if ($WithHelper) {
+  Assert-Command python
+}
 
-Write-Host "[cleanup] stopping leftover project processes..."
-Stop-ProjectProcesses -ProjectRoot $root
+$instanceId = [guid]::NewGuid().ToString("D")
+$manifest = New-RuntimeManifest -ProjectRoot $root -InstanceId $instanceId
+$previousManifest = Read-RuntimeManifest -Path $manifestPath -ExpectedProjectRoot $root
+if ($null -ne $previousManifest) {
+  Write-Host "[cleanup] stopping services owned by the previous runtime manifest..."
+  Stop-RuntimeManifestServices -Manifest $previousManifest
+  Remove-RuntimeManifest -Path $manifestPath
+}
+
+Assert-PortAvailable -Port $BackendPort -Name "Backend"
+Assert-PortAvailable -Port $FrontendPort -Name "Frontend"
+if ($WithHelper) {
+  Assert-PortAvailable -Port $HelperPort -Name "Helper"
+}
 
 if (-not $SkipInstall) {
   if (-not (Test-Path (Join-Path $backendDir "node_modules"))) {
@@ -402,56 +526,81 @@ if ($WithHelper) {
   }
 }
 
-$processes = @()
+$pendingProcessSnapshots = @()
 
 $backendUrl = "http://localhost:$BackendPort"
 $frontendUrl = "http://localhost:$FrontendPort"
 $helperUrl = "http://127.0.0.1:$HelperPort"
-$appVersion = Resolve-EnvString -Value "" -Name "APP_VERSION" -Default "0.2.8"
+$appVersion = Resolve-EnvString -Value "" -Name "APP_VERSION" -Default "0.2.9"
 $viteAppVersion = Resolve-EnvString -Value "" -Name "VITE_APP_VERSION" -Default $appVersion
 $helperBindHost = Resolve-EnvString -Value "" -Name "DT_HELPER_BIND_HOST" -Default "127.0.0.1"
 $helperToken = Resolve-EnvString -Value "" -Name "DT_HELPER_TOKEN" -Default ""
 $corsOrigin = Resolve-EnvString -Value "" -Name "CORS_ORIGIN" -Default "$frontendUrl,http://127.0.0.1:$FrontendPort"
 $viteDevHost = Resolve-EnvString -Value "" -Name "VITE_DEV_HOST" -Default "0.0.0.0"
+$appFallbackEnabled = $WithHelper.IsPresent.ToString().ToLowerInvariant()
 
-$backendCommand = @(
-  "Set-Location -LiteralPath '" + (Escape-SingleQuote $backendDir) + "';"
-  "`$env:DT_ENV_FILE = '" + (Escape-SingleQuote $envFile) + "';"
-  "`$env:PORT = '$BackendPort';"
-  "`$env:APP_VERSION = '" + (Escape-SingleQuote $appVersion) + "';"
-  "`$env:CORS_ORIGIN = '" + (Escape-SingleQuote $corsOrigin) + "';"
-  "npm run dev"
-) -join " "
-$processes += Start-DetachedPowerShell -Name "backend" -WorkingDirectory $backendDir -Command $backendCommand
+try {
+  Write-RuntimeManifestAtomic -Path $manifestPath -Manifest $manifest
 
-$frontendCommand = @(
-  "Set-Location -LiteralPath '" + (Escape-SingleQuote $frontendDir) + "';"
-  "`$env:VITE_DEV_PORT = '$FrontendPort';"
-  "`$env:VITE_BACKEND_URL = '$backendUrl';"
-  "`$env:VITE_APP_VERSION = '" + (Escape-SingleQuote $viteAppVersion) + "';"
-  "npm run dev -- --host '" + (Escape-SingleQuote $viteDevHost) + "'"
-) -join " "
-$processes += Start-DetachedPowerShell -Name "frontend" -WorkingDirectory $frontendDir -Command $frontendCommand
-
-if ($WithHelper) {
-  $helperCommand = @(
-    "Set-Location -LiteralPath '" + (Escape-SingleQuote $helperDir) + "';"
-    "`$env:DT_HELPER_BIND_HOST = '" + (Escape-SingleQuote $helperBindHost) + "';"
-    "`$env:DT_HELPER_PORT = '$HelperPort';"
-    "`$env:DT_HELPER_DEVICE_MODE = '" + (Escape-SingleQuote $HelperDeviceMode) + "';"
-    "`$env:DT_HELPER_REMOTE_HOST = '" + (Escape-SingleQuote $HelperRemoteHost) + "';"
-    "`$env:DT_HELPER_DEVICE_ID = '" + (Escape-SingleQuote $HelperDeviceId) + "';"
-    "`$env:DT_HELPER_TOKEN = '" + (Escape-SingleQuote $helperToken) + "';"
-    "python server.py"
+  $backendCommand = @(
+    "Set-Location -LiteralPath '" + (Escape-SingleQuote $backendDir) + "';"
+    "`$env:DT_RUNTIME_INSTANCE_ID = '$instanceId';"
+    "`$env:DT_ALLOW_APP_FALLBACK = '$appFallbackEnabled';"
+    "`$env:DT_ENV_FILE = '" + (Escape-SingleQuote $envFile) + "';"
+    "`$env:PORT = '$BackendPort';"
+    "`$env:APP_VERSION = '" + (Escape-SingleQuote $appVersion) + "';"
+    "`$env:CORS_ORIGIN = '" + (Escape-SingleQuote $corsOrigin) + "';"
+    "npm run dev"
   ) -join " "
-  $processes += Start-DetachedPowerShell -Name "helper" -WorkingDirectory $helperDir -Command $helperCommand
-}
+  $backendProcess = Start-DetachedPowerShell -Name "backend" -WorkingDirectory $backendDir -Command $backendCommand
+  $backendPending = Get-StartedRuntimeProcessSnapshot -Process $backendProcess -Name "backend" -Port $BackendPort
+  $pendingProcessSnapshots += $backendPending
+  $manifest = Register-RuntimeService -Manifest $manifest -Name "backend" -Process $backendProcess -Port $BackendPort -CreationTime $backendPending.creationTime
+  $pendingProcessSnapshots = @($pendingProcessSnapshots | Where-Object { $_.processId -ne $backendPending.processId })
 
-Wait-HttpEndpoint -Name "backend" -Url "$backendUrl/health"
-Wait-HttpEndpoint -Name "frontend" -Url $frontendUrl
-if ($WithHelper) {
-  Wait-HttpEndpoint -Name "helper" -Url "$helperUrl/health"
-}
+  $frontendCommand = @(
+    "Set-Location -LiteralPath '" + (Escape-SingleQuote $frontendDir) + "';"
+    "`$env:DT_RUNTIME_INSTANCE_ID = '$instanceId';"
+    "`$env:VITE_DEV_PORT = '$FrontendPort';"
+    "`$env:VITE_BACKEND_URL = '$backendUrl';"
+    "`$env:VITE_APP_VERSION = '" + (Escape-SingleQuote $viteAppVersion) + "';"
+    "npm run dev -- --host '" + (Escape-SingleQuote $viteDevHost) + "'"
+  ) -join " "
+  $frontendProcess = Start-DetachedPowerShell -Name "frontend" -WorkingDirectory $frontendDir -Command $frontendCommand
+  $frontendPending = Get-StartedRuntimeProcessSnapshot -Process $frontendProcess -Name "frontend" -Port $FrontendPort
+  $pendingProcessSnapshots += $frontendPending
+  $manifest = Register-RuntimeService -Manifest $manifest -Name "frontend" -Process $frontendProcess -Port $FrontendPort -CreationTime $frontendPending.creationTime
+  $pendingProcessSnapshots = @($pendingProcessSnapshots | Where-Object { $_.processId -ne $frontendPending.processId })
+
+  if ($WithHelper) {
+    $helperCommand = @(
+      "Set-Location -LiteralPath '" + (Escape-SingleQuote $helperDir) + "';"
+      "`$env:DT_RUNTIME_INSTANCE_ID = '$instanceId';"
+      "`$env:DT_HELPER_BIND_HOST = '" + (Escape-SingleQuote $helperBindHost) + "';"
+      "`$env:DT_HELPER_PORT = '$HelperPort';"
+      "`$env:DT_HELPER_DEVICE_MODE = '" + (Escape-SingleQuote $HelperDeviceMode) + "';"
+      "`$env:DT_HELPER_REMOTE_HOST = '" + (Escape-SingleQuote $HelperRemoteHost) + "';"
+      "`$env:DT_HELPER_DEVICE_ID = '" + (Escape-SingleQuote $HelperDeviceId) + "';"
+      "python server.py"
+    ) -join " "
+    $previousHelperToken = [Environment]::GetEnvironmentVariable("DT_HELPER_TOKEN", "Process")
+    try {
+      [Environment]::SetEnvironmentVariable("DT_HELPER_TOKEN", $helperToken, "Process")
+      $helperProcess = Start-DetachedPowerShell -Name "helper" -WorkingDirectory $helperDir -Command $helperCommand
+    } finally {
+      [Environment]::SetEnvironmentVariable("DT_HELPER_TOKEN", $previousHelperToken, "Process")
+    }
+    $helperPending = Get-StartedRuntimeProcessSnapshot -Process $helperProcess -Name "helper" -Port $HelperPort
+    $pendingProcessSnapshots += $helperPending
+    $manifest = Register-RuntimeService -Manifest $manifest -Name "helper" -Process $helperProcess -Port $HelperPort -CreationTime $helperPending.creationTime
+    $pendingProcessSnapshots = @($pendingProcessSnapshots | Where-Object { $_.processId -ne $helperPending.processId })
+  }
+
+  Wait-HttpEndpoint -Name "backend" -Url "$backendUrl/health" -ExpectedInstanceId $instanceId
+  Wait-HttpEndpoint -Name "frontend" -Url $frontendUrl
+  if ($WithHelper) {
+    Wait-HttpEndpoint -Name "helper" -Url "$helperUrl/health"
+  }
 
 Write-Host ""
 Write-Host "Ready:"
@@ -465,9 +614,36 @@ if ($WithHelper) {
   }
 }
 
-if ($OpenBrowser) {
-  Start-Process $frontendUrl
-}
+  if ($OpenBrowser) {
+    Start-Process $frontendUrl
+  }
 
-Write-Host ""
-Write-Host "Use stop.bat or stop.ps1 to stop the services."
+  Write-Host ""
+  Write-Host "Use stop.bat or stop.ps1 to stop the services."
+} catch {
+  $startupError = $_
+  $cleanupFailures = @()
+  try {
+    Stop-RuntimeManifestServices -Manifest $manifest
+  } catch {
+    $cleanupFailures += $_.Exception.Message
+  }
+  foreach ($pending in @($pendingProcessSnapshots)) {
+    if (-not (Stop-PendingRuntimeProcess -Pending $pending)) {
+      $manifest = Add-RuntimeService -Manifest $manifest -Name ([string]$pending.name) -RootPid ([int]$pending.processId) `
+        -CreationTime ([string]$pending.creationTime) -Port ([int]$pending.port)
+      $service = @($manifest.services | Where-Object { $_.name -eq $pending.name }) | Select-Object -First 1
+      if ($null -ne $service -and $null -ne $pending.PSObject.Properties["descendantSnapshots"]) {
+        Set-RuntimeServiceDescendantSnapshots -Service $service -Snapshots @($pending.descendantSnapshots) | Out-Null
+      }
+      $cleanupFailures += "pending $($pending.name) PID $($pending.processId) did not fully stop"
+    }
+  }
+  if ($cleanupFailures.Count -eq 0) {
+    Remove-RuntimeManifest -Path $manifestPath
+  } else {
+    Write-RuntimeManifestAtomic -Path $manifestPath -Manifest $manifest
+    Write-Warning ("Partial startup cleanup failed; preserving runtime manifest: {0}" -f ($cleanupFailures -join "; "))
+  }
+  throw $startupError
+}

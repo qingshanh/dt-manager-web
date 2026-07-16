@@ -33,13 +33,19 @@ const schema = z.object({
   DT_REAL_BRIDGE_TOKEN: z.string().optional().default(""),
   DT_REAL_BRIDGE_TIMEOUT_MS: z.coerce.number().int().positive().default(60000),
   DT_HELPER_PURCHASE_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
+  DT_ALLOW_APP_FALLBACK: z
+    .string()
+    .optional()
+    .default("false")
+    .transform((value) => ["true", "1", "yes", "on"].includes(value.trim().toLowerCase())),
   ADB_PATH: z.string().default("C:\\tmp\\reverse-tools\\android-sdk\\platform-tools\\adb.exe"),
   DT_ADB_DINGTONE_PACKAGE: z.string().default("me.talkyou.app.im"),
   DT_ADB_DINGTONE_MAIN_ACTIVITY: z.string().default(".activity.TalkuSplashActivity"),
   DT_ADB_DINGDONG_PACKAGE: z.string().default("me.dingtone.app.im"),
   DT_ADB_DINGDONG_MAIN_ACTIVITY: z.string().default(".activity.SplashActivity"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
-  APP_VERSION: z.string().default("0.2.8"),
+  DT_RUNTIME_INSTANCE_ID: z.string().optional().default(""),
+  APP_VERSION: z.string().default("0.2.9"),
   APP_COMMIT_SHA: z.string().optional().default(""),
   APP_REPOSITORY: z.string().default("qingshanh/dt-manager-web"),
   APP_UPDATE_BRANCH: z.string().default("main"),

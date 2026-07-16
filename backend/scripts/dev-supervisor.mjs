@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { FATAL_LISTEN_EXIT_CODE, nextRestartDecision } from "./dev-supervisor-policy.mjs";
 
-const restartDelayMs = Number(process.env.DEV_SUPERVISOR_RESTART_DELAY_MS ?? 1500);
 let child = null;
+let childStartedAt = 0;
 let stopping = false;
 let restartTimer = null;
 let restartCount = 0;
+let exitTimestamps = [];
 
 function log(message, meta = undefined) {
   const suffix = meta === undefined ? "" : ` ${JSON.stringify(meta)}`;
@@ -17,6 +19,7 @@ function startBackend() {
     return;
   }
   restartCount += 1;
+  childStartedAt = Date.now();
   log("starting backend", { attempt: restartCount });
   child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
     cwd: new URL("..", import.meta.url),
@@ -26,18 +29,51 @@ function startBackend() {
   });
 
   child.on("exit", (code, signal) => {
-    const exitedChild = child;
+    const now = Date.now();
+    const stableRunMs = Math.max(0, now - childStartedAt);
     child = null;
-    if (stopping) {
-      log("backend stopped", { code, signal });
+    const decision = nextRestartDecision({
+      exits: exitTimestamps,
+      now,
+      stableRunMs,
+      exitCode: code,
+      stopping
+    });
+
+    if (decision.nextFailureCount > 0) {
+      const priorExits = stableRunMs >= 60_000
+        ? []
+        : exitTimestamps.filter((timestamp) => timestamp >= now - 60_000);
+      exitTimestamps = [...priorExits, now];
+    }
+
+    if (!decision.restart) {
+      log(decision.reason === "circuit-breaker" ? "backend restart circuit-breaker opened" : "backend stopped", {
+        code,
+        signal,
+        reason: decision.reason,
+        windowFailures: decision.nextFailureCount
+      });
+      if (!stopping) {
+        process.exitCode = decision.reason === "fatal" && code === FATAL_LISTEN_EXIT_CODE
+          ? FATAL_LISTEN_EXIT_CODE
+          : 1;
+      }
       return;
     }
-    log("backend exited; restarting", { code, signal, delayMs: restartDelayMs });
+
+    log("backend exited; restart scheduled", {
+      code,
+      signal,
+      delayMs: decision.delayMs,
+      windowFailures: decision.nextFailureCount
+    });
     restartTimer = setTimeout(() => {
-      if (child === null && exitedChild !== child) {
+      restartTimer = null;
+      if (child === null && !stopping) {
         startBackend();
       }
-    }, restartDelayMs);
+    }, decision.delayMs);
   });
 
   child.on("error", (error) => {
@@ -55,9 +91,23 @@ function stop(signal) {
     process.exit(0);
     return;
   }
-  child.once("exit", () => process.exit(0));
-  child.kill(signal);
-  setTimeout(() => process.exit(0), 5000).unref?.();
+
+  const stoppingChild = child;
+  const finish = () => process.exit(0);
+  stoppingChild.once("exit", finish);
+  stoppingChild.kill(signal);
+  setTimeout(() => {
+    if (stoppingChild.exitCode !== null || stoppingChild.signalCode !== null) {
+      finish();
+      return;
+    }
+    if (process.platform === "win32" && stoppingChild.pid) {
+      spawn("taskkill", ["/PID", String(stoppingChild.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" })
+        .once("exit", finish);
+      return;
+    }
+    stoppingChild.kill("SIGKILL");
+  }, 5_000).unref?.();
 }
 
 process.on("SIGINT", () => stop("SIGINT"));
