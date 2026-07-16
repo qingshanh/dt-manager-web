@@ -74,6 +74,7 @@ export interface AccountSnapshot {
   user_grade: number | null;
   valid_point: number | null;
   progress_point: number | null;
+  progress_point_total: number | null;
   membership_type: string | null;
   membership_expire_at: string | null;
   profile_ver_code: string | null;
@@ -450,9 +451,17 @@ export interface PointStoreOrder {
   product_price: number | null;
   email: string;
   status: string;
+  source: 'panel' | 'remote';
   order_time: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface PointStoreOrderListResult {
+  orders: PointStoreOrder[];
+  stale: boolean;
+  sync_error: string | null;
+  synced_at: string | null;
 }
 
 export type BulkAccountAction = 'start_monitor' | 'stop_monitor' | 'telegram_on' | 'telegram_off' | 'mark_read' | 'mark_unread';

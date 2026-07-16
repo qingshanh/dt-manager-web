@@ -6,6 +6,7 @@ import { repairUtf8Mojibake } from "../utils/serializers.js";
 import { getSettingsMap } from "./settings.service.js";
 import type { ParsedSmsPush } from "./dingtone/message-parser.js";
 import { eventBus } from "./event-bus.js";
+import { parseTeamMessageMeta, renderTeamMessageContent } from "./team-message-normalizer.js";
 import { sendSmsTelegramNotification } from "./telegram-notifier.js";
 
 type MessageRuntimeDb = Pick<PrismaClient, "dtAccount" | "message" | "phoneNumber">;
@@ -54,9 +55,6 @@ export async function storeParsedSmsPushes(accountId: number, pushes: ParsedSmsP
 export async function storeHelperSmsMessages(accountId: number, rows: HelperSmsMessageRecord[], options: MessageRuntimeOptions = {}) {
   let createdCount = 0;
   for (const row of rows) {
-    if (!row.content?.trim()) {
-      continue;
-    }
     const created = await storeHelperSmsMessage(accountId, row, options);
     if (created) {
       createdCount += 1;
@@ -182,10 +180,6 @@ async function findDuplicateMessage(accountId: number, push: ParsedSmsPush, db: 
 async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRecord, options: MessageRuntimeOptions) {
   const db = options.db ?? prisma;
   const content = repairUtf8Mojibake(row.content?.trim() ?? "")?.trim();
-  if (!content) {
-    return false;
-  }
-  const normalizedRow = { ...row, content };
   const account = await db.dtAccount.findUnique({
     where: { id: accountId }
   });
@@ -193,7 +187,27 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
     return false;
   }
 
-  const teamName = resolveHelperTeamName(normalizedRow, account.appVariant);
+  const normalizedRow = { ...row, content: content ?? "" };
+  const appVariant = account.appVariant === "dingdong" ? "dingdong" : "dingtone";
+  const parsedTeamMeta = parseTeamMessageMeta(
+    normalizedRow.content,
+    normalizedRow.data2,
+    { k1: normalizedRow.type }
+  );
+  const renderedTeamContent = renderTeamMessageContent({
+    content: normalizedRow.content,
+    data2: normalizedRow.data2,
+    type: normalizedRow.type
+  }, appVariant);
+  const hasTeamCreditMeta =
+    (parsedTeamMeta.k1 === 531 || parsedTeamMeta.k1 === 532) &&
+    parsedTeamMeta.credits !== null;
+  const namedTeamName = resolveHelperTeamName(normalizedRow, account.appVariant);
+  const trustedTeamContext = hasTrustedHelperTeamContext(normalizedRow, namedTeamName);
+  const effectiveTeamType = parsedTeamMeta.k1 ?? normalizedRow.type;
+  const teamName =
+    namedTeamName ??
+    (trustedTeamContext && hasTeamCreditMeta ? (appVariant === "dingdong" ? "叮咚团队" : "说道团队") : null);
   if (isKnownSystemConversation(normalizedRow) && !teamName) {
     return false;
   }
@@ -208,9 +222,17 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
     return false;
   }
 
-
-  const storedContent = teamName ? extractTeamMessageContent(normalizedRow.content, account.appVariant) : content;
-  const rowForStorage = { ...normalizedRow, content: storedContent };
+  const storedContent = teamName
+    ? renderedTeamContent ?? extractTeamMessageEnvelopeText(normalizedRow.content)
+    : content;
+  if (!storedContent) {
+    return false;
+  }
+  const rowForStorage = {
+    ...normalizedRow,
+    content: storedContent,
+    type: teamName ? effectiveTeamType : normalizedRow.type
+  };
   const receivedAtResult = normalizeHelperReceivedAtResult(rowForStorage);
   const receivedAt = receivedAtResult.receivedAt;
   let toNumber =
@@ -226,10 +248,14 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
       duplicate,
       receivedAtResult
     );
+    const replacementK5Flag = rowForStorage.type === 531 || rowForStorage.type === 532
+      ? rowForStorage.type
+      : duplicate.k5Flag;
     if (
       teamName &&
       (duplicate.content !== storedContent ||
         duplicate.fromNumber !== teamName ||
+        duplicate.k5Flag !== replacementK5Flag ||
         replacementReceivedAt)
     ) {
       await db.message.update({
@@ -237,6 +263,7 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
         data: {
           fromNumber: teamName,
           content: storedContent,
+          k5Flag: replacementK5Flag,
           isRead: true,
           ...(replacementReceivedAt ? { receivedAt: replacementReceivedAt } : {})
         }
@@ -289,7 +316,7 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
         accountNickname: deriveFallbackName(targetAccount),
         from: sender,
         toNumber,
-        content,
+        content: storedContent,
         msgType,
         receivedAt: message.receivedAt.toISOString()
       }
@@ -314,7 +341,7 @@ async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMe
         direction: MessageDirection.incoming,
         rawK3: row.msgId
       },
-      select: { id: true, content: true, fromNumber: true, receivedAt: true, createdAt: true }
+      select: { id: true, content: true, fromNumber: true, k5Flag: true, receivedAt: true, createdAt: true }
     });
     if (byMsgId) {
       return byMsgId;
@@ -334,7 +361,7 @@ async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMe
       content,
       receivedAt: { gte: recentSince, lte: recentUntil }
     },
-    select: { id: true, content: true, fromNumber: true, receivedAt: true, createdAt: true }
+    select: { id: true, content: true, fromNumber: true, k5Flag: true, receivedAt: true, createdAt: true }
   });
   if (exactMatch) {
     return exactMatch;
@@ -349,7 +376,7 @@ async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMe
       content,
       receivedAt: { gte: recentSince, lte: recentUntil }
     },
-    select: { id: true, content: true, fromNumber: true, receivedAt: true, createdAt: true }
+    select: { id: true, content: true, fromNumber: true, k5Flag: true, receivedAt: true, createdAt: true }
   });
   if (sameMessage) {
     return sameMessage;
@@ -367,7 +394,7 @@ async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMe
           lte: new Date(normalizedReceivedAt.getTime() + 5_000)
         }
       },
-      select: { id: true, content: true, fromNumber: true, receivedAt: true, createdAt: true }
+      select: { id: true, content: true, fromNumber: true, k5Flag: true, receivedAt: true, createdAt: true }
     });
     if (crossSourceMatch) {
       return crossSourceMatch;
@@ -384,7 +411,7 @@ async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMe
         content,
         receivedAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60_000) }
       },
-      select: { id: true, content: true, fromNumber: true, receivedAt: true, createdAt: true }
+      select: { id: true, content: true, fromNumber: true, k5Flag: true, receivedAt: true, createdAt: true }
     });
   }
 
@@ -433,7 +460,14 @@ function resolveNamedTeamName(...values: Array<string | null | undefined>) {
 }
 
 function resolveHelperTeamName(row: HelperSmsMessageRecord, appVariant: unknown) {
-  const named = resolveNamedTeamName(row.senderId, row.data1, row.conversationId, row.conversationUserId);
+  const envelope = parseJsonRecord(row.content);
+  const named = resolveNamedTeamName(
+    row.senderId,
+    row.data1,
+    row.conversationId,
+    row.conversationUserId,
+    readJsonString(envelope?.msgTitle)
+  );
   if (named) {
     return named;
   }
@@ -443,32 +477,23 @@ function resolveHelperTeamName(row: HelperSmsMessageRecord, appVariant: unknown)
   return null;
 }
 
-function extractTeamMessageContent(content: string, appVariant: unknown) {
+function hasTrustedHelperTeamContext(row: HelperSmsMessageRecord, namedTeamName: string | null) {
+  return Boolean(namedTeamName) ||
+    row.conversationType === 4 ||
+    row.conversationId === "10000" ||
+    row.type === 531 ||
+    row.type === 532 ||
+    row.type === 3300 ||
+    row.data3 === "direct-web-offline";
+}
+
+function extractTeamMessageEnvelopeText(content: string) {
   const envelope = parseJsonRecord(content);
   if (!envelope) {
     return content;
   }
   const title = readJsonString(envelope.msgTitle);
   const body = readJsonString(envelope.msgContent);
-  const meta = parseJsonRecord(readJsonString(envelope.msgMeta));
-  const credits = readFiniteNumber(meta?.credits);
-  if (credits !== null) {
-    const currency = appVariant === "dingdong" ? "叮咚币" : "说道币";
-    const messageType = readFiniteNumber(meta?.type);
-    const expiryDays = readFiniteNumber(meta?.ex);
-    if (messageType === 5) {
-      return `您获得了${formatTeamFixedNumber(credits)}个${currency}。此任务已完成，开始一个新任务获得更多${currency}吧！`;
-    }
-    if (messageType === 34) {
-      const expiryMonths = expiryDays !== null && expiryDays > 0 ? Math.max(1, Math.round(expiryDays / 30)) : null;
-      const expiryText = expiryMonths === null ? "" : `（有效期${expiryMonths}个月）`;
-      return `兑换成功，恭喜您成功获得${currency}${formatTeamNumber(credits)}个${expiryText}。现在去查看余额`;
-    }
-    if (messageType === 99) {
-      return `${formatTeamNumber(credits)}个${currency}已经到你账上。现在去查看余额。`;
-    }
-    return `${formatTeamNumber(credits)}个${currency}已经到你账上。`;
-  }
   if (title && body && !looksLikeJson(body)) {
     return `${title}\n${body}`;
   }
@@ -495,19 +520,6 @@ function parseJsonRecord(value: string | null | undefined) {
 
 function readJsonString(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function readFiniteNumber(value: unknown) {
-  const parsed = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : Number.NaN;
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function formatTeamNumber(value: number) {
-  return Number.isInteger(value) ? String(value) : String(value);
-}
-
-function formatTeamFixedNumber(value: number) {
-  return value.toFixed(2);
 }
 
 function looksLikeJson(value: string) {

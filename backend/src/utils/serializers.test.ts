@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MessageDirection, MessageType, PhoneStatus } from "@prisma/client";
-import { repairUtf8Mojibake, serializeMessage, serializePhoneNumber } from "./serializers.js";
+import { MessageDirection, MessageType, PhoneStatus, type AccountSnapshot } from "@prisma/client";
+import {
+  repairUtf8Mojibake,
+  serializeMessage,
+  serializePhoneNumber,
+  serializeSnapshot,
+} from "./serializers.js";
 
 test("repairUtf8Mojibake restores UTF-8 Chinese text decoded as GBK", () => {
   assert.equal(repairUtf8Mojibake("璇撮亾鍥㈤槦绯荤粺娑堟伅"), "说道团队系统消息");
@@ -91,4 +96,96 @@ test("serializePhoneNumber exposes the per-number SMS receive switch", () => {
   });
 
   assert.equal(serialized.allow_receive_sms, false);
+});
+
+function snapshot(overrides: Partial<AccountSnapshot> = {}): AccountSnapshot {
+  return {
+    id: 1,
+    accountId: 1,
+    dtDingtoneId: null,
+    fullName: null,
+    avatarUrl: null,
+    gender: null,
+    birthday: null,
+    email: null,
+    phone: null,
+    aboutMe: null,
+    feeling: null,
+    company: null,
+    school: null,
+    country: null,
+    state: null,
+    city: null,
+    primaryBalance: null,
+    userGrade: null,
+    validPoint: null,
+    progressPoint: null,
+    membershipType: null,
+    membershipExpireAt: null,
+    profileVerCode: null,
+    rawJson: null,
+    updatedAt: new Date(0),
+    ...overrides,
+  };
+}
+
+test("serializeSnapshot prefers a positive public progress target", () => {
+  const result = serializeSnapshot(snapshot({
+    userGrade: 4,
+    rawJson: JSON.stringify({
+      publicPoint: {
+        progressPointTotal: 5000,
+        gradeInfo: { nextGradePoint: 6000 },
+        historyPoint: 3178.2,
+      },
+    }),
+  }));
+
+  assert.equal(result?.progress_point_total, 5000);
+});
+
+test("serializeSnapshot uses nested synonyms after non-positive public values", () => {
+  const result = serializeSnapshot(snapshot({
+    rawJson: JSON.stringify({
+      publicPoint: {
+        progressPointTotal: 0,
+        gradeInfo: { nextLevelPoint: 4200 },
+        userInfo: { nextGradePoint: 4300 },
+      },
+    }),
+  }));
+
+  assert.equal(result?.progress_point_total, 4200);
+});
+
+test("serializeSnapshot checks all grade info before user info synonyms", () => {
+  const result = serializeSnapshot(snapshot({
+    rawJson: JSON.stringify({
+      publicPoint: {
+        progressPointTotal: 0,
+        gradeInfo: {},
+      },
+      gradeInfo: { next_grade_point: 4100 },
+      userInfo: { next_level_point: 4300 },
+    }),
+  }));
+
+  assert.equal(result?.progress_point_total, 4100);
+});
+
+test("serializeSnapshot derives the V4 progress target", () => {
+  const result = serializeSnapshot(snapshot({ userGrade: 4, rawJson: JSON.stringify({ publicPoint: {} }) }));
+
+  assert.equal(result?.progress_point_total, 5000);
+});
+
+test("history and current points are never accepted as the progress target", () => {
+  const result = serializeSnapshot(snapshot({
+    userGrade: 3,
+    rawJson: JSON.stringify({
+      publicPoint: { historyPoint: 3178.2, validPoint: 1442.2, progressPoint: 1234 },
+    }),
+  }));
+
+  assert.equal(result?.progress_point_total, null);
 });

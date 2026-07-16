@@ -22,6 +22,7 @@ import { exportSessionFromAdbConfig } from "./adb-session.js";
 import { dumpSmsMessagesFromNotifications } from "./adb-notification-ui.js";
 import { dumpSmsMessagesFromUi, openMessagesInbox } from "./adb-message-ui.js";
 import { getGatewayMode, getSettingsMap } from "./settings.service.js";
+import { transferMonitorRunnerInPlace } from "./account-monitor-runner-transfer.js";
 
 type MonitorConfig = {
   pollIntervalMs: number;
@@ -239,21 +240,23 @@ export class AccountMonitorService {
     return this.start(accountId);
   }
 
-  transferHeartbeat(fromAccountId: number, toAccountId: number) {
-    if (fromAccountId === toAccountId) {
-      return;
+  async transferHeartbeat(fromAccountId: number, toAccountId: number) {
+    const { replacedRunner } = transferMonitorRunnerInPlace(this.runners, fromAccountId, toAccountId, {
+      clearTimer: (timer) => clearTimeout(timer),
+      schedule: (runner) => this.scheduleNext(runner, runner.pollIntervalMs)
+    });
+    if (replacedRunner) {
+      await prisma.monitorSession.updateMany({
+        where: {
+          id: replacedRunner.sessionId,
+          status: { in: [MonitorStatus.running, MonitorStatus.error] }
+        },
+        data: {
+          status: MonitorStatus.stopped,
+          stoppedAt: new Date()
+        }
+      });
     }
-    const runner = this.runners.get(fromAccountId);
-    if (!runner) {
-      return;
-    }
-    if (runner.timer) {
-      clearTimeout(runner.timer);
-    }
-    const nextRunner = { ...runner, accountId: toAccountId, timer: null };
-    this.runners.set(toAccountId, nextRunner);
-    this.runners.delete(fromAccountId);
-    this.scheduleNext(nextRunner, nextRunner.pollIntervalMs);
   }
 
   async restoreEnabled() {

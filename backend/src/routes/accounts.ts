@@ -21,6 +21,13 @@ import { dingtoneGateway } from "../services/dingtone/index.js";
 import { RealDingtoneGateway } from "../services/dingtone/real-gateway.js";
 import { dumpHelperSmsMessages, executeHelperAction, executeHelperActionWithRetry, getCachedPrivateNumberEvent } from "../services/helper-bridge.js";
 import { refreshAccountRuntimeData } from "../services/account-runtime.js";
+import { buildSameVariantDuplicateAccountWhere } from "../services/account-duplicate-scope.js";
+import {
+  classifyDirectSessionValidationFailure,
+  persistedSessionValidationFailureMessage,
+  validateThenPersistDirectSession,
+  type DirectSessionValidationFailureCategory
+} from "../services/direct-session-import.js";
 import {
   mapPhoneNumberBase,
   mapPhoneNumberCreate,
@@ -33,7 +40,8 @@ import {
   listAccountPointStoreOrders,
   orderAccountPointStoreProduct,
   refreshAccountPointStoreOrder,
-  serializeStoredPointStoreOrder
+  serializeStoredPointStoreOrder,
+  syncAndListAccountPointStoreOrders
 } from "../services/point-store.js";
 import { dumpSmsMessagesFromAdb, listPhoneNumbersFromAdb } from "../services/adb-database.js";
 import { exportSessionFromAdbConfig } from "../services/adb-session.js";
@@ -68,6 +76,7 @@ const createAccountSchema = z
     email: z.string().email().optional(),
     phone: z.string().min(5).optional(),
     password: z.string().min(1).optional(),
+    device_id: z.string().trim().min(1).optional(),
     telegram_notify: z.boolean().optional().default(false),
     proxy_enabled: z.boolean().optional().default(false)
   })
@@ -294,6 +303,7 @@ accountsRouter.param("id", async (req, _res, next, value) => {
 
 const directRefreshGateway = new DirectDingtoneGateway();
 const helperRefreshGateway = new RealDingtoneGateway();
+const SAFE_ACCOUNT_REFRESH_ERROR = "账号数据刷新失败，请稍后重试。";
 const SESSION_EXPORT_SETTING_KEYS = [
   "DT_GATEWAY_MODE",
   "dt_server_ip",
@@ -574,7 +584,11 @@ accountsRouter.post("/", async (req, res, next) => {
     const adminId = req.auth!.userId;
     const existing = await findExistingAccount(adminId, body.app_variant, body.email ?? null, body.phone ?? null);
     const nickname = normalizeOptionalString(body.nickname);
-    const deviceId = normalizeVerificationDeviceId(existing?.dtDeviceId ?? createDeviceId(), body.app_variant, body.login_type);
+    const deviceId = normalizeVerificationDeviceId(
+      body.device_id ?? existing?.dtDeviceId ?? createDeviceId(),
+      body.app_variant,
+      body.login_type
+    );
     const trackCode = existing?.dtTrackCode ?? createTrackCode();
 
     if (body.login_type === "manual_session") {
@@ -593,6 +607,7 @@ accountsRouter.post("/", async (req, res, next) => {
           telegramNotify: body.telegram_notify,
           proxyEnabled: body.proxy_enabled,
           status: nextStatus,
+          ...(existing?.dtUserId ? {} : { monitorEnabled: false }),
           lastError: null
         },
         create: {
@@ -607,7 +622,8 @@ accountsRouter.post("/", async (req, res, next) => {
           dtTrackCode: trackCode,
           telegramNotify: body.telegram_notify,
           proxyEnabled: body.proxy_enabled,
-          status: AccountStatus.pending
+          status: AccountStatus.pending,
+          monitorEnabled: false
         }
       });
 
@@ -1299,11 +1315,11 @@ accountsRouter.post("/:id/refresh", async (req, res, next) => {
       if (helperRefreshed?.snapshot) {
         logger.warn("Direct refresh failed, returning helper-backed snapshot", {
           accountId,
-          error: error instanceof Error ? error.message : String(error)
+          errorType: error instanceof Error ? error.name : typeof error
         });
         return ok(res, {
           snapshot: helperRefreshed.snapshot,
-          refresh_error: error instanceof Error ? error.message : String(error),
+          refresh_error: SAFE_ACCOUNT_REFRESH_ERROR,
           cached: false
         });
       }
@@ -1311,11 +1327,11 @@ accountsRouter.post("/:id/refresh", async (req, res, next) => {
       if (cached) {
         logger.warn("Refresh failed, returning cached snapshot", {
           accountId,
-          error: error instanceof Error ? error.message : String(error)
+          errorType: error instanceof Error ? error.name : typeof error
         });
         return ok(res, {
           snapshot: serializeSnapshot(cached),
-          refresh_error: error instanceof Error ? error.message : String(error),
+          refresh_error: SAFE_ACCOUNT_REFRESH_ERROR,
           cached: true
         });
       }
@@ -1352,8 +1368,13 @@ accountsRouter.get("/:id/pointstore/orders", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);
     await assertAccount(accountId);
-    const orders = await listAccountPointStoreOrders(accountId);
-    ok(res, orders.map(serializeStoredPointStoreOrder));
+    const result = await syncAndListAccountPointStoreOrders(accountId);
+    ok(res, {
+      orders: result.orders.map(serializeStoredPointStoreOrder),
+      stale: result.stale,
+      sync_error: result.syncError,
+      synced_at: result.syncedAt
+    });
   } catch (error) {
     next(error);
   }
@@ -2206,13 +2227,6 @@ async function validateCapturedSession(
   }
 
   const message = lastError instanceof Error ? lastError.message : "unknown direct session validation error";
-  await prisma.dtAccount.update({
-    where: { id: account.id },
-    data: {
-      status: AccountStatus.error,
-      lastError: `Captured session validation failed: ${message}`
-    }
-  });
   throw new AppError(`Captured session validation failed: ${message}`, 409, 409);
 }
 
@@ -2235,42 +2249,46 @@ async function importAuthorizedSession(
   };
   assertCapturedSessionMatchesAccountVariant(account, storedSession);
   await assertCapturedSessionIsNotOwnedByAnotherAccount(account, storedSession);
-  let persistedAccountId = await persistCapturedSession(accountId, account, storedSession);
-  await tryHydrateImportedAccountFromHelper(persistedAccountId);
+  const result = await validateThenPersistDirectSession(storedSession, {
+    validate: (candidate) => validateCapturedSessionBeforeImport(account, candidate, options),
+    persist: async (candidate) => {
+      const persistedAccountId = await persistCapturedSession(accountId, account, candidate);
+      await accountMonitorService.stop(persistedAccountId, {
+        preserveMonitorEnabled: false,
+        targetStatus: AccountStatus.offline,
+        emitStatus: false
+      });
+      await tryHydrateImportedAccountFromHelper(persistedAccountId);
+      return { persistedAccountId, session: candidate };
+    }
+  });
 
-  const validation = await tryValidateCapturedSessionQuickly(account, storedSession, options);
-  const validationError = validation ? null : "Direct validation timed out or failed during import; imported helper session was still saved.";
-  const finalSession = validation
-    ? {
-        ...storedSession,
-        deviceId: validation.deviceId
-      }
-    : storedSession;
-  persistedAccountId = await persistCapturedSession(persistedAccountId, account, finalSession);
-
-  if (validationError) {
-    await prisma.dtAccount.update({
-      where: { id: persistedAccountId },
-      data: {
-        status: AccountStatus.offline,
-        lastError: validationError
-      }
-    });
-  } else {
-    await prisma.dtAccount.update({
-      where: { id: persistedAccountId },
-      data: {
-        status: AccountStatus.offline,
-        lastError: null
-      }
-    });
-  }
+  await prisma.dtAccount.update({
+    where: { id: result.storedSession.persistedAccountId },
+    data: {
+      status: AccountStatus.offline,
+      lastError: null
+    }
+  });
 
   return {
-    storedSession: finalSession,
-    validation,
-    validationError
+    storedSession: result.storedSession.session,
+    validation: result.validation,
+    validationError: null
   };
+}
+
+async function validateCapturedSessionBeforeImport(
+  account: Parameters<typeof validateCapturedSession>[0],
+  session: DingtoneSessionExport,
+  options: { phonePreviewCountryCode?: number } = {}
+) {
+  const timeout = Symbol("direct-session-timeout");
+  const result = await Promise.race([
+    validateCapturedSession(account, session, options),
+    delayResult(8_000, timeout)
+  ]);
+  return result === timeout ? null : result;
 }
 
 async function tryValidateCapturedSessionQuickly(
@@ -2284,18 +2302,43 @@ async function tryValidateCapturedSessionQuickly(
   session: DingtoneSessionExport,
   options: { phonePreviewCountryCode?: number } = {}
 ) {
+  const timeout = Symbol("persisted-session-validation-timeout");
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       validateCapturedSession(account, session, options),
-      delayResult<null>(8_000, null)
+      delayResult(8_000, timeout)
     ]);
+    if (result === timeout) {
+      await markPersistedSessionValidationFailure(account.id, "timeout");
+      logger.warn("Quick direct validation failed after import", {
+        accountId: account.id,
+        reasonCategory: "timeout"
+      });
+      return null;
+    }
+    return result;
   } catch (error) {
+    const reasonCategory = classifyDirectSessionValidationFailure(error);
+    await markPersistedSessionValidationFailure(account.id, reasonCategory);
     logger.warn("Quick direct validation failed after import", {
       accountId: account.id,
-      error: error instanceof Error ? error.message : String(error)
+      reasonCategory
     });
     return null;
   }
+}
+
+async function markPersistedSessionValidationFailure(
+  accountId: number,
+  reasonCategory: DirectSessionValidationFailureCategory
+) {
+  await prisma.dtAccount.update({
+    where: { id: accountId },
+    data: {
+      status: AccountStatus.error,
+      lastError: persistedSessionValidationFailureMessage(reasonCategory)
+    }
+  });
 }
 
 function assertCapturedSessionMatchesAccountVariant(account: { appVariant: AppVariant }, session: DingtoneSessionExport) {
@@ -2365,11 +2408,12 @@ async function assertCapturedSessionIsNotOwnedByAnotherAccount(
   }
 
   const owner = await prisma.dtAccount.findFirst({
-    where: {
+    where: buildSameVariantDuplicateAccountWhere({
+      id: account.id,
       adminId: account.adminId,
-      dtUserId,
-      NOT: { id: account.id }
-    },
+      appVariant: account.appVariant,
+      dtUserId
+    }),
     select: {
       id: true,
       nickname: true,
@@ -2541,11 +2585,13 @@ async function tryRefreshValidatedAccountData(accountId: number, timeoutMs = 12_
       error: null
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.warn("Validated session refresh failed after successful direct probe", { accountId, error: message });
+    logger.warn("Validated session refresh failed after successful direct probe", {
+      accountId,
+      errorType: error instanceof Error ? error.name : typeof error
+    });
     return {
       snapshot: null,
-      error: message
+      error: SAFE_ACCOUNT_REFRESH_ERROR
     };
   }
 }
@@ -2611,11 +2657,12 @@ async function mergeDuplicateAccounts(accountId: number) {
   }
 
   const duplicates = await prisma.dtAccount.findMany({
-    where: {
+    where: buildSameVariantDuplicateAccountWhere({
+      id: accountId,
       adminId: target.adminId,
-      dtUserId,
-      NOT: { id: accountId }
-    }
+      appVariant: target.appVariant,
+      dtUserId
+    })
   });
 
   for (const duplicate of duplicates) {
@@ -2635,7 +2682,7 @@ async function mergeDuplicateAccountData(targetAccountId: number, duplicateAccou
     "Duplicate account not found"
   );
 
-  accountMonitorService.transferHeartbeat(duplicateAccountId, targetAccountId);
+  await accountMonitorService.transferHeartbeat(duplicateAccountId, targetAccountId);
 
   const duplicatePhones = await prisma.phoneNumber.findMany({
     where: { accountId: duplicateAccountId }
@@ -3212,7 +3259,7 @@ async function importSessionAccount(
   }
 
   if (validateSession) {
-    const validation = await tryValidateCapturedSessionQuickly(
+    await tryValidateCapturedSessionQuickly(
       {
         id: account.id,
         appVariant: resolvedAppVariant,
@@ -3228,14 +3275,6 @@ async function importSessionAccount(
         packageName: item.package_name ?? undefined
       }
     );
-    if (!validation) {
-      await prisma.dtAccount.update({
-        where: { id: account.id },
-        data: {
-          lastError: "Imported session was saved, but direct validation did not complete."
-        }
-      });
-    }
   }
 
   await mergeDuplicateAccounts(account.id);

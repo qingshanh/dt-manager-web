@@ -109,10 +109,40 @@ test("point store supports email override, persisted history, status refresh, an
   assert.match(store, /status: "unknown"/);
   assert.match(store, /POINT_STORE_ORDER_UNCERTAIN_MESSAGE/);
   assert.match(store, /export function resolveSuccessfulPointStoreOrderStatus/);
+  assert.match(store, /normalizeRemotePointStoreOrderStatus/);
+  assert.match(store, /export function normalizePointStoreOrderStatus/);
+  assert.match(store, /export function isTerminalPointStoreStatus/);
   assert.match(store, /readOrderStatus\(orderInfo\) \?\? readOrderStatus\(order\) \?\? "completed"/);
   assert.match(store, /sendPointStoreTelegramNotification/);
   assert.match(notifier, /export async function sendPointStoreTelegramNotification/);
   assert.match(notifier, /订单 ID/);
+});
+
+test("point store history synchronizes the read-only remote list into a safe response envelope", () => {
+  const routes = readProjectFile("backend/src/routes/accounts.ts");
+  const store = readProjectFile("backend/src/services/point-store.ts");
+  const endpoints = readProjectFile("frontend/src/services/endpoints.ts");
+  const types = readProjectFile("frontend/src/types/index.ts");
+  const syncStart = store.indexOf("export async function syncAndListAccountPointStoreOrders");
+  const syncEnd = store.indexOf("export function serializeStoredPointStoreOrder", syncStart);
+  const syncBlock = store.slice(syncStart, syncEnd);
+
+  assert.notEqual(syncStart, -1);
+  assert.match(syncBlock, /safelyResolvePointStoreHistoryUid\(\(\) => resolvePointUid\(account\)\)/);
+  assert.doesNotMatch(syncBlock, /const pointUid = resolvePointUid\(account\)/);
+  assert.match(syncBlock, /fetchPublicJson\(`\/pointstore\/order\/list\?uid=\$\{encodeURIComponent\(uid\)\}`\)/);
+  assert.match(syncBlock, /prisma\.pointStoreOrder\.upsert/);
+  assert.match(syncBlock, /update:\s*\{[\s\S]*rawInfoJson: order\.rawInfoJson/);
+  assert.doesNotMatch(syncBlock, /rawOrderJson|sendPointStoreTelegramNotification/);
+  assert.match(store, /email:\s*maskPointStoreEmail\(order\.email\)/);
+  assert.match(store, /source:\s*resolvePointStoreOrderSource\(order\)/);
+  assert.match(routes, /syncAndListAccountPointStoreOrders/);
+  assert.match(routes, /orders:\s*result\.orders\.map\(serializeStoredPointStoreOrder\)/);
+  assert.match(routes, /sync_error:\s*result\.syncError/);
+  assert.match(routes, /synced_at:\s*result\.syncedAt/);
+  assert.match(types, /export interface PointStoreOrderListResult/);
+  assert.match(types, /source:\s*'panel' \| 'remote'/);
+  assert.match(endpoints, /ApiResponse<PointStoreOrderListResult>/);
 });
 
 test("dashboard and account list expose the requested management controls", () => {

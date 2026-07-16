@@ -8,6 +8,7 @@ import {
   isSocketClosedError,
   normalizeDirectWebOfflineMessages
 } from "./direct-gateway.js";
+import { parseTeamMessageMeta, renderTeamMessageContent } from "../team-message-normalizer.js";
 import zlib from "node:zlib";
 
 test("builds the native getUserOfflineMsg query with the device flag enabled", () => {
@@ -115,12 +116,85 @@ test("normalizes the singular Message array returned by the real TalkU endpoint"
   assert.match(rows[0]?.data2 ?? "", /"type":34/);
 });
 
+test("keeps metadata-only TalkU credit messages from numeric senders", () => {
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [
+      {
+        msgTitle: "",
+        msgContent: "",
+        msgMeta: JSON.stringify({ k1: 531, credits: 20, bc: 20, adType: 0, ex: 90, type: 34 }),
+        msgSenderID: "2684354560",
+        msgId: "direct-credit-531",
+        msgType: 531,
+        msgTimeStamp: 1_800_000_000
+      }
+    ]
+  }, "dingtone");
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.type, 531);
+  assert.equal(rows[0]?.senderId, "说道团队");
+  assert.equal(rows[0]?.conversationId, "10000");
+  assert.equal(rows[0]?.msgId, "direct-credit-531");
+  assert.match(rows[0]?.data2 ?? "", /"credits":20/);
+  assert.doesNotThrow(() => JSON.parse(rows[0]!.content));
+});
+
+test("keeps metadata-only DingDong task credits from numeric senders", () => {
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [
+      {
+        msgTitle: "",
+        msgContent: "",
+        msgMeta: JSON.stringify({ k1: 532, credits: 0.5, ex: -1, type: 5 }),
+        msgSenderID: "2684354560",
+        msgId: "direct-credit-532",
+        msgType: 532,
+        msgTimeStamp: 1_800_000_001
+      }
+    ]
+  }, "dingdong");
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.type, 532);
+  assert.equal(rows[0]?.senderId, "叮咚团队");
+  assert.equal(rows[0]?.conversationId, "10000");
+  assert.match(rows[0]?.data2 ?? "", /"credits":0.5/);
+  assert.doesNotThrow(() => JSON.parse(rows[0]!.content));
+});
+
+test("promotes common-event credit metadata to its inner secretary type", () => {
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [
+      {
+        content: JSON.stringify({
+          content: "",
+          args: { type: 99, params: { k1: 531, credits: 4, ex: -1 } }
+        }),
+        from: "2684354560",
+        msgId: "direct-credit-3300",
+        msgType: 3300,
+        msgTimeStamp: 1_800_000_002
+      }
+    ]
+  }, "dingtone");
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.type, 531);
+  assert.equal(rows[0]?.senderId, "说道团队");
+  assert.match(rows[0]?.data2 ?? "", /"credits":4/);
+  assert.doesNotThrow(() => JSON.parse(rows[0]!.content));
+});
+
 test("does not mix non-secretary web offer messages into the team conversation", () => {
   const rows = normalizeDirectWebOfflineMessages({
     Result: 1,
     Message: [
       {
-        content: JSON.stringify({ OfName: "offer" }),
+        content: JSON.stringify({ OfName: "offer", content: "Free credits available", credits: 4 }),
         from: "100000000000002",
         msgId: "offer-1001",
         msgType: 29,
@@ -130,6 +204,90 @@ test("does not mix non-secretary web offer messages into the team conversation",
   }, "dingtone");
 
   assert.equal(rows.length, 0);
+});
+
+test("hard-excludes type 29 offers even when they use a known team name and credit metadata", () => {
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [
+      {
+        msgTitle: "TalkU Team",
+        content: JSON.stringify({ content: "Free credits available", credits: 4 }),
+        msgMeta: JSON.stringify({ k1: 531, credits: 4, type: 99 }),
+        from: "TalkU Team",
+        msgId: "offer-team-name-1002",
+        msgType: 29,
+        timestamp: 1_800_000_301
+      }
+    ]
+  }, "dingtone");
+
+  assert.deepEqual(rows, []);
+});
+
+test("prioritizes envelope msgMeta then data2 then args and params per metadata field", () => {
+  const preferred = parseTeamMessageMeta(
+    JSON.stringify({
+      msgMeta: JSON.stringify({ k1: 531, credits: 20, type: 34 }),
+      args: { type: 99, params: { k1: 532, credits: 4, ex: -1, type: 5 } }
+    }),
+    JSON.stringify({ k1: 532, credits: 10, ex: 90, type: 5 })
+  );
+
+  assert.equal(preferred.k1, 531);
+  assert.equal(preferred.actionType, 34);
+  assert.equal(preferred.credits, 20);
+  assert.equal(preferred.expiryDays, 90);
+
+  const fallback = parseTeamMessageMeta(
+    JSON.stringify({
+      msgMeta: JSON.stringify({ k1: 531 }),
+      args: { type: 34, params: { k1: 532, credits: 4, ex: -1, type: 5 } }
+    }),
+    JSON.stringify({ credits: 10 })
+  );
+
+  assert.equal(fallback.k1, 531);
+  assert.equal(fallback.actionType, 34);
+  assert.equal(fallback.credits, 10);
+  assert.equal(fallback.expiryDays, -1);
+});
+
+test("safely bounds deeply nested, cyclic, and malformed team metadata", () => {
+  const deep: Record<string, unknown> = { k1: 531, credits: 4, type: 99 };
+  let cursor = deep;
+  for (let index = 0; index < 20_000; index += 1) {
+    const params: Record<string, unknown> = {};
+    cursor.params = params;
+    cursor = params;
+  }
+
+  const parseDeepMeta = () => parseTeamMessageMeta(deep);
+  assert.doesNotThrow(parseDeepMeta);
+  const deepMeta = parseDeepMeta();
+  assert.equal(deepMeta.k1, 531);
+  assert.equal(deepMeta.credits, 4);
+
+  const cyclic: Record<string, unknown> = { k1: 532, credits: 0.5, type: 5 };
+  cyclic.args = cyclic;
+  const parseCyclicMeta = () => parseTeamMessageMeta(cyclic);
+  assert.doesNotThrow(parseCyclicMeta);
+  const cyclicMeta = parseCyclicMeta();
+  assert.equal(cyclicMeta.k1, 532);
+  assert.equal(cyclicMeta.credits, 0.5);
+
+  assert.doesNotThrow(() => parseTeamMessageMeta("{bad-json", "{also-bad"));
+  assert.equal(parseTeamMessageMeta("{bad-json").credits, null);
+});
+
+test("rejects negative and implausibly large team credit amounts", () => {
+  for (const credits of [-0.01, 1_000_000.01]) {
+    assert.equal(parseTeamMessageMeta({ k1: 531, credits, type: 99 }).credits, null);
+    assert.equal(renderTeamMessageContent({
+      content: JSON.stringify({ msgMeta: JSON.stringify({ k1: 531, credits, type: 99 }) }),
+      type: 531
+    }, "dingtone"), null);
+  }
 });
 
 test("delivers each web-offline message only once after a successful callback", async () => {

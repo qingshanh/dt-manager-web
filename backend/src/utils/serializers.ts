@@ -28,12 +28,33 @@ export function serializeSnapshot(snapshot: AccountSnapshot | null) {
     user_grade: snapshot.userGrade,
     valid_point: normalizeSnapshotMemberPoint(snapshot.validPoint) ?? normalizeSnapshotMemberPoint(snapshot.progressPoint),
     progress_point: normalizeSnapshotMemberPoint(snapshot.progressPoint),
+    progress_point_total: resolveSnapshotProgressPointTotal(snapshot),
     membership_type: repairUtf8Mojibake(snapshot.membershipType),
     membership_expire_at: snapshot.membershipExpireAt,
     profile_ver_code: repairUtf8Mojibake(snapshot.profileVerCode),
     raw_json: snapshot.rawJson,
     updated_at: snapshot.updatedAt
   };
+}
+
+function resolveSnapshotProgressPointTotal(snapshot: Pick<AccountSnapshot, "rawJson" | "userGrade">) {
+  const raw = parseJsonRecord(snapshot.rawJson);
+  const publicPoint = isRecord(raw?.publicPoint) ? raw.publicPoint : null;
+  const gradeInfoRecords = [publicPoint?.gradeInfo, raw?.gradeInfo].filter(isRecord);
+  const userInfoRecords = [publicPoint?.userInfo, raw?.userInfo].filter(isRecord);
+  const keys = [
+    "progressPointTotal",
+    "progress_point_total",
+    "nextGradePoint",
+    "next_grade_point",
+    "nextLevelPoint",
+    "next_level_point",
+  ];
+  const explicit =
+    pickPositiveNumber(publicPoint, keys) ??
+    pickPositiveNumberFromRecords(gradeInfoRecords, keys) ??
+    pickPositiveNumberFromRecords(userInfoRecords, keys);
+  return explicit ?? (snapshot.userGrade === 4 ? 5000 : null);
 }
 
 function normalizeSnapshotPrimaryBalance(value: number | null, rawJson: string | null) {
@@ -196,6 +217,29 @@ function pickNumber(record: Record<string, unknown> | null, keys: string[]) {
       if (Number.isFinite(parsed)) {
         return parsed;
       }
+    }
+  }
+  return null;
+}
+
+function pickPositiveNumber(record: Record<string, unknown> | null, keys: string[]) {
+  if (!record) {
+    return null;
+  }
+  for (const key of keys) {
+    const value = pickNumber(record, [key]);
+    if (value !== null && value > 0) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function pickPositiveNumberFromRecords(records: Record<string, unknown>[], keys: string[]) {
+  for (const record of records) {
+    const value = pickPositiveNumber(record, keys);
+    if (value !== null) {
+      return value;
     }
   }
   return null;

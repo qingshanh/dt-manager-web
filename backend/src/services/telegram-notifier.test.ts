@@ -24,13 +24,13 @@ test("SMS notification is escaped HTML with target and verification code", () =>
   const text = (build as (input: unknown) => string)({
     account,
     fromNumber: "OPEN&AI",
-    toNumber: "<3197005033038>",
+    toNumber: "<12025550199>",
     content: "<code> 748402 & more",
     receivedAt: new Date("2026-07-15T00:00:00Z")
   });
   assert.match(text, /<b>.*验证码短信<\/b>/);
   assert.match(text, /VMOS &amp; &lt;Test&gt;/);
-  assert.match(text, /<code>&lt;3197005033038&gt;<\/code>/);
+  assert.match(text, /<code>&lt;12025550199&gt;<\/code>/);
   assert.match(text, /OPEN&amp;AI/);
   assert.match(text, /<code>748402<\/code>/);
   assert.match(text, /&lt;code&gt; 748402 &amp; more/);
@@ -145,6 +145,11 @@ test("notification markup fallback retries only a classified unsupported copy-te
     assert.equal(result.calls.length, 1);
     assert.equal(result.thrown, error);
   }
+});
+
+test("point-store notification titles map remote status four and five", () => {
+  assert.equal(notifierModule.pointStoreNotificationTitle("4"), "积分商城订单处理中");
+  assert.equal(notifierModule.pointStoreNotificationTitle("5"), "积分商城兑换成功");
 });
 
 test("static phone notification regression accepts only the current Chinese HTML output", () => {

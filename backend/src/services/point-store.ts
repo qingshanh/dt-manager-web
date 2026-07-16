@@ -4,6 +4,13 @@ import { AppError, assertFound } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { serializeSnapshot } from "../utils/serializers.js";
 import { fetchPublicJson } from "./public-account-enrichment.js";
+import {
+  maskPointStoreEmail,
+  normalizeRemotePointStoreOrderStatus,
+  resolvePointStoreOrderSource,
+  safelyResolvePointStoreHistoryUid,
+  synchronizePointStoreOrderHistory,
+} from "./point-store-order-history.js";
 import { pointStoreNotificationTitle, sendPointStoreTelegramNotification } from "./telegram-notifier.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -240,7 +247,7 @@ export async function refreshAccountPointStoreOrder(accountId: number, orderId: 
     throw new AppError(`查询订单失败：${pickString(response, ["Reason", "reason", "message"]) ?? "接口未返回成功"}`, 400, 400);
   }
   const info = unwrapData(response) ?? {};
-  const nextStatus = normalizeOrderStatus(info, found.status);
+  const nextStatus = normalizePointStoreOrderStatus(info, found.status);
   const updated = await prisma.pointStoreOrder.update({
     where: { id: found.id },
     data: {
@@ -271,6 +278,50 @@ export async function refreshAccountPointStoreOrder(accountId: number, orderId: 
   return updated;
 }
 
+export async function syncAndListAccountPointStoreOrders(accountId: number) {
+  const account = await getAccountWithSnapshot(accountId);
+  const pointUid = safelyResolvePointStoreHistoryUid(() => resolvePointUid(account));
+  const fallbackEmail = normalizeOptionalString(account.email ?? account.snapshot?.email) ?? "";
+  return synchronizePointStoreOrderHistory(
+    { accountId, pointUid, fallbackEmail },
+    {
+      fetchList: (uid) => fetchPublicJson(`/pointstore/order/list?uid=${encodeURIComponent(uid)}`),
+      upsertRemoteOrder: async (targetAccountId, order, emailFallback) => {
+        await prisma.pointStoreOrder.upsert({
+          where: {
+            accountId_remoteOrderId: {
+              accountId: targetAccountId,
+              remoteOrderId: order.remoteOrderId,
+            },
+          },
+          update: {
+            productId: order.productId,
+            productName: order.productName,
+            productPrice: order.productPrice,
+            email: order.email ?? emailFallback,
+            status: order.status,
+            orderTime: order.orderTime,
+            rawInfoJson: order.rawInfoJson,
+          },
+          create: {
+            accountId: targetAccountId,
+            remoteOrderId: order.remoteOrderId,
+            productId: order.productId,
+            productName: order.productName,
+            productPrice: order.productPrice,
+            email: order.email ?? emailFallback,
+            status: order.status,
+            orderTime: order.orderTime,
+            rawInfoJson: order.rawInfoJson,
+          },
+        });
+      },
+      listCachedOrders: (targetAccountId) => prisma.pointStoreOrder.findMany({ where: { accountId: targetAccountId } }),
+      now: () => new Date(),
+    },
+  );
+}
+
 export function serializeStoredPointStoreOrder(order: PointStoreOrder) {
   return {
     id: order.id,
@@ -279,8 +330,9 @@ export function serializeStoredPointStoreOrder(order: PointStoreOrder) {
     product_id: order.productId,
     product_name: order.productName,
     product_price: order.productPrice,
-    email: order.email,
+    email: maskPointStoreEmail(order.email),
     status: order.status,
+    source: resolvePointStoreOrderSource(order),
     order_time: order.orderTime,
     created_at: order.createdAt,
     updated_at: order.updatedAt
@@ -493,24 +545,57 @@ function isSuccessfulPointStoreBusinessResult(value: JsonRecord) {
   return result === null || result === 1;
 }
 
-function normalizeOrderStatus(value: JsonRecord | null | undefined, fallback = "pending") {
-  return readOrderStatus(value) ?? fallback;
+export function normalizePointStoreOrderStatus(value: JsonRecord | null | undefined, fallback = "pending") {
+  return readOrderStatus(value) ?? normalizePointStoreOrderStatusValue(fallback) ?? fallback;
 }
 
 function readOrderStatus(value: JsonRecord | null | undefined) {
-  const text = pickString(value, ["status", "orderStatus", "order_status", "state"]);
-  if (text) {
-    return text;
-  }
-  const numeric = pickNumber(value, ["status", "orderStatus", "order_status", "state"]);
-  if (numeric === null) {
+  if (!value) {
     return null;
   }
-  return ({ 0: "pending", 1: "completed", 2: "failed", 3: "processing" } as Record<number, string>)[numeric] ?? String(numeric);
+  for (const key of ["status", "orderStatus", "order_status", "state"]) {
+    const normalized = normalizePointStoreOrderStatusValue(value[key]);
+    if (normalized !== null) {
+      return normalized;
+    }
+  }
+  return null;
 }
 
-function isTerminalPointStoreStatus(status: string) {
-  return /complete|success|done|fulfilled|fail|cancel|error|reject|^1$|^2$/i.test(status.trim());
+function normalizePointStoreOrderStatusValue(value: unknown) {
+  const remoteStatus = normalizeRemotePointStoreOrderStatus(value);
+  if (remoteStatus !== "unknown") {
+    return remoteStatus;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+  const text = value.trim();
+  const normalized = text.toLowerCase();
+  if (/complete|success|done|fulfilled/.test(normalized)) {
+    return "completed";
+  }
+  if (/fail|cancel|error|reject/.test(normalized)) {
+    return "failed";
+  }
+  if (/process/.test(normalized)) {
+    return "processing";
+  }
+  if (/submit/.test(normalized)) {
+    return "submitting";
+  }
+  if (/pending/.test(normalized)) {
+    return "pending";
+  }
+  return text;
+}
+
+export function isTerminalPointStoreStatus(status: string) {
+  const normalized = normalizePointStoreOrderStatusValue(status);
+  return normalized === "completed" || normalized === "failed";
 }
 
 function normalizeOptionalString(value: string | null | undefined) {

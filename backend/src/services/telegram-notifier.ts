@@ -1,6 +1,7 @@
 import type { PrismaClient } from "@prisma/client";
 import type { DingtonePhoneNumber } from "./dingtone/types.js";
 import { getSettingsMap } from "./settings.service.js";
+import { normalizeRemotePointStoreOrderStatus } from "./point-store-order-history.js";
 import { TelegramApiError, telegramService } from "./telegram.js";
 import { escapeTelegramHtml, limitTelegramMessage } from "./telegram-bot-ui.js";
 
@@ -56,15 +57,25 @@ export async function sendPointStoreTelegramNotification(input: PointStoreNotifi
 }
 
 export function pointStoreNotificationTitle(status: string) {
-  const normalized = status.trim().toLowerCase();
-  if (/complete|success|done|fulfilled|^1$/.test(normalized)) {
+  const value = status.trim().toLowerCase();
+  const remoteStatus = normalizeRemotePointStoreOrderStatus(value);
+  const normalized = remoteStatus !== "unknown"
+    ? remoteStatus
+    : /complete|success|done|fulfilled/.test(value)
+      ? "completed"
+      : /fail|cancel|error|reject/.test(value)
+        ? "failed"
+        : /process/.test(value)
+          ? "processing"
+          : value;
+  if (normalized === "completed") {
     return "积分商城兑换成功";
   }
-  if (/fail|cancel|error|reject|^2$/.test(normalized)) {
+  if (normalized === "failed") {
     return "积分商城兑换失败";
   }
-  if (/process|^3$/.test(normalized)) {
-    return "积分商城兑换处理中";
+  if (normalized === "processing") {
+    return "积分商城订单处理中";
   }
   return "积分商城兑换已提交";
 }

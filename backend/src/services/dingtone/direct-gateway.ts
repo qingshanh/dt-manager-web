@@ -7,6 +7,7 @@ import { config } from "../../config.js";
 import { AppError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
 import { getSettingsMap } from "../settings.service.js";
+import { buildTeamMessageEnvelope, parseTeamMessageMeta } from "../team-message-normalizer.js";
 import { parseDirectActionTemplate, type DirectActionTemplate, type DirectTemplateParams } from "./direct-template.js";
 import { isOfflineMessageIndexPush, parseSmsPush, type ParsedSmsPush } from "./message-parser.js";
 import type {
@@ -3730,20 +3731,41 @@ export function normalizeDirectWebOfflineMessages(payload: unknown, appVariant?:
     const title = pickString(record, ["msgTitle", "title"]);
     const rawBody = pickString(record, ["msgContent", "content", "message", "body"]);
     const messageType = pickNumber(record, ["msgType", "type"]) ?? null;
+    if (messageType === 29) {
+      continue;
+    }
     const originalSenderId = pickString(record, ["msgSenderID", "msgSenderId", "senderId", "sender", "from"]) ?? null;
-    const teamName = resolveDirectWebOfflineTeamName(messageType, title, originalSenderId, appVariant);
+    const commonEvent = messageType === 3300 ? parseDirectSecretaryCommonEvent(rawBody) : null;
+    const parsedMeta = parseTeamMessageMeta(
+      rawBody,
+      record.data2,
+      {
+        msgMeta: record.msgMeta ?? record.meta,
+        args: commonEvent?.args
+      },
+      { k1: messageType }
+    );
+    const hasCreditMeta =
+      (parsedMeta.k1 === 531 || parsedMeta.k1 === 532) &&
+      parsedMeta.credits !== null;
+    const teamName =
+      resolveDirectWebOfflineTeamName(messageType, title, originalSenderId, appVariant) ??
+      (hasCreditMeta ? (appVariant === "dingdong" ? "叮咚团队" : "说道团队") : null);
     if (!teamName) {
       continue;
     }
-    const commonEvent = messageType === 3300 ? parseDirectSecretaryCommonEvent(rawBody) : null;
     const body = commonEvent?.content ?? rawBody;
-    const content = title && body && title !== body ? `${title}\n${body}` : title ?? body;
+    const plainContent = title && body && title !== body ? `${title}\n${body}` : title ?? body;
+    const content = hasCreditMeta || (!plainContent && parsedMeta.raw)
+      ? buildTeamMessageEnvelope({ title, body, meta: parsedMeta.raw })
+      : plainContent;
     if (!content) {
       continue;
     }
     const msgId = pickString(record, ["msgId", "messageId", "id"]) ?? null;
     const timestamp = pickNumber(record, ["msgTimeStamp", "timestamp", "time", "createdAt"]) ?? null;
-    const meta = normalizeDirectWebOfflineMeta(record.msgMeta ?? record.meta ?? commonEvent?.args);
+    const meta = parsedMeta.raw ?? normalizeDirectWebOfflineMeta(record.msgMeta ?? record.meta ?? record.data2 ?? commonEvent?.args);
+    const effectiveType = parsedMeta.k1 ?? messageType;
     const dedupeKey = msgId ?? `${teamName}|${timestamp ?? ""}|${content}`;
     if (seen.has(dedupeKey)) {
       continue;
@@ -3752,7 +3774,7 @@ export function normalizeDirectWebOfflineMessages(payload: unknown, appVariant?:
     rows.push({
       conversationType: 4,
       conversationId: "10000",
-      type: messageType,
+      type: effectiveType,
       senderId: teamName,
       msgId,
       content,

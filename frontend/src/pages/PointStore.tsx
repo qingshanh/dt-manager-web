@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { App, Button, Card, Col, Descriptions, Input, Row, Space, Statistic, Table, Tabs, Tag, Typography } from 'antd';
+import { Alert, App, Button, Card, Col, Descriptions, Empty, Input, Row, Space, Statistic, Table, Tabs, Tag, Typography } from 'antd';
 import { ArrowLeftOutlined, GiftOutlined, HistoryOutlined, MailOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
@@ -12,16 +12,26 @@ import {
   refreshPointStoreOrder,
 } from '../services/endpoints';
 import type { DtAccountDetail, PointStoreData, PointStoreOrder, PointStoreProduct } from '../types';
+import { resolvePointStoreHistoryView } from './point-store-view';
 
 function formatPoints(value: number | null | undefined) {
   return typeof value === 'number' && Number.isFinite(value) ? value.toLocaleString() : '-';
 }
 
+const ORDER_STATUS_LABELS: Record<string, string> = {
+  pending: '已提交',
+  submitting: '提交中',
+  processing: '进行中',
+  completed: '已完成',
+  failed: '失败',
+  unknown: '未知',
+};
+
 function orderStatusColor(status: string) {
   const normalized = status.toLowerCase();
-  if (/complete|success|done|1/.test(normalized)) return 'green';
-  if (/fail|cancel|error|2/.test(normalized)) return 'red';
-  if (/process|pending|submit|0|3/.test(normalized)) return 'processing';
+  if (normalized === 'completed') return 'green';
+  if (normalized === 'failed') return 'red';
+  if (normalized === 'processing' || normalized === 'pending' || normalized === 'submitting') return 'processing';
   return 'default';
 }
 
@@ -47,6 +57,12 @@ export default function PointStore() {
   const [account, setAccount] = useState<DtAccountDetail | null>(null);
   const [store, setStore] = useState<PointStoreData | null>(null);
   const [orders, setOrders] = useState<PointStoreOrder[]>([]);
+  const [activeTab, setActiveTab] = useState('products');
+  const [ordersLoaded, setOrdersLoaded] = useState(false);
+  const [ordersLoading, setOrdersLoading] = useState(false);
+  const [ordersStale, setOrdersStale] = useState(false);
+  const [ordersSyncError, setOrdersSyncError] = useState<string | null>(null);
+  const [ordersSyncedAt, setOrdersSyncedAt] = useState<string | null>(null);
   const [email, setEmail] = useState('');
   const [defaultEmail, setDefaultEmail] = useState('');
   const [loading, setLoading] = useState(true);
@@ -56,14 +72,12 @@ export default function PointStore() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [accountData, storeData, orderData] = await Promise.all([
+      const [accountData, storeData] = await Promise.all([
         getAccount(accountId),
         getAccountPointStore(accountId),
-        getAccountPointStoreOrders(accountId),
       ]);
       setAccount(accountData);
       setStore(storeData);
-      setOrders(orderData);
       const nextDefaultEmail = storeData.email || accountData.snapshot?.email || accountData.email || '';
       setDefaultEmail(nextDefaultEmail);
       setEmail(nextDefaultEmail);
@@ -74,11 +88,43 @@ export default function PointStore() {
     }
   }, [accountId, message]);
 
+  const loadOrders = useCallback(async () => {
+    setOrdersLoading(true);
+    try {
+      const result = await getAccountPointStoreOrders(accountId);
+      setOrders(result.orders);
+      setOrdersStale(result.stale);
+      setOrdersSyncError(result.sync_error);
+      setOrdersSyncedAt(result.synced_at);
+      setOrdersLoaded(true);
+    } catch (err) {
+      setOrdersStale(false);
+      setOrdersSyncError(err instanceof Error ? err.message : '订单同步失败');
+      setOrdersSyncedAt(null);
+      setOrdersLoaded(true);
+    } finally {
+      setOrdersLoading(false);
+    }
+  }, [accountId]);
+
   useEffect(() => {
     if (Number.isFinite(accountId) && accountId > 0) {
+      setActiveTab('products');
+      setOrders([]);
+      setOrdersLoaded(false);
+      setOrdersStale(false);
+      setOrdersSyncError(null);
+      setOrdersSyncedAt(null);
       void load();
     }
   }, [accountId, load]);
+
+  const handleTabChange = (key: string) => {
+    setActiveTab(key);
+    if (key === 'orders' && !ordersLoaded && !ordersLoading) {
+      void loadOrders();
+    }
+  };
 
   const validEmail = useMemo(() => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()), [email]);
 
@@ -171,8 +217,14 @@ export default function PointStore() {
     { title: '商品', dataIndex: 'product_name', ellipsis: true },
     { title: '邮箱', dataIndex: 'email', width: 220, ellipsis: true },
     { title: '积分', dataIndex: 'product_price', width: 90, render: formatPoints },
-    { title: '状态', dataIndex: 'status', width: 110, render: (value) => <Tag color={orderStatusColor(value)}>{value}</Tag> },
-    { title: '时间', dataIndex: 'order_time', width: 170, render: (value, order) => dayjs(value || order.created_at).format('YYYY-MM-DD HH:mm:ss') },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      width: 110,
+      render: (value: string) => <Tag color={orderStatusColor(value)}>{ORDER_STATUS_LABELS[value] ?? ORDER_STATUS_LABELS.unknown}</Tag>,
+    },
+    { title: '实际时间', dataIndex: 'order_time', width: 170, render: (value, order) => dayjs(value || order.created_at).format('YYYY-MM-DD HH:mm:ss') },
+    { title: '来源', dataIndex: 'source', width: 110, render: (value) => value === 'panel' ? '本地审计' : '远端订单' },
     {
       title: '操作',
       width: 90,
@@ -183,6 +235,12 @@ export default function PointStore() {
       ),
     },
   ];
+
+  const orderHistoryView = resolvePointStoreHistoryView({
+    ordersCount: orders.length,
+    stale: ordersStale,
+    syncError: ordersSyncError,
+  });
 
   return (
     <div>
@@ -208,6 +266,8 @@ export default function PointStore() {
       </div>
 
       <Tabs
+        activeKey={activeTab}
+        onChange={handleTabChange}
         items={[
           {
             key: 'products',
@@ -217,7 +277,41 @@ export default function PointStore() {
           {
             key: 'orders',
             label: <Space><HistoryOutlined />历史订单</Space>,
-            children: <Table columns={orderColumns} dataSource={orders} rowKey="id" loading={loading} pagination={{ pageSize: 10 }} scroll={{ x: 1050 }} />,
+            children: (
+              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                <Space wrap>
+                  <Button icon={<ReloadOutlined />} loading={ordersLoading} onClick={() => void loadOrders()}>
+                    手动刷新
+                  </Button>
+                  {ordersSyncedAt ? (
+                    <Typography.Text type="secondary">
+                      最近同步：{dayjs(ordersSyncedAt).format('YYYY-MM-DD HH:mm:ss')}
+                    </Typography.Text>
+                  ) : null}
+                </Space>
+                {orderHistoryView.alert ? (
+                  <Alert
+                    type={orderHistoryView.alert.type}
+                    showIcon
+                    message={orderHistoryView.alert.message}
+                    description={orderHistoryView.alert.description}
+                  />
+                ) : null}
+                {!ordersLoading && ordersLoaded && orders.length === 0 ? (
+                  <Empty description={orderHistoryView.emptyText} />
+                ) : (
+                  <Table
+                    columns={orderColumns}
+                    dataSource={orders}
+                    rowKey="id"
+                    loading={ordersLoading}
+                    locale={{ emptyText: orderHistoryView.emptyText }}
+                    pagination={{ pageSize: 10 }}
+                    scroll={{ x: 1180 }}
+                  />
+                )}
+              </Space>
+            ),
           },
         ]}
       />

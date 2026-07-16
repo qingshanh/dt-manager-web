@@ -62,7 +62,8 @@ test("upgrade progress total does not fall back to current redeemable points", (
   assert.notEqual(progressTotalEnd, -1);
   const progressTotalBlock = accountDetailSource.slice(progressTotalStart, progressTotalEnd);
 
-  assert.doesNotMatch(progressTotalBlock, /gameRedeemInfo|gameHomePage|validPoint/);
+  assert.doesNotMatch(progressTotalBlock, /gameRedeemInfo|gameHomePage|validPoint|historyPoint|history_point/);
+  assert.match(accountDetailSource, /snapshot\?\.progress_point_total/);
   assert.match(accountDetailSource, /userGradeValue === 4 \? 5000 : null/);
   assert.match(accountDetailSource, /fetchMessages\(1, \{ force: true \}\)/);
 });

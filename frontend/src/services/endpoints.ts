@@ -24,6 +24,7 @@ import type {
   PointData,
   PointStoreData,
   PointStoreOrder,
+  PointStoreOrderListResult,
   PointStoreOrderResult,
   PurchasePhoneNumberBody,
   PurchasePhoneNumberResult,
@@ -529,7 +530,7 @@ export async function getAccountPointStore(accountId: number) {
 }
 
 export async function getAccountPointStoreOrders(accountId: number) {
-  const res = await api.get<ApiResponse<PointStoreOrder[]>>(`/accounts/${accountId}/pointstore/orders`);
+  const res = await api.get<ApiResponse<PointStoreOrderListResult>>(`/accounts/${accountId}/pointstore/orders`);
   return res.data.data;
 }
 

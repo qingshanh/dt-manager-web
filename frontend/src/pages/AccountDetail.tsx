@@ -89,6 +89,9 @@ import type {
   ValidateSessionResult,
 } from '../types';
 import { notifyMessageReadStateChanged } from '../services/ui-events';
+import DirectSessionImportModal, {
+  type DirectSessionImportValues,
+} from '../components/accounts/DirectSessionImportModal';
 
 type SnapshotExtras = {
   dtDingtoneId: string | null;
@@ -364,8 +367,6 @@ function parseSnapshotExtras(rawJson?: string | null): SnapshotExtras {
           'next_grade_point',
           'nextLevelPoint',
           'next_level_point',
-          'historyPoint',
-          'history_point',
         ]),
       expirePoint:
         pickNumber(publicPoint ?? {}, ['expirePoint', 'expire_point']) ??
@@ -1073,6 +1074,8 @@ export default function AccountDetail() {
   const [phones, setPhones] = useState<PhoneNumber[]>([]);
   const [phoneCountries, setPhoneCountries] = useState<PhoneCountryOption[]>([]);
   const [phoneLoading, setPhoneLoading] = useState(false);
+  const [directSessionImportOpen, setDirectSessionImportOpen] = useState(false);
+  const [directSessionImportLoading, setDirectSessionImportLoading] = useState(false);
   const [editNickname, setEditNickname] = useState(false);
   const [nickname, setNickname] = useState('');
   const [pointStore, setPointStore] = useState<PointStoreData | null>(null);
@@ -1085,7 +1088,8 @@ export default function AccountDetail() {
   const validPointValue = pointStore?.valid_point ?? snapshot?.valid_point ?? snapshotExtras.validPoint ?? null;
   const userGradeValue = pointStore?.user_grade ?? snapshotExtras.userGrade ?? snapshot?.user_grade ?? null;
   const progressPointValue = pointStore?.history_point ?? snapshotExtras.progressPoint ?? snapshot?.progress_point ?? null;
-  const progressPointTotalValue = snapshotExtras.progressPointTotal ?? (userGradeValue === 4 ? 5000 : null);
+  const progressPointTotalValue =
+    snapshot?.progress_point_total ?? snapshotExtras.progressPointTotal ?? (userGradeValue === 4 ? 5000 : null);
   const expirePointValue = pointStore?.expire_point ?? snapshotExtras.expirePoint;
   const expireTimeValue = pointStore?.expire_time ?? snapshotExtras.expireTime;
   const dingtoneIdValue = snapshotExtras.dtDingtoneId ?? snapshot?.dt_dingtone_id ?? null;
@@ -1544,65 +1548,27 @@ export default function AccountDetail() {
   };
 
   const handleImportDirectSession = async () => {
-    const countries = await fetchPhoneCountries();
-    let dtUserId = account?.dt_user_id ?? '';
-    let token = '';
-    let deviceId = account?.dt_device_id ?? '';
-    let deviceCandidatesText = '';
-    let phonePreviewCountryCode: number | undefined = countries[0]?.country_code;
+    setDirectSessionImportOpen(true);
+    await fetchPhoneCountries();
+  };
 
-    modal.confirm({
-      title: '导入直连会话',
-      width: 640,
-      okText: '验证并接管',
-      cancelText: '取消',
-      content: (
-        <Space direction="vertical" style={{ width: '100%' }}>
-          <div style={{ color: '#666' }}>
-            填入可用的 `dtUserId`、`token`、`deviceId`，系统会先做一次直连探测，成功后保存到账户。
-          </div>
-          <Input defaultValue={dtUserId} placeholder="dtUserId" onChange={(event) => { dtUserId = event.target.value; }} />
-          <Input.Password placeholder="token" onChange={(event) => { token = event.target.value; }} />
-          <Input
-            defaultValue={deviceId}
-            placeholder="deviceId，例如 And.xxxxx.dttalk"
-            onChange={(event) => { deviceId = event.target.value; }}
-          />
-          <Input.TextArea
-            rows={3}
-            placeholder="可选：额外 deviceId 候选，每行或每个逗号一个"
-            onChange={(event) => { deviceCandidatesText = event.target.value; }}
-          />
-          <Select
-            allowClear
-            defaultValue={phonePreviewCountryCode}
-            disabled={countries.length === 0}
-            options={countries.map((item) => ({
-              label: item.label,
-              value: item.country_code,
-            }))}
-            placeholder={countries.length === 0 ? '国家列表尚未加载，跳过候选号预览' : '可选：顺手验证一个国家的候选号预览'}
-            onChange={(value) => { phonePreviewCountryCode = value ? Number(value) : undefined; }}
-          />
-        </Space>
-      ),
-      onOk: async () => {
-        const deviceIdCandidates = deviceCandidatesText
-          .split(/[\n,]/)
-          .map((item) => item.trim())
-          .filter(Boolean);
-        const result = await validateSession(accountId, {
-          dt_user_id: dtUserId.trim() || undefined,
-          token: token.trim() || undefined,
-          device_id: deviceId.trim() || undefined,
-          device_id_candidates: deviceIdCandidates.length > 0 ? deviceIdCandidates : undefined,
-          app_variant: account?.app_variant,
-          phone_preview_country_code: phonePreviewCountryCode,
-        });
-        await Promise.all([fetchAccount(), fetchPhones()]);
-        showSessionImportSuccess(result, '直连会话已导入');
-      },
-    });
+  const handleSubmitDirectSession = async (values: DirectSessionImportValues) => {
+    setDirectSessionImportLoading(true);
+    try {
+      const result = await validateSession(accountId, {
+        dt_user_id: values.dtUserId,
+        token: values.token,
+        device_id: values.deviceId,
+        device_id_candidates: values.deviceIdCandidates.length > 0 ? values.deviceIdCandidates : undefined,
+        app_variant: account?.app_variant,
+        phone_preview_country_code: values.phonePreviewCountryCode,
+      });
+      await Promise.all([fetchAccount({ force: true }), fetchPhones({ force: true })]);
+      setDirectSessionImportOpen(false);
+      showSessionImportSuccess(result, '直连会话已导入');
+    } finally {
+      setDirectSessionImportLoading(false);
+    }
   };
 
   const handleCaptureHelperSession = () => {
@@ -1610,14 +1576,15 @@ export default function AccountDetail() {
     const appName = isDingdong ? '叮咚' : '说道';
     const packageName = isDingdong ? 'me.dingtone.app.im' : 'me.talkyou.app.im';
     modal.confirm({
-      title: `从已登录${appName} App 导入会话`,
+      title: `模拟器测试导入（仅逆向/测试） - ${appName}`,
       content: (
         <Space direction="vertical">
           <div>将通过 helper/ADB 连接当前模拟器里的 {appName} App，并导出已登录会话接管到面板。</div>
+          <div style={{ color: '#cf1322' }}>该入口不是正式部署依赖，仅用于逆向和测试环境。</div>
           <div style={{ color: '#666' }}>目标包名：{packageName}</div>
         </Space>
       ),
-      okText: '导入已登录会话',
+      okText: '确认测试导入',
       cancelText: '取消',
       onOk: async () => {
         const result = await captureSession(accountId);
@@ -2239,7 +2206,7 @@ export default function AccountDetail() {
         </Tag>
         <Space style={{ marginLeft: 'auto' }}>
           <Button onClick={handleImportDirectSession}>导入会话</Button>
-          <Button onClick={handleCaptureHelperSession}>从已登录 App 导入</Button>
+          <Button onClick={handleCaptureHelperSession}>模拟器测试导入（仅逆向/测试）</Button>
           <Button
             type={account?.monitor_enabled ? 'default' : 'primary'}
             icon={account?.monitor_enabled ? <PauseCircleOutlined /> : <PlayCircleOutlined />}
@@ -2535,6 +2502,16 @@ export default function AccountDetail() {
             ),
           },
         ]}
+      />
+      <DirectSessionImportModal
+        open={directSessionImportOpen}
+        appVariant={account?.app_variant ?? 'dingtone'}
+        initialDtUserId={account?.dt_user_id ?? ''}
+        initialDeviceId={account?.dt_device_id ?? ''}
+        countries={phoneCountries}
+        loading={directSessionImportLoading}
+        onCancel={() => setDirectSessionImportOpen(false)}
+        onSubmit={handleSubmitDirectSession}
       />
       <Modal
         title={`${account?.app_variant === 'dingdong' ? '叮咚团队' : '说道团队'}消息历史`}

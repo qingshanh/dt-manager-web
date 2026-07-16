@@ -139,7 +139,7 @@ async function main() {
   checks.push(checkDtUserIdMonitorUniqueness());
   checks.push(checkLegacyEncryptionKeyFallback());
   checks.push(checkMonitorStartTokenPreflight());
-  checks.push(checkDuplicateSessionMergeAcrossVariants());
+  checks.push(checkDuplicateSessionMergeWithinVariant());
   checks.push(checkSessionImportTokenReuseGuard());
   checks.push(checkDirectMonitorHostDiagnostics());
   checks.push(checkPreviewAreaCodeBackfill());
@@ -1195,8 +1195,8 @@ function checkDirectVerificationRandomDeviceIds() {
   const createsAndDeviceId =
     createBlock.includes("crypto.randomBytes(16).toString(\"hex\")") &&
     createBlock.includes("`And.${crypto.randomBytes(16).toString(\"hex\")}.dttalk`");
-  const newAccountsDoNotReuseDevice =
-    createAccountBlock.includes("normalizeVerificationDeviceId(existing?.dtDeviceId ?? createDeviceId(), body.app_variant, body.login_type)");
+  const requestedDeviceKeepsRandomFallback =
+    /body\.device_id\s*\?\?\s*existing\?\.dtDeviceId\s*\?\?\s*createDeviceId\(\)/m.test(createAccountBlock);
   const resendUsesFreshPair =
     resendBlock.includes("const deviceId = createDeviceId();") &&
     resendBlock.includes("const trackCode = createTrackCode();") &&
@@ -1222,14 +1222,14 @@ function checkDirectVerificationRandomDeviceIds() {
     name: "direct_verification_random_device_ids",
     ok:
       createsAndDeviceId &&
-      newAccountsDoNotReuseDevice &&
+      requestedDeviceKeepsRandomFallback &&
       resendUsesFreshPair &&
       savesBeforeSend &&
       recordsSendFailure &&
       recordsVerifyFailure,
     detail: {
       createsAndDeviceId,
-      newAccountsDoNotReuseDevice,
+      requestedDeviceKeepsRandomFallback,
       resendUsesFreshPair,
       savesBeforeSend,
       recordsSendFailure,
@@ -1984,23 +1984,33 @@ function checkMonitorStartTokenPreflight() {
   };
 }
 
-function checkDuplicateSessionMergeAcrossVariants() {
+function checkDuplicateSessionMergeWithinVariant() {
   const routeText = readSourceFile("src/routes/accounts.ts");
+  const scopeText = readSourceFile("src/services/account-duplicate-scope.ts");
   const mergeDuplicateBlock = extractFunctionBlock(routeText, "mergeDuplicateAccounts");
   const ownerGuardBlock = extractFunctionBlock(routeText, "assertCapturedSessionIsNotOwnedByAnotherAccount");
-  const hasDtUserIdAndNotGuard = (block: string) => /dtUserId\s*,\s*NOT\s*:/m.test(block);
-  const mergesByDtUserIdAcrossVariants =
-    hasDtUserIdAndNotGuard(mergeDuplicateBlock) &&
-    !/dtUserId\s*,\s*appVariant:\s*target\.appVariant/m.test(mergeDuplicateBlock);
-  const ownerGuardChecksByDtUserIdAcrossVariants =
-    hasDtUserIdAndNotGuard(ownerGuardBlock) &&
-    !/dtUserId\s*,\s*appVariant:\s*account\.appVariant/m.test(ownerGuardBlock);
+  const helperScopesAdministrator = /adminId:\s*input\.adminId/.test(scopeText);
+  const helperScopesAppVariant = /appVariant:\s*input\.appVariant/.test(scopeText);
+  const helperScopesDtUserId = /dtUserId:\s*input\.dtUserId/.test(scopeText);
+  const helperExcludesTarget = /NOT:\s*\{\s*id:\s*input\.id\s*\}/.test(scopeText);
+  const mergeUsesScopedHelper = /buildSameVariantDuplicateAccountWhere/.test(mergeDuplicateBlock);
+  const ownerGuardUsesScopedHelper = /buildSameVariantDuplicateAccountWhere/.test(ownerGuardBlock);
   return {
-    name: "duplicate_session_merge_across_variants",
-    ok: mergesByDtUserIdAcrossVariants && ownerGuardChecksByDtUserIdAcrossVariants,
+    name: "duplicate_session_merge_same_variant",
+    ok:
+      helperScopesAdministrator &&
+      helperScopesAppVariant &&
+      helperScopesDtUserId &&
+      helperExcludesTarget &&
+      mergeUsesScopedHelper &&
+      ownerGuardUsesScopedHelper,
     detail: {
-      mergesByDtUserIdAcrossVariants,
-      ownerGuardChecksByDtUserIdAcrossVariants
+      helperScopesAdministrator,
+      helperScopesAppVariant,
+      helperScopesDtUserId,
+      helperExcludesTarget,
+      mergeUsesScopedHelper,
+      ownerGuardUsesScopedHelper
     }
   };
 }

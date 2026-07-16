@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Alert, App, Button, Card, Form, Input, Select, Space, Steps, Tag, Typography } from 'antd';
-import { LockOutlined, MailOutlined, NumberOutlined, PhoneOutlined } from '@ant-design/icons';
+import { MailOutlined, NumberOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { createAccount, getAccount, getSettings, sendVerificationCode, verifyCode } from '../services/endpoints';
 import type { AppVariant, CreateAccountRequest, LoginType, SettingItem } from '../types';
@@ -8,8 +8,6 @@ import type { AppVariant, CreateAccountRequest, LoginType, SettingItem } from '.
 type CreateFormValues = {
   nickname?: string;
   email?: string;
-  phone?: string;
-  password?: string;
   deviceId?: string;
 };
 
@@ -42,9 +40,9 @@ export default function AccountAdd() {
   const isMockMode = settings.DT_GATEWAY_MODE === 'mock';
   const isDirectMode = settings.DT_GATEWAY_MODE === 'direct';
   const variantLabel = useMemo(() => (appVariant === 'dingdong' ? '叮咚' : '说道'), [appVariant]);
-  const isVerificationLogin = loginType === 'email_code' || loginType === 'phone_code';
-  const verificationTargetLabel = loginType === 'phone_code' ? '手机号' : '邮箱';
-  const verificationDeliveryLabel = loginType === 'phone_code' ? '短信' : '邮件';
+  const isVerificationLogin = loginType === 'email_code';
+  const verificationTargetLabel = '邮箱';
+  const verificationDeliveryLabel = '邮件';
 
   const watchPendingVerificationSend = async (id: number) => {
     for (let i = 0; i < 18; i += 1) {
@@ -70,14 +68,8 @@ export default function AccountAdd() {
         device_id: values.deviceId?.trim() || undefined,
       };
 
-      if (loginType === 'email_code' || loginType === 'email_password' || loginType === 'manual_session') {
+      if (loginType === 'email_code' || loginType === 'manual_session') {
         params.email = values.email?.trim() || undefined;
-      }
-      if (loginType === 'phone_code' || loginType === 'phone_password') {
-        params.phone = values.phone?.trim() || undefined;
-      }
-      if (loginType === 'email_password' || loginType === 'phone_password') {
-        params.password = values.password;
       }
 
       const result = await createAccount(params);
@@ -186,7 +178,7 @@ export default function AccountAdd() {
         current={step}
         items={[
           { title: '填写信息' },
-          { title: loginType === 'phone_code' ? '验证手机号' : '验证邮箱' },
+          { title: '验证邮箱' },
           { title: '完成' },
         ]}
         style={{ marginBottom: 32 }}
@@ -211,11 +203,8 @@ export default function AccountAdd() {
                 value={loginType}
                 onChange={(value: LoginType) => setLoginType(value)}
                 options={[
-                  { value: 'manual_session', label: '手动导入直连会话' },
                   { value: 'email_code', label: '邮箱 + 验证码' },
-                  { value: 'phone_code', label: '手机号 + 验证码' },
-                  { value: 'email_password', label: '邮箱 + 密码' },
-                  { value: 'phone_password', label: '手机号 + 密码' },
+                  { value: 'manual_session', label: '手动导入直连会话' },
                 ]}
               />
             </Form.Item>
@@ -246,7 +235,7 @@ export default function AccountAdd() {
               />
             )}
 
-            {(loginType === 'email_code' || loginType === 'email_password' || loginType === 'manual_session') && (
+            {(loginType === 'email_code' || loginType === 'manual_session') && (
               <Form.Item
                 label="邮箱"
                 name="email"
@@ -260,18 +249,6 @@ export default function AccountAdd() {
                 }
               >
                 <Input prefix={<MailOutlined />} placeholder="user@example.com" />
-              </Form.Item>
-            )}
-
-            {(loginType === 'phone_code' || loginType === 'phone_password') && (
-              <Form.Item label="手机号" name="phone" rules={[{ required: true, message: '请输入手机号' }]}>
-                <Input prefix={<PhoneOutlined />} placeholder="+8613800138000" />
-              </Form.Item>
-            )}
-
-            {(loginType === 'email_password' || loginType === 'phone_password') && (
-              <Form.Item label="密码" name="password" rules={[{ required: true, message: '请输入密码' }]}>
-                <Input.Password prefix={<LockOutlined />} placeholder={`${variantLabel}账户密码`} />
               </Form.Item>
             )}
 
@@ -293,9 +270,7 @@ export default function AccountAdd() {
           <Typography.Paragraph style={{ marginBottom: 16 }}>
             {isMockMode
               ? `当前是 mock 模式，不会收到真实${verificationDeliveryLabel}，请直接输入固定验证码 123456。`
-              : loginType === 'phone_code'
-                ? '验证码已发送至手机号，请输入收到的验证码。'
-                : '验证码已发送至邮箱，请输入收到的验证码。'}
+              : '验证码已发送至邮箱，请输入收到的验证码。'}
           </Typography.Paragraph>
           <Form layout="vertical" onFinish={handleVerify}>
             <Form.Item label="验证码" name="code" rules={[{ required: true, message: '请输入验证码' }]}>

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { MessageDirection, MessageType } from "@prisma/client";
+import { normalizeDirectWebOfflineMessages } from "./dingtone/direct-gateway.js";
 import { eventBus, type AppEvent } from "./event-bus.js";
 import { storeHelperSmsMessages, storeParsedSmsPushes } from "./message-runtime.js";
 
@@ -369,7 +370,7 @@ test("renders a TalkU redemption message from its real secretary envelope", asyn
   assert.equal(imported, 1);
   assert.equal(runtime.messages[0]?.msgType, MessageType.system);
   assert.equal(runtime.messages[0]?.fromNumber, "说道团队");
-  assert.equal(runtime.messages[0]?.content, "兑换成功，恭喜您成功获得说道币20个（有效期3个月）。现在去查看余额");
+  assert.equal(runtime.messages[0]?.content, "兑换成功，20.00 说道币已到账");
 });
 
 test("renders DingDong team credit arrivals and completed tasks from real metadata", async () => {
@@ -404,8 +405,241 @@ test("renders DingDong team credit arrivals and completed tasks from real metada
   );
 
   assert.equal(imported, 2);
-  assert.equal(runtime.messages[0]?.content, "4个叮咚币已经到你账上。现在去查看余额。");
-  assert.equal(runtime.messages[1]?.content, "您获得了0.50个叮咚币。此任务已完成，开始一个新任务获得更多叮咚币吧！");
+  assert.equal(runtime.messages[0]?.content, "获得 4.00 叮咚币");
+  assert.equal(runtime.messages[1]?.content, "任务完成，获得 0.50 叮咚币");
+});
+
+test("stores metadata-only DingDong task credits from Direct web offline", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    appVariant: "dingdong",
+    nickname: null,
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: false
+  });
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [
+      {
+        msgTitle: "",
+        msgContent: "",
+        msgMeta: JSON.stringify({ k1: 532, credits: 0.5, ex: -1, type: 5 }),
+        msgSenderID: "2684354560",
+        msgId: "direct-credit-532",
+        msgType: 532,
+        msgTimeStamp: 1_800_000_001
+      }
+    ]
+  }, "dingdong");
+
+  const imported = await storeHelperSmsMessages(1, rows, {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  });
+
+  assert.equal(imported, 1);
+  assert.equal(runtime.messages[0]?.msgType, MessageType.system);
+  assert.equal(runtime.messages[0]?.k5Flag, 532);
+  assert.equal(runtime.messages[0]?.fromNumber, "叮咚团队");
+  assert.equal(runtime.messages[0]?.content, "任务完成，获得 0.50 叮咚币");
+  assert.equal(runtime.messages[0]?.isRead, true);
+});
+
+test("stores common-event credits using nested params metadata", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    appVariant: "dingdong",
+    nickname: null,
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: false
+  });
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [
+      {
+        content: JSON.stringify({
+          content: "",
+          args: { type: 99, params: { k1: 531, credits: 4, ex: -1 } }
+        }),
+        from: "2684354560",
+        msgId: "direct-credit-3300-store",
+        msgType: 3300,
+        msgTimeStamp: 1_800_000_002
+      }
+    ]
+  }, "dingdong");
+
+  const imported = await storeHelperSmsMessages(1, rows, {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  });
+
+  assert.equal(imported, 1);
+  assert.equal(runtime.messages[0]?.k5Flag, 531);
+  assert.equal(runtime.messages[0]?.content, "获得 4.00 叮咚币");
+});
+
+test("stores team credit metadata from data2 when the helper content is empty", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    appVariant: "dingtone",
+    nickname: null,
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: false
+  });
+
+  const imported = await storeHelperSmsMessages(1, [
+    {
+      conversationType: 4,
+      conversationId: "10000",
+      type: 531,
+      senderId: "2684354560",
+      msgId: "data2-only-credit",
+      content: "",
+      data2: JSON.stringify({ k1: 531, credits: 4, ex: -1, type: 99 }),
+      timestamp: 1_800_000_003
+    }
+  ], {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  });
+
+  assert.equal(imported, 1);
+  assert.equal(runtime.messages[0]?.content, "获得 4.00 说道币");
+  assert.equal(runtime.messages[0]?.k5Flag, 531);
+});
+
+test("uses the inner team type for direct helper creation and duplicate upgrades", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    appVariant: "dingdong",
+    nickname: null,
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: false
+  });
+  const row = {
+    conversationType: 4,
+    conversationId: "10000",
+    type: 3300,
+    senderId: "2684354560",
+    msgId: "helper-inner-type-531",
+    content: "",
+    data2: JSON.stringify({ k1: 531, credits: 4, ex: -1, type: 99 }),
+    timestamp: 1_800_000_006
+  };
+
+  assert.equal(await storeHelperSmsMessages(1, [row], {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  }), 1);
+  assert.equal(runtime.messages[0]?.k5Flag, 531);
+
+  runtime.messages[0]!.k5Flag = 3300;
+  runtime.messages[0]!.content = "积分变动：";
+  runtime.messages[0]!.fromNumber = "2684354560";
+
+  assert.equal(await storeHelperSmsMessages(1, [row], {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  }), 0);
+  assert.equal(runtime.messages.length, 1);
+  assert.equal(runtime.messages[0]?.k5Flag, 531);
+  assert.equal(runtime.messages[0]?.content, "获得 4.00 叮咚币");
+  assert.equal(runtime.messages[0]?.fromNumber, "叮咚团队");
+});
+
+test("keeps untrusted helper JSON metadata as an ordinary unread SMS", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    adminId: 1,
+    appVariant: "dingtone",
+    nickname: null,
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: true
+  });
+  const events: AppEvent[] = [];
+  const listener = (event: AppEvent) => events.push(event);
+  eventBus.on("event", listener);
+
+  try {
+    const imported = await storeHelperSmsMessages(1, [
+      {
+        conversationType: 1,
+        conversationId: "12025550101|Service Notice",
+        type: 1,
+        senderId: "Service Notice",
+        msgId: "ordinary-json-credit-meta",
+        content: "Ordinary balance notice",
+        data2: JSON.stringify({ k1: 531, credits: 4, type: 99 })
+      }
+    ], {
+      db: runtime.db as any,
+      emitEvents: true,
+      sendTelegram: false,
+      collectTeamMessages: true
+    });
+
+    assert.equal(imported, 1);
+    assert.equal(runtime.messages[0]?.msgType, MessageType.sms);
+    assert.equal(runtime.messages[0]?.fromNumber, "Service Notice");
+    assert.equal(runtime.messages[0]?.content, "Ordinary balance notice");
+    assert.equal(runtime.messages[0]?.k5Flag, 1);
+    assert.equal(runtime.messages[0]?.isRead, false);
+    assert.equal(events.filter((event) => event.type === "new_message").length, 1);
+  } finally {
+    eventBus.off("event", listener);
+  }
+});
+
+test("keeps empty ordinary helper SMS rows filtered", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    appVariant: "dingtone",
+    nickname: null,
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: false
+  });
+
+  const imported = await storeHelperSmsMessages(1, [
+    {
+      conversationType: 1,
+      conversationId: "12025550101|Service",
+      senderId: "Service",
+      msgId: "empty-ordinary-helper",
+      content: ""
+    }
+  ], { db: runtime.db as any, emitEvents: false, sendTelegram: false });
+
+  assert.equal(imported, 0);
+  assert.equal(runtime.messages.length, 0);
 });
 
 test("upgrades an existing team summary when the same helper message is scanned again", async () => {
@@ -421,7 +655,7 @@ test("upgrades an existing team summary when the same helper message is scanned 
     content: "积分变动：4",
     rawInfo: "10000",
     rawK3: "existing-team-summary",
-    k5Flag: 531,
+    k5Flag: 3300,
     isRead: true,
     telegramSent: false,
     telegramMsgId: null,
@@ -448,8 +682,126 @@ test("upgrades an existing team summary when the same helper message is scanned 
 
   assert.equal(imported, 0);
   assert.equal(runtime.messages.length, 1);
-  assert.equal(runtime.messages[0]?.content, "4个叮咚币已经到你账上。现在去查看余额。");
+  assert.equal(runtime.messages[0]?.content, "获得 4.00 叮咚币");
+  assert.equal(runtime.messages[0]?.fromNumber, "叮咚团队");
+  assert.equal(runtime.messages[0]?.k5Flag, 531);
   assert.ok((runtime.messages[0]?.receivedAt.getTime() ?? 0) <= Date.now() + 1_000);
+});
+
+test("upgrades repeated team messages from outer 3300 to inner 531 and 532 types", async () => {
+  for (const scenario of [
+    { k1: 531, actionType: 99, credits: 4, expected: "获得 4.00 叮咚币" },
+    { k1: 532, actionType: 5, credits: 0.5, expected: "任务完成，获得 0.50 叮咚币" }
+  ]) {
+    const runtime = createMessageRuntimeDb();
+    runtime.accounts.set(1, {
+      id: 1,
+      appVariant: "dingdong",
+      nickname: null,
+      email: "owner@example.com",
+      phone: null,
+      dtUserId: "u1",
+      telegramNotify: false
+    });
+    const msgId = `credit-upgrade-${scenario.k1}`;
+    runtime.messages.push({
+      id: 1,
+      accountId: 1,
+      direction: MessageDirection.incoming,
+      msgType: MessageType.system,
+      fromNumber: "2684354560",
+      toNumber: null,
+      content: "积分变动：",
+      rawInfo: "10000",
+      rawK3: msgId,
+      k5Flag: 3300,
+      isRead: true,
+      telegramSent: false,
+      telegramMsgId: null,
+      receivedAt: new Date(),
+      createdAt: new Date()
+    });
+    const rows = normalizeDirectWebOfflineMessages({
+      Result: 1,
+      Message: [
+        {
+          content: JSON.stringify({
+            content: "",
+            args: {
+              type: scenario.actionType,
+              params: { k1: scenario.k1, credits: scenario.credits, ex: -1 }
+            }
+          }),
+          from: "2684354560",
+          msgId,
+          msgType: 3300,
+          msgTimeStamp: 1_800_000_004
+        }
+      ]
+    }, "dingdong");
+
+    const imported = await storeHelperSmsMessages(1, rows, {
+      db: runtime.db as any,
+      emitEvents: false,
+      sendTelegram: false,
+      collectTeamMessages: true
+    });
+
+    assert.equal(imported, 0);
+    assert.equal(runtime.messages.length, 1);
+    assert.equal(runtime.messages[0]?.content, scenario.expected);
+    assert.equal(runtime.messages[0]?.fromNumber, "叮咚团队");
+    assert.equal(runtime.messages[0]?.k5Flag, scenario.k1);
+  }
+});
+
+test("isolates normalized team credits from events and Telegram even when forced on", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    adminId: 1,
+    appVariant: "dingtone",
+    nickname: "Team account",
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: true
+  });
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [
+      {
+        msgTitle: "",
+        msgContent: "",
+        msgMeta: JSON.stringify({ k1: 531, credits: 20, ex: 90, type: 34 }),
+        msgSenderID: "2684354560",
+        msgId: "isolated-team-credit",
+        msgType: 531,
+        msgTimeStamp: 1_800_000_005
+      }
+    ]
+  }, "dingtone");
+  const events: AppEvent[] = [];
+  const listener = (event: AppEvent) => events.push(event);
+  eventBus.on("event", listener);
+
+  try {
+    const imported = await storeHelperSmsMessages(1, rows, {
+      db: runtime.db as any,
+      emitEvents: true,
+      sendTelegram: true,
+      collectTeamMessages: true
+    });
+
+    assert.equal(imported, 1);
+    assert.equal(runtime.messages[0]?.msgType, MessageType.system);
+    assert.equal(runtime.messages[0]?.isRead, true);
+    assert.equal(runtime.messages[0]?.telegramSent, false);
+    assert.equal(runtime.messages[0]?.telegramMsgId, null);
+    assert.equal(events.filter((event) => event.type === "new_message").length, 0);
+  } finally {
+    eventBus.off("event", listener);
+  }
 });
 
 test("keeps the original import time when a repeated team message has no provider timestamp", async () => {
