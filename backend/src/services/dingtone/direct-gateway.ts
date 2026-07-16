@@ -332,15 +332,32 @@ const DIRECT_OFFLINE_CATCHUP_RETRY_MS = 30_000;
 const DIRECT_NOTIFY_ONLY_CATCHUP_THROTTLE_MS = 60_000;
 const DIRECT_WEB_OFFLINE_POLL_INTERVAL_MS = 60_000;
 const DIRECT_RECONNECT_BACKOFF_MAX_MS = 1_000;
+const DIRECT_LINK_BOOTSTRAP_WAIT_MS = 1_250;
+const DIRECT_LINK_HEALTHY_AFTER_MS = 15_000;
 const DIRECT_SESSION_OPERATION_IDLE_WAIT_MS = 5_000;
 const DIRECT_PUSH_HOST_CONCURRENCY = 2;
 const DIRECT_PUSH_NON_SMS_FRAME_BATCH_LIMIT = 5;
 const DIRECT_PUSH_NON_SMS_FRAME_PAUSE_MS = 1_000;
-const DIRECT_IDLE_NON_SMS_FRAME_PAUSE_BATCH = 3;
-const DIRECT_IDLE_NON_SMS_FRAME_PAUSE_MS = 750;
 const DIRECT_SOCKET_FRAME_BUDGET_PER_TICK = 20;
 const DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS = 5_000;
 const DIRECT_SESSION_KEEPALIVE_INTERVAL_MS = 5_000;
+
+function calculateDirectPairedKeepaliveDelay(elapsedSinceConnect: number) {
+  const elapsed = Math.max(0, elapsedSinceConnect);
+  if (elapsed === 0) {
+    return DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS;
+  }
+  const remaining = DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS - (elapsed % DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS);
+  return remaining === DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS ? 250 : Math.max(250, remaining);
+}
+
+export function calculateDirectPairedKeepaliveDelayForTest(elapsedSinceConnect: number) {
+  return calculateDirectPairedKeepaliveDelay(elapsedSinceConnect);
+}
+
+function isDirectLinkStable(openedAt: number, now: number) {
+  return openedAt > 0 && now - openedAt >= DIRECT_LINK_HEALTHY_AFTER_MS;
+}
 const DINGDONG_SESSION_KEEPALIVE_INTERVAL_MS = 2_000;
 const CAPTURED_OFFLINE_FIELDS = {
   deviceId: "And.11111111111111111111111111111111.dttalk"
@@ -1431,6 +1448,7 @@ export async function listenDirectSessionPushes(input: {
   let selectedHost = baseHosts[0] ?? runtime.primaryHost;
   let attempts = 0;
   let successfulPairs = 0;
+  let stablePairs = 0;
   let nextOfflineCatchupAt = 0;
   let nextNotifyOnlyCatchupAt = 0;
   let nextWebOfflinePollAt = 0;
@@ -1583,7 +1601,11 @@ export async function listenDirectSessionPushes(input: {
 
       const pushSession = new DirectSession(runtime, host);
       let linkSession: DirectSession | null = null;
+      let linkReservationEpoch: number | null = null;
       let linkRegistrationEpoch: number | null = null;
+      let pushOpenedAt = 0;
+      let pushReportedHealthy = false;
+      let pairedFailureReported = false;
       listener.session = pushSession;
       listener.sessions?.add(pushSession);
       if (!isActiveDirectPushListener(listener)) {
@@ -1595,6 +1617,10 @@ export async function listenDirectSessionPushes(input: {
       diagnostics.recordConnectionAttempt(host);
       selectedHost = host;
       await reportHostStatus(host, "connecting", null);
+      const reportPairedHostFailure = async (error: unknown) => {
+        pairedFailureReported = true;
+        await reportHostStatus(host, "failed", error instanceof Error ? error.message : String(error));
+      };
       let pushTraceCount = 0;
       let linkTraceCount = 0;
       const collectPairTrace = () => {
@@ -1607,7 +1633,28 @@ export async function listenDirectSessionPushes(input: {
           linkTraceCount = linkTrace.totalSeen;
         }
       };
+      const reserveRouteRegistration = () => {
+        if (
+          (linkRegistrationEpoch !== null && routeCoordinator.isOwner(host, linkRegistrationEpoch))
+          || (linkReservationEpoch !== null && routeCoordinator.isOwner(host, linkReservationEpoch))
+        ) {
+          return true;
+        }
+        if (!routeCoordinator.shouldClaim(host)) {
+          return false;
+        }
+        linkReservationEpoch = routeCoordinator.claim(host);
+        return true;
+      };
       const closeLinkSession = async () => {
+        if (linkRegistrationEpoch !== null) {
+          routeCoordinator.release(host, linkRegistrationEpoch);
+          linkRegistrationEpoch = null;
+        }
+        if (linkReservationEpoch !== null) {
+          routeCoordinator.release(host, linkReservationEpoch);
+          linkReservationEpoch = null;
+        }
         if (!linkSession) {
           return;
         }
@@ -1615,9 +1662,6 @@ export async function listenDirectSessionPushes(input: {
         const closingSession = linkSession;
         linkSession = null;
         linkTraceCount = 0;
-        if (linkRegistrationEpoch !== null) {
-          linkRegistrationEpoch = null;
-        }
         listener.sessions?.delete(closingSession);
         await closingSession.close().catch(() => undefined);
       };
@@ -1625,7 +1669,7 @@ export async function listenDirectSessionPushes(input: {
         if (linkRegistrationEpoch !== null && routeCoordinator.isOwner(host, linkRegistrationEpoch)) {
           return true;
         }
-        if (!routeCoordinator.shouldClaim(host)) {
+        if (!reserveRouteRegistration() || linkReservationEpoch === null) {
           logger.info("Direct secondary paired workers stay authenticated without replacing the primary SMS route", {
             host,
             registrationOwnerHost,
@@ -1636,7 +1680,7 @@ export async function listenDirectSessionPushes(input: {
         if (!isActiveDirectPushListener(listener)) {
           throw new Error("Direct listener was preempted before route registration");
         }
-        const reservedEpoch = routeCoordinator.claim(host);
+        const reservedEpoch = linkReservationEpoch;
         try {
           if (!isActiveDirectPushListener(listener)) {
             throw new Error("Direct listener was preempted before route registration");
@@ -1650,6 +1694,7 @@ export async function listenDirectSessionPushes(input: {
             throw new Error("Direct listener was preempted during route registration");
           }
           linkRegistrationEpoch = reservedEpoch;
+          linkReservationEpoch = null;
           logger.info("Direct paired worker owns the SMS route", {
             host,
             registrationOwnerHost
@@ -1657,6 +1702,9 @@ export async function listenDirectSessionPushes(input: {
           return true;
         } catch (error) {
           routeCoordinator.release(host, reservedEpoch);
+          if (linkReservationEpoch === reservedEpoch) {
+            linkReservationEpoch = null;
+          }
           if (host === registrationOwnerHost) {
             routeCoordinator.markPrimaryUnavailable();
           }
@@ -1670,7 +1718,12 @@ export async function listenDirectSessionPushes(input: {
         if (!isActiveDirectPushListener(listener)) {
           throw new Error("Direct listener was preempted before link session creation");
         }
-        await closeLinkSession();
+        if (linkSession) {
+          await closeLinkSession();
+        }
+        if (!reserveRouteRegistration()) {
+          return null;
+        }
         linkSession = new DirectSession(runtime, host);
         listener.sessions?.add(linkSession);
         try {
@@ -1684,7 +1737,6 @@ export async function listenDirectSessionPushes(input: {
           }
           await ensureRouteRegistration(linkSession);
           successfulPairs += 1;
-          await reportHostStatus(host, "connected", null);
           offlineTemplateAttempted = true;
           offlineTemplateSent = true;
           offlineTemplateSendCount += 1;
@@ -1712,6 +1764,7 @@ export async function listenDirectSessionPushes(input: {
           return linkSession;
         } catch (error) {
           collectPairTrace();
+          await reportPairedHostFailure(error);
           await closeLinkSession();
           throw error;
         }
@@ -1725,7 +1778,9 @@ export async function listenDirectSessionPushes(input: {
           nextNotifyOnlyCatchupAt = Date.now() + DIRECT_NOTIFY_ONLY_CATCHUP_THROTTLE_MS;
           try {
             const currentLinkSession = await ensureLinkSession();
-            await requestOfflineCatchup(currentLinkSession, host, "notify-only");
+            if (currentLinkSession) {
+              await requestOfflineCatchup(currentLinkSession, host, "notify-only");
+            }
           } catch (error) {
             logger.warn("Direct notify-only catch-up could not refresh the paired link", {
               host,
@@ -1738,16 +1793,30 @@ export async function listenDirectSessionPushes(input: {
 
       try {
         await pushSession.openPush(input.account);
+        pushOpenedAt = Date.now();
+        pushReportedHealthy = false;
 
         while (!listener.preempted && isWithinCurrentListenWindow() && diagnostics.totalPushes() < maxPushFrames) {
-          let currentLinkSession: DirectSession;
+          pairedFailureReported = false;
+          let currentLinkSession = linkSession as DirectSession | null;
+          if (currentLinkSession && !currentLinkSession.isOpen()) {
+            await closeLinkSession();
+            currentLinkSession = null;
+          }
           try {
-            currentLinkSession = await ensureLinkSession();
-            await ensureRouteRegistration(currentLinkSession);
-            lastError = undefined;
+            if (!currentLinkSession && routeCoordinator.ownerHost() === null && reserveRouteRegistration()) {
+              currentLinkSession = await ensureLinkSession();
+            }
+            if (currentLinkSession) {
+              await ensureRouteRegistration(currentLinkSession);
+            }
           } catch (error) {
             lastError = error;
             diagnostics.recordHostError(host, error);
+            if (!pairedFailureReported) {
+              await reportPairedHostFailure(error);
+              await closeLinkSession();
+            }
             logger.warn("Direct paired link registration failed; keeping push socket open", {
               host,
               pushAttempt: attempts,
@@ -1771,51 +1840,63 @@ export async function listenDirectSessionPushes(input: {
             nextWebOfflinePollAt > 0 ? nextWebOfflinePollAt : deadline
           );
           const waitMs = Math.max(250, Math.min(5_000, waitUntil - Date.now()));
-          const linkWaitMs = Math.max(250, Math.ceil(waitMs / 2));
+          const linkWaitMs = currentLinkSession ? Math.max(250, Math.ceil(waitMs / 2)) : 0;
           const nextPushes: DirectProbePushResult[] = [];
-          try {
-            nextPushes.push(
-              ...(await currentLinkSession.waitForPushes(
-                linkWaitMs,
-                remainingFrames,
-                input.onPush,
-                handlePairedFrame
-              ))
-            );
-          } catch (error) {
-            lastError = error;
-            diagnostics.recordHostError(host, error);
-            logger.warn("Direct registered link read failed; keeping prelogin socket open", {
-              host,
-              pushAttempt: attempts,
-              error: error instanceof Error ? error.message : String(error)
-            });
-            if (linkSession === currentLinkSession) {
-              await closeLinkSession();
-            }
-            if (isFatalDirectSessionError(error)) {
-              throw normalizeDirectError(error);
+          if (currentLinkSession) {
+            try {
+              nextPushes.push(
+                ...(await currentLinkSession.waitForPushes(
+                  linkWaitMs,
+                  remainingFrames,
+                  input.onPush,
+                  handlePairedFrame
+                ))
+              );
+              pairedFailureReported = false;
+            } catch (error) {
+              diagnostics.recordHostError(host, error);
+              logger.info("Direct auxiliary link read ended; releasing SMS route for failover", {
+                host,
+                pushAttempt: attempts,
+                error: error instanceof Error ? error.message : String(error)
+              });
+              if (linkSession === currentLinkSession) {
+                await closeLinkSession();
+              }
+              pairedFailureReported = false;
             }
           }
           const remainingAfterLink = Math.max(0, remainingFrames - nextPushes.length);
+          let pushReadSucceeded = false;
           if (remainingAfterLink > 0) {
-            const pushWaitMs = Math.max(250, waitMs - linkWaitMs);
+            const pushWaitMs = Math.max(250, currentLinkSession ? waitMs - linkWaitMs : waitMs);
             nextPushes.push(
               ...(await pushSession.waitForPushes(pushWaitMs, remainingAfterLink, input.onPush, handlePairedFrame))
             );
+            pushReadSucceeded = true;
+            if (
+              !pushReportedHealthy
+              && linkRegistrationEpoch !== null
+              && routeCoordinator.isOwner(host, linkRegistrationEpoch)
+              && isDirectLinkStable(pushOpenedAt, Date.now())
+            ) {
+              pushReportedHealthy = true;
+              stablePairs += 1;
+              await reportHostStatus(host, "connected", null);
+            }
           }
           diagnostics.recordPushes(nextPushes);
           collectPairTrace();
-          lastError = undefined;
+          if (pushReadSucceeded && pushReportedHealthy) {
+            lastError = undefined;
+          }
           if (listener.preempted || !isWithinCurrentListenWindow() || diagnostics.totalPushes() >= maxPushFrames) {
             break;
           }
-          if (Date.now() >= nextOfflineCatchupAt) {
-            const currentLinkSession = await ensureLinkSession();
+          if (Date.now() >= nextOfflineCatchupAt && currentLinkSession) {
             await requestOfflineCatchup(currentLinkSession, host, "interval");
           }
-          if (Date.now() >= nextWebOfflinePollAt) {
-            const currentLinkSession = await ensureLinkSession();
+          if (Date.now() >= nextWebOfflinePollAt && currentLinkSession) {
             await requestWebOfflineMessages(currentLinkSession, host);
           }
         }
@@ -1825,7 +1906,9 @@ export async function listenDirectSessionPushes(input: {
         if (host === registrationOwnerHost) {
           routeCoordinator.markPrimaryUnavailable();
         }
-        await reportHostStatus(host, "failed", error instanceof Error ? error.message : String(error));
+        if (!pairedFailureReported) {
+          await reportHostStatus(host, "failed", error instanceof Error ? error.message : String(error));
+        }
         collectPairTrace();
         if (!listener.preempted) {
           logger.warn("Direct paired push listen failed, reconnecting inside listen window", {
@@ -1842,6 +1925,14 @@ export async function listenDirectSessionPushes(input: {
           }
         }
       } finally {
+        if (linkRegistrationEpoch !== null) {
+          routeCoordinator.release(host, linkRegistrationEpoch);
+          linkRegistrationEpoch = null;
+        }
+        if (linkReservationEpoch !== null) {
+          routeCoordinator.release(host, linkReservationEpoch);
+          linkReservationEpoch = null;
+        }
         await closeLinkSession();
         await pushSession.close().catch(() => undefined);
         listener.sessions?.delete(pushSession);
@@ -1872,7 +1963,7 @@ export async function listenDirectSessionPushes(input: {
     throw normalizeDirectError(lastError);
   }
 
-  if (!listener.preempted && successfulPairs === 0 && lastError) {
+  if (!listener.preempted && stablePairs === 0 && lastError) {
     throw normalizeDirectError(lastError);
   }
 
@@ -2944,9 +3035,6 @@ class DirectSession {
   private readonly jsonWaiters = new DirectWaiterQueue<ApiResult>();
   private jsonCaptureUntil = 0;
   private skippedNonSmsLogCount = 0;
-  private idleDroppedNonSmsFrameCount = 0;
-  private idleSocketPaused = false;
-  private idleSocketPauseTimer: NodeJS.Timeout | null = null;
   private keepaliveTimer: NodeJS.Timeout | null = null;
   private keepaliveWriteInFlight = false;
   private keepaliveWriteCount = 0;
@@ -2976,15 +3064,14 @@ class DirectSession {
   }
 
   async openPush(account: DirectSessionAccount) {
-    await this.openPrelogin(account);
-    this.startPairedKeepalive();
+    await this.openPrelogin(account, true);
   }
 
   async openLink(account: DirectSessionAccount) {
     await this.openPrelogin(account);
-    await this.bootstrapAuthenticatedSession(account);
+    await this.startSocketKeepalive();
+    await this.bootstrapAuthenticatedSession(account, DIRECT_LINK_BOOTSTRAP_WAIT_MS);
     await this.primeLinkRegistration(account);
-    this.startPairedKeepalive();
   }
 
   private async primeLinkRegistration(account: DirectSessionAccount) {
@@ -3028,7 +3115,7 @@ class DirectSession {
     );
   }
 
-  private async openPrelogin(account: DirectSessionAccount) {
+  private async openPrelogin(account: DirectSessionAccount, startPairedKeepalive = false) {
     this.account = account;
     this.trackCodeGenerator = createDirectTrackCodeGenerator(account.dtUserId);
     this.socket = await this.connectSocket(this.host, this.runtime.port, this.runtime.connectTimeoutMs);
@@ -3038,6 +3125,9 @@ class DirectSession {
 
     const connectResp = await this.waitForFrame((frame) => frame.type === 0x8102, this.runtime.ioTimeoutMs, "connect response");
     this.sessionId = Buffer.from(connectResp.raw.subarray(14, 18));
+    if (startPairedKeepalive) {
+      this.startPairedKeepalive();
+    }
 
     const prelogin = buildRequestFrame({
       template: TEMPLATES.getInfoBeforeLogin,
@@ -3415,10 +3505,6 @@ class DirectSession {
   async close() {
     this.closed = true;
     this.stopSocketKeepalive();
-    if (this.idleSocketPauseTimer) {
-      clearTimeout(this.idleSocketPauseTimer);
-      this.idleSocketPauseTimer = null;
-    }
     if (this.socket && !this.socket.destroyed) {
       this.socket.destroy();
     }
@@ -3556,7 +3642,6 @@ class DirectSession {
         this.rawWaiters.size > 0;
       const shouldTraceFrame = shouldQueueRawFrame || Boolean(jsonPayload) || Boolean(process.env.DT_DIRECT_DEBUG_DUMP_DIR);
       if (!shouldTraceFrame) {
-        this.pauseIdleSocketAfterDroppedFrame(parsed);
         processedFrames += 1;
         if (this.shouldYieldBufferedConsume(processedFrames)) {
           return;
@@ -3635,13 +3720,11 @@ class DirectSession {
       return;
     }
     this.bufferedConsumeScheduled = true;
-    this.socket?.pause();
     setImmediate(() => {
       this.bufferedConsumeScheduled = false;
       if (this.closed) {
         return;
       }
-      this.socket?.resume();
       if (this.buffer.length >= 6) {
         this.consume(Buffer.alloc(0));
       }
@@ -3675,7 +3758,7 @@ class DirectSession {
 
   private startPairedKeepalive() {
     this.stopSocketKeepalive();
-    this.keepaliveTimer = setInterval(() => {
+    const sendPairedKeepalive = () => {
       if (this.keepaliveWriteInFlight || this.closed) {
         return;
       }
@@ -3696,7 +3779,18 @@ class DirectSession {
         .finally(() => {
           this.keepaliveWriteInFlight = false;
         });
-    }, DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS);
+    };
+    const startRecurringKeepalive = () => {
+      if (this.closed) {
+        return;
+      }
+      sendPairedKeepalive();
+      this.keepaliveTimer = setInterval(sendPairedKeepalive, DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS);
+      this.keepaliveTimer.unref?.();
+    };
+    const elapsedSinceConnect = Math.max(0, Date.now() - this.socketConnectedAt);
+    const firstDelayMs = calculateDirectPairedKeepaliveDelay(elapsedSinceConnect);
+    this.keepaliveTimer = setTimeout(startRecurringKeepalive, firstDelayMs);
     this.keepaliveTimer.unref?.();
   }
 
@@ -3766,7 +3860,7 @@ class DirectSession {
     token: string;
     deviceId?: string | null;
     email?: string | null;
-  }) {
+  }, waitMs = 3_000) {
     const packet = buildLoginInitPacket({
       session: this.sessionId,
       route: this.route,
@@ -3776,9 +3870,9 @@ class DirectSession {
       configTrackCode: this.nextTrackCode()
     });
     this.clearJsonQueue();
-    this.beginJsonCapture(3_000);
+    this.beginJsonCapture(waitMs);
     await this.write(packet);
-    await this.drainBootstrapFrames(3_000);
+    await this.drainBootstrapFrames(waitMs);
     this.bootstrapPayloads = [...this.jsonQueue];
     this.accountPhoneCountryKeys = extractBootstrapPhoneCountryKeys(this.jsonQueue);
     if (this.accountPhoneCountryKeys) {
@@ -3823,6 +3917,9 @@ class DirectSession {
         }
       } catch (error) {
         if (error instanceof AppError && error.statusCode === 504) {
+          if (Date.now() < deadline) {
+            continue;
+          }
           break;
         }
         throw error;
@@ -3929,26 +4026,6 @@ class DirectSession {
     }
   }
 
-
-  private pauseIdleSocketAfterDroppedFrame(parsed: ParsedFrame) {
-    if (parsed.type !== 0x8107 || parsed.status === 0x0101 || parsed.status === 0x0103 || this.rawWaiters.size > 0 || this.jsonWaiters.size > 0) {
-      this.idleDroppedNonSmsFrameCount = 0;
-      return;
-    }
-    this.idleDroppedNonSmsFrameCount += 1;
-    if (this.idleDroppedNonSmsFrameCount < DIRECT_IDLE_NON_SMS_FRAME_PAUSE_BATCH || this.idleSocketPaused || !this.socket || this.socket.destroyed) {
-      return;
-    }
-    this.idleDroppedNonSmsFrameCount = 0;
-    this.idleSocketPaused = true;
-    this.socket.pause();
-    this.idleSocketPauseTimer = setTimeout(() => {
-      this.idleSocketPaused = false;
-      this.idleSocketPauseTimer = null;
-      this.socket?.resume();
-    }, DIRECT_IDLE_NON_SMS_FRAME_PAUSE_MS);
-    this.idleSocketPauseTimer.unref?.();
-  }
   private failWaiters(error: Error) {
     this.rawWaiters.rejectAll(error);
     this.jsonWaiters.rejectAll(error);
@@ -8414,7 +8491,7 @@ function createDirectRouteCoordinator(primaryHost: string) {
 
   return {
     shouldClaim(host: string) {
-      return host === primaryHost || (backupEligible && owner === null);
+      return owner === null && (host === primaryHost ? !backupEligible : backupEligible);
     },
     claim(host: string) {
       owner = host;
@@ -8431,6 +8508,8 @@ function createDirectRouteCoordinator(primaryHost: string) {
       owner = null;
       if (host === primaryHost) {
         backupEligible = true;
+      } else {
+        backupEligible = false;
       }
     },
     markPrimaryUnavailable() {

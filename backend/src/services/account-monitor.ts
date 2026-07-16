@@ -79,6 +79,73 @@ type DirectMonitorFrameState = {
   missedStatus0103Sample: string | null;
 };
 
+type DirectMonitorHostState = "connecting" | "connected" | "failed";
+type DirectMonitorListenState = "active" | "connecting" | "degraded" | "completed" | "preempted";
+
+function applyDirectMonitorHostStatus(
+  state: DirectMonitorFrameState,
+  host: string,
+  hostState: DirectMonitorHostState,
+  error: string | null
+) {
+  state.host ??= host;
+  if (hostState === "connecting") {
+    state.pairedHosts.delete(host);
+    state.connectingHosts.add(host);
+    return;
+  }
+  state.connectingHosts.delete(host);
+  if (hostState === "connected") {
+    state.pairedHosts.add(host);
+    state.failedHosts.delete(host);
+    return;
+  }
+  state.pairedHosts.delete(host);
+  state.failedHosts.set(host, error ?? "unknown error");
+}
+
+function resolveDirectMonitorListenState(state: DirectMonitorFrameState, preempted: boolean): DirectMonitorListenState {
+  if (preempted) {
+    return "preempted";
+  }
+  if (state.pairedHosts.size === 0 && state.failedHosts.size > 0) {
+    return "degraded";
+  }
+  if (state.pairedHosts.size === 0 && state.connectingHosts.size > 0) {
+    return "connecting";
+  }
+  return "active";
+}
+
+function createDirectMonitorFrameState(): DirectMonitorFrameState {
+  return {
+    host: null,
+    pairedHosts: new Set(),
+    connectingHosts: new Set(),
+    failedHosts: new Map(),
+    rawPushFrames: 0,
+    smsPushes: 0,
+    nonSmsPushFrames: 0,
+    statusCounts: new Map(),
+    hostCounts: new Map(),
+    missedStatus0103Sample: null
+  };
+}
+
+function createSerializedLatestDiagnosticWriter<T>(writeSnapshot: (snapshot: T) => Promise<void>) {
+  let tail: Promise<void> = Promise.resolve();
+  return (snapshotFactory: () => T) => {
+    const pending = tail.then(() => writeSnapshot(snapshotFactory()));
+    tail = pending.catch(() => undefined);
+    return pending;
+  };
+}
+
+export const createDirectMonitorFrameStateForTest = createDirectMonitorFrameState;
+export const applyDirectMonitorHostStatusForTest = applyDirectMonitorHostStatus;
+export const resolveDirectMonitorListenStateForTest = resolveDirectMonitorListenState;
+export const createSerializedLatestDiagnosticWriterForTest = createSerializedLatestDiagnosticWriter;
+
 const directMonitorGateway = new DirectDingtoneGateway();
 let activeDirectMonitorPolls = 0;
 let offlineCatchupSequence = 0;
@@ -764,18 +831,24 @@ export class AccountMonitorService {
     let offlineCatchupSent = false;
     let offlineCatchupSendCount = 0;
     let offlineCatchupError: string | null = null;
-    const liveState: DirectMonitorFrameState = {
-      host: null,
-      pairedHosts: new Set(),
-      connectingHosts: new Set(),
-      failedHosts: new Map(),
-      rawPushFrames: 0,
-      smsPushes: 0,
-      nonSmsPushFrames: 0,
-      statusCounts: new Map(),
-      hostCounts: new Map(),
-      missedStatus0103Sample: null
-    };
+    const liveState = createDirectMonitorFrameState();
+    const liveDiagnosticWriter = createSerializedLatestDiagnosticWriter<string>(async (snapshot) => {
+      if (runner.stopped) {
+        return;
+      }
+      diagnosticNote = snapshot;
+      await prisma.monitorSession.update({
+        where: { id: runner.sessionId },
+        data: {
+          routeAddress: snapshot
+        }
+      }).catch((error) => {
+        logger.warn("Failed to update live direct SMS monitor diagnostics", {
+          accountId: runner.accountId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+    });
     const updateLiveDiagnostic = async (force = false) => {
       if (runner.stopped) {
         return;
@@ -785,31 +858,22 @@ export class AccountMonitorService {
         return;
       }
       lastDiagnosticUpdateAt = now;
-      diagnosticNote = buildDirectMonitorLiveDiagnosticNote(liveState, createdMessages, preempted, {
-        scanned: appCatchupScanned,
-        imported: appCatchupImported,
-        source: appCatchupSource,
-        error: appCatchupError
-      }, {
-        attempted: offlineCatchupAttempted,
-        sent: offlineCatchupSent,
-        sendCount: offlineCatchupSendCount,
-        error: offlineCatchupError
-      }, {
-        at: runner.lastDirectSmsAt,
-        target: runner.lastDirectSmsTarget
-      });
-      await prisma.monitorSession.update({
-        where: { id: runner.sessionId },
-        data: {
-          routeAddress: diagnosticNote
-        }
-      }).catch((error) => {
-        logger.warn("Failed to update live direct SMS monitor diagnostics", {
-          accountId: runner.accountId,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      });
+      await liveDiagnosticWriter(() =>
+        buildDirectMonitorLiveDiagnosticNote(liveState, createdMessages, preempted, {
+          scanned: appCatchupScanned,
+          imported: appCatchupImported,
+          source: appCatchupSource,
+          error: appCatchupError
+        }, {
+          attempted: offlineCatchupAttempted,
+          sent: offlineCatchupSent,
+          sendCount: offlineCatchupSendCount,
+          error: offlineCatchupError
+        }, {
+          at: runner.lastDirectSmsAt,
+          target: runner.lastDirectSmsTarget
+        }, resolveDirectMonitorListenState(liveState, preempted))
+      );
     };
     activeDirectMonitorPolls += 1;
     runner.lastCycleUsedDirectSlot = true;
@@ -926,18 +990,7 @@ export class AccountMonitorService {
           }
         },
         onHostStatus: async (status) => {
-          liveState.host ??= status.host;
-          liveState.connectingHosts.delete(status.host);
-          if (status.state === "connecting") {
-            liveState.connectingHosts.add(status.host);
-            liveState.failedHosts.delete(status.host);
-          } else if (status.state === "connected") {
-            liveState.pairedHosts.add(status.host);
-            liveState.failedHosts.delete(status.host);
-          } else {
-            liveState.pairedHosts.delete(status.host);
-            liveState.failedHosts.set(status.host, status.error ?? "unknown error");
-          }
+          applyDirectMonitorHostStatus(liveState, status.host, status.state, status.error);
           await updateLiveDiagnostic(true);
         },
         onOfflineCatchup: async (status) => {
@@ -1182,7 +1235,7 @@ function buildDirectMonitorLiveDiagnosticNote(
   appCatchup?: { scanned: number; imported: number; source: string | null; error: string | null },
   offlineCatchup?: { attempted: boolean; sent: boolean; sendCount: number; error: string | null },
   lastDirectSms?: { at: string | null; target: string | null },
-  listenState?: "active" | "completed" | "preempted"
+  listenState?: DirectMonitorListenState
 ) {
   const statusSummary = Array.from(state.statusCounts.entries())
     .sort(([left], [right]) => left.localeCompare(right))

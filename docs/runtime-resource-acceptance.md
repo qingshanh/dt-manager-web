@@ -36,6 +36,11 @@
 - 预热后内存增长斜率低于 5MB/小时；
 - 空闲 CPU 平均低于单核 10%；
 - Direct pushes、calls、trace、错误、queue 和 cache 保持固定上限；
+- Direct link 必须连续存活至少 60 秒后，验收才报告 `active`；代码健康门槛仍为 15 秒，验收观察窗口为 60 秒；
+- 同一 60 秒窗口内，paired registration/read failure 不得超过初始连接数量；
+- `offlineCatchupSends` 不得仅因间隔数秒的重连而持续增长；
+- 已知成功号码必须出现 `0x0103 -> parsed SMS -> stored message` 的完整链路；
+- 正式环境必须满足 `appFallbackAllowed=false`；
 - 正式环境不执行 App/helper/ADB fallback；
 - 普通短信、目标号码、团队消息、主备故障接管、Telegram 和商城订单同步无回退。
 

@@ -45,7 +45,7 @@ const schema = z.object({
   DT_ADB_DINGDONG_MAIN_ACTIVITY: z.string().default(".activity.SplashActivity"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   DT_RUNTIME_INSTANCE_ID: z.string().optional().default(""),
-  APP_VERSION: z.string().default("0.2.9"),
+  APP_VERSION: z.string().default("0.2.10"),
   APP_COMMIT_SHA: z.string().optional().default(""),
   APP_REPOSITORY: z.string().default("qingshanh/dt-manager-web"),
   APP_UPDATE_BRANCH: z.string().default("main"),
