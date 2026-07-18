@@ -165,17 +165,61 @@ function extractProviderLabelFromContent(content: string) {
   }
   return label;
 }
-function extractTargetNumberFromPushMetadata(json: { info?: string; k3?: string }, fromNumber: string | null) {
-  const senderDigits = normalizePhoneDigits(fromNumber);
-  const candidates = [json.info, json.k3]
-    .flatMap((value) => extractDigitRunsFromBase64(value))
-    .filter((value) => value.length >= 7)
-    .filter((value) => !samePhoneDigits(value, senderDigits));
-  const best = candidates.sort((left, right) => right.length - left.length || left.localeCompare(right))[0];
-  return best ?? null;
+const DIRECT_SMS_ENVELOPE_LENGTH_OFFSET = 15;
+
+function readLengthPrefixedDigits(buffer: Buffer, offset: number) {
+  if (offset < 0 || offset + 4 > buffer.length) {
+    return null;
+  }
+  const length = buffer.readUInt32LE(offset);
+  if (length < 7 || length > 15 || offset + 4 + length > buffer.length) {
+    return null;
+  }
+  const value = buffer.subarray(offset + 4, offset + 4 + length).toString("latin1");
+  if (!/^\d+$/.test(value)) {
+    return null;
+  }
+  return { value, nextOffset: offset + 4 + length };
 }
 
-function samePhoneDigits(candidate: string, normalizedSender: string) {
+function extractBinaryEnvelopeTarget(value?: string) {
+  if (!value?.trim()) {
+    return null;
+  }
+  try {
+    const decoded = Buffer.from(value, "base64");
+    const sender = readLengthPrefixedDigits(decoded, DIRECT_SMS_ENVELOPE_LENGTH_OFFSET);
+    if (!sender) {
+      return null;
+    }
+    return readLengthPrefixedDigits(decoded, sender.nextOffset)?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function extractExplicitTarget(value?: string) {
+  if (!value?.trim()) {
+    return null;
+  }
+  try {
+    const decoded = Buffer.from(value, "base64").toString("latin1");
+    return decoded.match(/(?:^|[^a-z0-9_])(?:target|recipient|to)\s*[:=]\s*\+?(\d{7,15})(?!\d)/i)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function extractTargetNumberFromPushMetadata(json: { info?: string; k3?: string }, fromNumber: string | null) {
+  const confirmedTargets = [json.info, json.k3]
+    .map((value) => extractBinaryEnvelopeTarget(value) ?? extractExplicitTarget(value))
+    .filter((value): value is string => Boolean(value))
+    .filter((value) => !samePhoneDigits(value, fromNumber));
+  const uniqueTargets = [...new Set(confirmedTargets)];
+  return uniqueTargets.length === 1 ? uniqueTargets[0] : null;
+}
+
+function samePhoneDigits(candidate: string, normalizedSender: string | null | undefined) {
   const digits = normalizeComparablePhoneDigits(candidate);
   const senderDigits = normalizeComparablePhoneDigits(normalizedSender);
   return Boolean(digits && senderDigits && digits === senderDigits);

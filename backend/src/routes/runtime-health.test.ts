@@ -43,3 +43,15 @@ test("health payload returns null instance id and clamps negative uptime", () =>
   assert.equal(payload.instanceId, null);
   assert.equal(payload.uptimeSeconds, 0);
 });
+
+test("health payload exposes the coordinated runtime state when supplied", () => {
+  const payload = buildHealthPayload({
+    version: "0.2.11",
+    gatewayMode: "direct",
+    startedAt: new Date("2026-07-18T00:00:00.000Z"),
+    now: new Date("2026-07-18T00:00:01.000Z"),
+    runtimeState: "stopping"
+  });
+
+  assert.equal(payload.runtimeState, "stopping");
+});

@@ -4,6 +4,7 @@ import { prisma } from "../lib/prisma.js";
 import { AppError, assertFound } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { decryptText } from "../utils/crypto.js";
+import { LatestAsyncWriter } from "../utils/latest-async-writer.js";
 import { eventBus } from "./event-bus.js";
 import { refreshAccountRuntimeData } from "./account-runtime.js";
 import { dingtoneGateway } from "./dingtone/index.js";
@@ -11,7 +12,6 @@ import {
   DirectDingtoneGateway,
   listenDirectSessionPushes,
   preemptDirectSessionPushListener,
-  releaseDirectAccountRuntime,
   type DirectProbeResult,
   type DirectProbePushResult,
   type DirectWebOfflineMessage
@@ -24,8 +24,6 @@ import { dumpSmsMessagesFromNotifications } from "./adb-notification-ui.js";
 import { dumpSmsMessagesFromUi, openMessagesInbox } from "./adb-message-ui.js";
 import { getGatewayMode, getSettingsMap } from "./settings.service.js";
 import { transferMonitorRunnerInPlace } from "./account-monitor-runner-transfer.js";
-import { runtimeWorkQueue } from "./runtime-work-queue.js";
-import { AppFallbackProbeGate } from "./app-fallback-gate.js";
 
 type MonitorConfig = {
   pollIntervalMs: number;
@@ -79,87 +77,9 @@ type DirectMonitorFrameState = {
   missedStatus0103Sample: string | null;
 };
 
-type DirectMonitorHostState = "connecting" | "connected" | "failed";
-type DirectMonitorListenState = "active" | "connecting" | "degraded" | "completed" | "preempted";
-
-function applyDirectMonitorHostStatus(
-  state: DirectMonitorFrameState,
-  host: string,
-  hostState: DirectMonitorHostState,
-  error: string | null
-) {
-  state.host ??= host;
-  if (hostState === "connecting") {
-    state.pairedHosts.delete(host);
-    state.connectingHosts.add(host);
-    return;
-  }
-  state.connectingHosts.delete(host);
-  if (hostState === "connected") {
-    state.pairedHosts.add(host);
-    state.failedHosts.delete(host);
-    return;
-  }
-  state.pairedHosts.delete(host);
-  state.failedHosts.set(host, error ?? "unknown error");
-}
-
-function resolveDirectMonitorListenState(state: DirectMonitorFrameState, preempted: boolean): DirectMonitorListenState {
-  if (preempted) {
-    return "preempted";
-  }
-  if (state.pairedHosts.size === 0 && state.failedHosts.size > 0) {
-    return "degraded";
-  }
-  if (state.pairedHosts.size === 0 && state.connectingHosts.size > 0) {
-    return "connecting";
-  }
-  return "active";
-}
-
-function createDirectMonitorFrameState(): DirectMonitorFrameState {
-  return {
-    host: null,
-    pairedHosts: new Set(),
-    connectingHosts: new Set(),
-    failedHosts: new Map(),
-    rawPushFrames: 0,
-    smsPushes: 0,
-    nonSmsPushFrames: 0,
-    statusCounts: new Map(),
-    hostCounts: new Map(),
-    missedStatus0103Sample: null
-  };
-}
-
-function createSerializedLatestDiagnosticWriter<T>(writeSnapshot: (snapshot: T) => Promise<void>) {
-  let tail: Promise<void> = Promise.resolve();
-  return (snapshotFactory: () => T) => {
-    const pending = tail.then(() => writeSnapshot(snapshotFactory()));
-    tail = pending.catch(() => undefined);
-    return pending;
-  };
-}
-
-export const createDirectMonitorFrameStateForTest = createDirectMonitorFrameState;
-export const applyDirectMonitorHostStatusForTest = applyDirectMonitorHostStatus;
-export const resolveDirectMonitorListenStateForTest = resolveDirectMonitorListenState;
-export const createSerializedLatestDiagnosticWriterForTest = createSerializedLatestDiagnosticWriter;
-
 const directMonitorGateway = new DirectDingtoneGateway();
 let activeDirectMonitorPolls = 0;
-let offlineCatchupSequence = 0;
-const appFallbackProbeGate = new AppFallbackProbeGate({ cooldownMs: 5 * 60_000 });
-
-export type AccountMonitorRuntimeSnapshot = {
-  runnerCount: number;
-  runningCount: number;
-  shuttingDown: boolean;
-  activeDirectMonitorPolls: number;
-  appFallbackAllowed: boolean;
-  appFallbackCooldownUntil: number;
-  appFallbackProbeInFlight: boolean;
-};
+let appFallbackScanQueue = Promise.resolve() as Promise<unknown>;
 
 function monitorFailureRetryDelay(consecutiveFailures: number) {
   if (consecutiveFailures <= 0) {
@@ -198,7 +118,6 @@ export class AccountMonitorService {
     await this.stopDuplicateDtUserIdMonitors(accountId, account.adminId, account.dtUserId);
     await this.stop(accountId, { preserveMonitorEnabled: true, targetStatus: AccountStatus.offline, emitStatus: false });
     const monitorConfig = await this.loadMonitorConfig();
-    this.assertAcceptingNewRunners();
     const session = await prisma.monitorSession.create({
       data: {
         accountId,
@@ -285,10 +204,6 @@ export class AccountMonitorService {
         deviceId: account.dtDeviceId,
         appVariant: account.appVariant
       });
-      await releaseDirectAccountRuntime({
-        dtUserId: account.dtUserId,
-        deviceId: account.dtDeviceId
-      });
     }
 
     const targetStatus = options?.targetStatus ?? AccountStatus.offline;
@@ -329,19 +244,6 @@ export class AccountMonitorService {
   isRunning(accountId: number) {
     const runner = this.runners.get(accountId);
     return Boolean(runner && !runner.stopped);
-  }
-
-  snapshot(): AccountMonitorRuntimeSnapshot {
-    const fallback = appFallbackProbeGate.snapshot();
-    return {
-      runnerCount: this.runners.size,
-      runningCount: Array.from(this.runners.values()).filter((runner) => runner.running && !runner.stopped).length,
-      shuttingDown: this.shuttingDown,
-      activeDirectMonitorPolls,
-      appFallbackAllowed: config.DT_ALLOW_APP_FALLBACK,
-      appFallbackCooldownUntil: fallback.cooldownUntil,
-      appFallbackProbeInFlight: fallback.probeInFlight
-    };
   }
 
   async stopAll() {
@@ -607,9 +509,7 @@ export class AccountMonitorService {
       const useDirectFlow = await shouldUseDirectAccountFlow(account);
 
       if (shouldRefreshRuntimeData(runner) && !useDirectFlow) {
-        const result = await runtimeWorkQueue.run(`account-refresh:${runner.accountId}`, () =>
-          refreshAccountRuntimeData(runner.accountId, dingtoneGateway)
-        );
+        const result = await refreshAccountRuntimeData(runner.accountId, dingtoneGateway);
         phoneCount = result.phoneCount;
         runner.lastRefreshAt = Date.now();
       }
@@ -819,7 +719,6 @@ export class AccountMonitorService {
     let createdMessages = 0;
     let preempted = false;
     let diagnosticNote: string | null = null;
-    let lastDiagnosticUpdateAt = 0;
     let directListenCompleted = false;
     let appCatchupInFlight = false;
     let appCatchupScanned = 0;
@@ -831,49 +730,50 @@ export class AccountMonitorService {
     let offlineCatchupSent = false;
     let offlineCatchupSendCount = 0;
     let offlineCatchupError: string | null = null;
-    const liveState = createDirectMonitorFrameState();
-    const liveDiagnosticWriter = createSerializedLatestDiagnosticWriter<string>(async (snapshot) => {
-      if (runner.stopped) {
-        return;
-      }
-      diagnosticNote = snapshot;
-      await prisma.monitorSession.update({
-        where: { id: runner.sessionId },
-        data: {
-          routeAddress: snapshot
-        }
-      }).catch((error) => {
-        logger.warn("Failed to update live direct SMS monitor diagnostics", {
-          accountId: runner.accountId,
-          error: error instanceof Error ? error.message : String(error)
+    const liveState: DirectMonitorFrameState = {
+      host: null,
+      pairedHosts: new Set(),
+      connectingHosts: new Set(),
+      failedHosts: new Map(),
+      rawPushFrames: 0,
+      smsPushes: 0,
+      nonSmsPushFrames: 0,
+      statusCounts: new Map(),
+      hostCounts: new Map(),
+      missedStatus0103Sample: null
+    };
+    const diagnosticWriter = new LatestAsyncWriter<string>(async (note) => {
+      try {
+        await prisma.monitorSession.update({
+          where: { id: runner.sessionId },
+          data: { routeAddress: note }
         });
-      });
-    });
-    const updateLiveDiagnostic = async (force = false) => {
+      } catch (error) {
+        logger.warn("Failed to update direct SMS monitor diagnostics", {
+          accountId: runner.accountId,
+          error: sanitizeMonitorDiagnosticError(error)
+        });
+      }
+    }, { minIntervalMs: 10_000 });
+    const updateLiveDiagnostic = (immediate = false) => {
       if (runner.stopped) {
         return;
       }
-      const now = Date.now();
-      if (!force && now - lastDiagnosticUpdateAt < 10_000) {
-        return;
-      }
-      lastDiagnosticUpdateAt = now;
-      await liveDiagnosticWriter(() =>
-        buildDirectMonitorLiveDiagnosticNote(liveState, createdMessages, preempted, {
-          scanned: appCatchupScanned,
-          imported: appCatchupImported,
-          source: appCatchupSource,
-          error: appCatchupError
-        }, {
-          attempted: offlineCatchupAttempted,
-          sent: offlineCatchupSent,
-          sendCount: offlineCatchupSendCount,
-          error: offlineCatchupError
-        }, {
-          at: runner.lastDirectSmsAt,
-          target: runner.lastDirectSmsTarget
-        }, resolveDirectMonitorListenState(liveState, preempted))
-      );
+      diagnosticNote = buildDirectMonitorLiveDiagnosticNote(liveState, createdMessages, preempted, {
+        scanned: appCatchupScanned,
+        imported: appCatchupImported,
+        source: appCatchupSource,
+        error: appCatchupError
+      }, {
+        attempted: offlineCatchupAttempted,
+        sent: offlineCatchupSent,
+        sendCount: offlineCatchupSendCount,
+        error: offlineCatchupError
+      }, {
+        at: runner.lastDirectSmsAt,
+        target: runner.lastDirectSmsTarget
+      });
+      diagnosticWriter.schedule(diagnosticNote, { immediate });
     };
     activeDirectMonitorPolls += 1;
     runner.lastCycleUsedDirectSlot = true;
@@ -884,7 +784,7 @@ export class AccountMonitorService {
       }
       appCatchupInFlight = true;
       try {
-        const result = await runtimeWorkQueue.run(`app-fallback:${runner.accountId}`, () =>
+        const result = await runSerializedAppFallbackScan(() =>
           this.pollAppFallbackMessages(runner, account)
         );
         appCatchupScanned += result.scanned;
@@ -893,7 +793,7 @@ export class AccountMonitorService {
         appCatchupError = null;
         if (result.imported > 0) {
           createdMessages += result.imported;
-          await updateLiveDiagnostic(true);
+          updateLiveDiagnostic(true);
           logger.info("Direct monitor imported SMS via app fallback", {
             accountId: runner.accountId,
             imported: result.imported,
@@ -924,6 +824,12 @@ export class AccountMonitorService {
       appCatchupState.promise = promise;
       void promise;
     };
+    const appCatchupTimer = runner.appCatchupEnabled
+      ? setInterval(() => {
+          scheduleAppCatchup("interval");
+        }, runner.appCatchupIntervalMs)
+      : null;
+    appCatchupTimer?.unref?.();
     try {
       if (runner.appCatchupEnabled) {
         scheduleAppCatchup("startup");
@@ -966,7 +872,7 @@ export class AccountMonitorService {
           runner.lastDirectSmsTarget = push.sms.toNumber ?? null;
           try {
             createdMessages += await storeParsedSmsPushes(runner.accountId, [push.sms]);
-            await updateLiveDiagnostic(true);
+            updateLiveDiagnostic(true);
           } catch (error) {
             logger.warn("Direct SMS push was received but could not be stored immediately", {
               accountId: runner.accountId,
@@ -976,12 +882,10 @@ export class AccountMonitorService {
         },
         onWebOfflineMessages: async (messages: DirectWebOfflineMessage[]) => {
           try {
-            const sequence = offlineCatchupSequence += 1;
-            createdMessages += await runtimeWorkQueue.run(
-              `offline-catchup:${runner.accountId}:${sequence}`,
-              () => storeHelperSmsMessages(runner.accountId, messages, { sendTelegram: false })
-            );
-            await updateLiveDiagnostic(true);
+            createdMessages += await storeHelperSmsMessages(runner.accountId, messages, {
+              sendTelegram: false
+            });
+            updateLiveDiagnostic();
           } catch (error) {
             logger.warn("Direct web-offline team messages could not be stored", {
               accountId: runner.accountId,
@@ -990,15 +894,26 @@ export class AccountMonitorService {
           }
         },
         onHostStatus: async (status) => {
-          applyDirectMonitorHostStatus(liveState, status.host, status.state, status.error);
-          await updateLiveDiagnostic(true);
+          liveState.host ??= status.host;
+          liveState.connectingHosts.delete(status.host);
+          if (status.state === "connecting") {
+            liveState.connectingHosts.add(status.host);
+            liveState.failedHosts.delete(status.host);
+          } else if (status.state === "connected") {
+            liveState.pairedHosts.add(status.host);
+            liveState.failedHosts.delete(status.host);
+          } else {
+            liveState.pairedHosts.delete(status.host);
+            liveState.failedHosts.set(status.host, status.error ?? "unknown error");
+          }
+          updateLiveDiagnostic();
         },
         onOfflineCatchup: async (status) => {
           offlineCatchupAttempted = status.attempted;
           offlineCatchupSent = status.sent;
           offlineCatchupSendCount = status.sendCount;
           offlineCatchupError = status.error;
-          await updateLiveDiagnostic(true);
+          updateLiveDiagnostic();
         },
         onFrame: async (push, host) => {
           liveState.host = host;
@@ -1040,7 +955,7 @@ export class AccountMonitorService {
           ) {
             scheduleAppCatchup("direct-frame-gap");
           }
-          await updateLiveDiagnostic(Boolean(push.sms));
+          updateLiveDiagnostic(Boolean(push.sms));
         }
       });
       if (runner.stopped) {
@@ -1049,17 +964,6 @@ export class AccountMonitorService {
       preempted = Boolean(result.preempted);
       directListenCompleted = true;
       diagnosticNote = buildDirectMonitorDiagnosticNote(result, createdMessages);
-      await prisma.monitorSession.update({
-        where: { id: runner.sessionId },
-        data: {
-          routeAddress: diagnosticNote
-        }
-      }).catch((error) => {
-        logger.warn("Failed to update final direct SMS monitor diagnostics", {
-          accountId: runner.accountId,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      });
       if (preempted) {
         logger.info("Direct SMS monitor was preempted by another direct operation; reconnecting shortly", {
           accountId: runner.accountId,
@@ -1068,11 +972,14 @@ export class AccountMonitorService {
         });
       }
     } finally {
+      if (appCatchupTimer) {
+        clearInterval(appCatchupTimer);
+      }
       const pendingAppCatchup = appCatchupState.promise;
       if (pendingAppCatchup) {
         await pendingAppCatchup.catch(() => undefined);
       }
-      if (directListenCompleted && !runner.stopped) {
+      try {
         diagnosticNote = buildDirectMonitorLiveDiagnosticNote(liveState, createdMessages, preempted, {
           scanned: appCatchupScanned,
           imported: appCatchupImported,
@@ -1086,18 +993,12 @@ export class AccountMonitorService {
         }, {
           at: runner.lastDirectSmsAt,
           target: runner.lastDirectSmsTarget
-        }, preempted ? "preempted" : "completed");
-        await prisma.monitorSession.update({
-          where: { id: runner.sessionId },
-          data: { routeAddress: diagnosticNote }
-        }).catch((error) => {
-          logger.warn("Failed to update final direct SMS monitor catch-up diagnostics", {
-            accountId: runner.accountId,
-            error: error instanceof Error ? error.message : String(error)
-          });
-        });
+        }, directListenCompleted ? (preempted ? "preempted" : "completed") : "active");
+        await diagnosticWriter.flush(diagnosticNote);
+      } finally {
+        await diagnosticWriter.close();
+        activeDirectMonitorPolls = Math.max(0, activeDirectMonitorPolls - 1);
       }
-      activeDirectMonitorPolls = Math.max(0, activeDirectMonitorPolls - 1);
     }
     return { createdMessages, preempted, diagnosticNote, listened: true, skippedForConcurrency: false };
   }
@@ -1112,18 +1013,8 @@ export class AccountMonitorService {
     account: { dtUserId: string; appVariant: AppVariant }
   ) {
     const appVariant = account.appVariant;
-    const sessionProbe = await appFallbackProbeGate.probe(() =>
-      exportSessionFromAdbConfig(appVariant).catch(() => null)
-    );
-    if (sessionProbe.status !== "available") {
-      return {
-        source: sessionProbe.status === "cooldown" ? "app-probe-cooldown" : "app-unavailable",
-        scanned: 0,
-        imported: 0
-      };
-    }
-    const session = sessionProbe.value;
-    if (session.dtUserId !== account.dtUserId) {
+    const session = await exportSessionFromAdbConfig(appVariant).catch(() => null);
+    if (!session || session.dtUserId !== account.dtUserId) {
       return { source: "app-session-mismatch", scanned: 0, imported: 0 };
     }
     const limit = Math.max(20, runner.maxRetryCount * 20);
@@ -1180,6 +1071,29 @@ export class AccountMonitorService {
     };
   }
 }
+
+function runSerializedAppFallbackScan<T>(run: () => Promise<T>): Promise<T> {
+  appFallbackScanQueue = appFallbackScanQueue.then(run, run);
+  const next = appFallbackScanQueue as Promise<T>;
+  appFallbackScanQueue = appFallbackScanQueue.then(() => undefined, () => undefined);
+  return next;
+}
+
+function sanitizeMonitorDiagnosticError(error: unknown) {
+  return (error instanceof Error ? error.message : String(error))
+    .replace(
+      /([?&]|\b)(token|password|secret|authorization|cookie)\b\s*[:=]\s*(?:Bearer\s+)?[^\s&,;]+/gi,
+      "$1$2=[redacted]"
+    )
+    .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[redacted-email]")
+    .replace(/\+?\d[\d\s().-]{6,}\d/g, "[redacted-phone]")
+    .slice(0, 500);
+}
+
+export function sanitizeMonitorDiagnosticErrorForTest(error: unknown) {
+  return sanitizeMonitorDiagnosticError(error);
+}
 function shouldScheduleAppCatchupForFrame(state: DirectMonitorFrameState) {
   return state.smsPushes === 0 && (state.missedStatus0103Sample !== null || state.nonSmsPushFrames >= 2);
 }
@@ -1235,7 +1149,7 @@ function buildDirectMonitorLiveDiagnosticNote(
   appCatchup?: { scanned: number; imported: number; source: string | null; error: string | null },
   offlineCatchup?: { attempted: boolean; sent: boolean; sendCount: number; error: string | null },
   lastDirectSms?: { at: string | null; target: string | null },
-  listenState?: DirectMonitorListenState
+  listenState?: "active" | "completed" | "preempted"
 ) {
   const statusSummary = Array.from(state.statusCounts.entries())
     .sort(([left], [right]) => left.localeCompare(right))

@@ -531,10 +531,15 @@ $pendingProcessSnapshots = @()
 $backendUrl = "http://localhost:$BackendPort"
 $frontendUrl = "http://localhost:$FrontendPort"
 $helperUrl = "http://127.0.0.1:$HelperPort"
-$appVersion = Resolve-EnvString -Value "" -Name "APP_VERSION" -Default "0.2.10"
+$appVersion = Resolve-EnvString -Value "" -Name "APP_VERSION" -Default "0.2.11"
 $viteAppVersion = Resolve-EnvString -Value "" -Name "VITE_APP_VERSION" -Default $appVersion
 $helperBindHost = Resolve-EnvString -Value "" -Name "DT_HELPER_BIND_HOST" -Default "127.0.0.1"
-$helperToken = Resolve-EnvString -Value "" -Name "DT_HELPER_TOKEN" -Default ""
+$bridgeToken = Resolve-EnvString -Value "" -Name "DT_REAL_BRIDGE_TOKEN" -Default ""
+$helperToken = Resolve-EnvString -Value "" -Name "DT_HELPER_TOKEN" -Default $bridgeToken
+if ($WithHelper -and [string]::IsNullOrWhiteSpace($helperToken)) {
+  $helperToken = [guid]::NewGuid().ToString("N")
+  Write-Host "[helper] generated an ephemeral authentication token for this launch"
+}
 $corsOrigin = Resolve-EnvString -Value "" -Name "CORS_ORIGIN" -Default "$frontendUrl,http://127.0.0.1:$FrontendPort"
 $viteDevHost = Resolve-EnvString -Value "" -Name "VITE_DEV_HOST" -Default "0.0.0.0"
 $appFallbackEnabled = $WithHelper.IsPresent.ToString().ToLowerInvariant()
@@ -552,7 +557,15 @@ try {
     "`$env:CORS_ORIGIN = '" + (Escape-SingleQuote $corsOrigin) + "';"
     "npm run dev"
   ) -join " "
-  $backendProcess = Start-DetachedPowerShell -Name "backend" -WorkingDirectory $backendDir -Command $backendCommand
+  $previousBridgeToken = [Environment]::GetEnvironmentVariable("DT_REAL_BRIDGE_TOKEN", "Process")
+  try {
+    if ($WithHelper) {
+      [Environment]::SetEnvironmentVariable("DT_REAL_BRIDGE_TOKEN", $helperToken, "Process")
+    }
+    $backendProcess = Start-DetachedPowerShell -Name "backend" -WorkingDirectory $backendDir -Command $backendCommand
+  } finally {
+    [Environment]::SetEnvironmentVariable("DT_REAL_BRIDGE_TOKEN", $previousBridgeToken, "Process")
+  }
   $backendPending = Get-StartedRuntimeProcessSnapshot -Process $backendProcess -Name "backend" -Port $BackendPort
   $pendingProcessSnapshots += $backendPending
   $manifest = Register-RuntimeService -Manifest $manifest -Name "backend" -Process $backendProcess -Port $BackendPort -CreationTime $backendPending.creationTime

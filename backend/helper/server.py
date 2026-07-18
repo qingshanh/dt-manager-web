@@ -74,10 +74,13 @@ class HelperConfig:
     def from_env(cls) -> "HelperConfig":
         load_project_env()
         base_dir = Path(__file__).resolve().parent
+        auth_token = os.getenv("DT_HELPER_TOKEN", "").strip()
+        if not auth_token:
+            raise RuntimeError("DT_HELPER_TOKEN is required and must not be empty")
         return cls(
             bind_host=os.getenv("DT_HELPER_BIND_HOST", "127.0.0.1"),
             bind_port=int(os.getenv("DT_HELPER_PORT", "5175")),
-            auth_token=os.getenv("DT_HELPER_TOKEN", "").strip(),
+            auth_token=auth_token,
             device_mode=os.getenv("DT_HELPER_DEVICE_MODE", "usb").strip().lower(),
             device_id=os.getenv("DT_HELPER_DEVICE_ID", "").strip(),
             remote_host=os.getenv("DT_HELPER_REMOTE_HOST", "127.0.0.1:27042").strip(),
@@ -519,21 +522,27 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "message": str(error), "code": 500})
             return
         if parsed_path.path == "/cached/request_private_number":
-            assert self.bridge is not None
-            cached = self.bridge.get_cached_event("request_private_number")
-            if not cached:
-                self._json_response(HTTPStatus.NOT_FOUND, {"ok": False, "message": "No cached request_private_number event", "code": 404})
-                return
-            self._json_response(
-                HTTPStatus.OK,
-                {
-                    "ok": True,
-                    "data": {
-                        "cached_at": cached.get("at"),
-                        "payload": cached.get("payload"),
+            try:
+                self._authorize()
+                assert self.bridge is not None
+                cached = self.bridge.get_cached_event("request_private_number")
+                if not cached:
+                    self._json_response(HTTPStatus.NOT_FOUND, {"ok": False, "message": "No cached request_private_number event", "code": 404})
+                    return
+                self._json_response(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "data": {
+                            "cached_at": cached.get("at"),
+                            "payload": cached.get("payload"),
+                        },
                     },
-                },
-            )
+                )
+            except BridgeError as error:
+                self._json_response(error.status_code, {"ok": False, "message": error.message, "code": error.code})
+            except Exception as error:
+                self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "message": str(error), "code": 500})
             return
         if parsed_path.path != "/health":
             self._json_response(HTTPStatus.NOT_FOUND, {"ok": False, "message": "Not found", "code": 404})
@@ -592,7 +601,7 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _authorize(self) -> None:
         token = self.config.auth_token if self.config else ""
         if not token:
-            return
+            raise BridgeError("Helper authentication is not configured", HTTPStatus.SERVICE_UNAVAILABLE, 503)
         auth_header = self.headers.get("authorization", "")
         bridge_header = self.headers.get("x-dt-bridge-token", "")
         bearer = auth_header.removeprefix("Bearer ").strip()

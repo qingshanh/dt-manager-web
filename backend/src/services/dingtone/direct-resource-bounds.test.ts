@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { DirectTransportGovernor } from "./direct-transport-governor.js";
 import {
   createDirectListenerDiagnosticsForTest,
   directRuntimeCacheSizesForTest,
@@ -102,4 +103,16 @@ test("long listeners count cumulatively while short probes have an explicit fram
   assert.doesNotMatch(listenerText, /Number\.MAX_SAFE_INTEGER/);
   assert.match(listenerText, /diagnostics\.totalPushes\(\)/);
   assert.match(probeText, /input\.maxPushFrames \?\? MAX_DIRECT_LISTENER_PUSHES/);
+});
+
+test("direct transport governor entries remain bounded and clear releases them", () => {
+  let now = 0;
+  const governor = new DirectTransportGovernor({ now: () => now, random: () => 0.5 });
+  for (let index = 0; index < 1_000; index += 1) {
+    now = index;
+    governor.recordFailure(`transport-${index}:80`, "discovery");
+  }
+  assert.equal(governor.snapshot().size, 128);
+  governor.clear();
+  assert.equal(governor.snapshot().size, 0);
 });

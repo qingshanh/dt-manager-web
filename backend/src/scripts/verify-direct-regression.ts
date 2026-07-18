@@ -1813,9 +1813,13 @@ function checkRealtimePushListenerAcceptsAny8107Sms() {
       : "";
   const listensToAny8107 = waitForPushesText.includes("const candidatePush = frameToDirectPush(frame)");
   const noStatus0103Gate = !waitForPushesText.includes("if (frame.status !== 0x0103)");
+  const reportsNonSmsFrameDirectly = waitForPushesText.includes("await onFrame?.(nonSmsFrame, this.host)");
+  const reportsNonSmsFrameThroughSafeWrapper = waitForPushesText.includes(
+    "await invokeDirectListenerCallback(onFrame, nonSmsFrame, this.host)"
+  );
   const reportsNonSmsFrames =
     waitForPushesText.includes("const nonSmsFrame =") &&
-    waitForPushesText.includes("await onFrame?.(nonSmsFrame, this.host)");
+    (reportsNonSmsFrameDirectly || reportsNonSmsFrameThroughSafeWrapper);
   const includesCapturedRtcHosts =
     gatewayText.includes('"34.247.151.224"') &&
     gatewayText.includes('"18.167.22.30"') &&

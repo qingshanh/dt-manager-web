@@ -42,7 +42,7 @@ test("backend wires SIGTERM through the idempotent shutdown coordinator", () => 
   assert.match(indexSource, /process\.once\("SIGINT"/);
   assert.match(indexSource, /process\.once\("SIGTERM"/);
   assert.match(indexSource, /telegramBotService\.stop\(\)/);
-  assert.match(indexSource, /runtimeWorkQueue\.stop\(\)/);
+  assert.match(indexSource, /stopWorkQueue:\s*\(\) => undefined/);
   assert.match(indexSource, /closeAllSseConnections/);
   assert.match(indexSource, /prisma\.\$disconnect\(\)/);
   assert.match(indexSource, /const hardExitTimer = setTimeout/);

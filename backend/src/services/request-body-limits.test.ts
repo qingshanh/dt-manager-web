@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import http from "node:http";
 import express, { type RequestHandler } from "express";
 import test from "node:test";
 
 import { installJsonBodyParsers } from "./request-body-limits.js";
+
+const indexSource = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+const nginxSource = readFileSync(new URL("../../../frontend/nginx.conf", import.meta.url), "utf8");
 
 async function withServer(run: (baseUrl: string) => Promise<void>) {
   const app = express();
@@ -21,6 +25,7 @@ async function withServer(run: (baseUrl: string) => Promise<void>) {
     const status = typeof error === "object" && error && "status" in error ? Number(error.status) : 500;
     res.status(status).json({ ok: false });
   });
+
   const server = http.createServer(app);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -63,11 +68,29 @@ test("ordinary API rejects oversized JSON while backup uses its independent limi
 
 test("unauthorized backup is rejected before the large parser", async () => {
   await withServer(async (baseUrl) => {
-    const response = await fetch(`${baseUrl}/api/accounts/backup/import`, {
+    const unauthorizedBackup = await fetch(`${baseUrl}/api/accounts/backup/import`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: body(5000)
     });
-    assert.equal(response.status, 401);
+    assert.equal(unauthorizedBackup.status, 401);
   });
+});
+
+test("backend entrypoint installs the scoped JSON body parsers", () => {
+  assert.match(indexSource, /import \{ installJsonBodyParsers \} from "\.\/services\/request-body-limits\.js";/);
+  assert.match(indexSource, /installJsonBodyParsers\(app, requireAuth\);/);
+});
+
+test("nginx grants 100 MB only to the exact backup import route", () => {
+  assert.match(nginxSource, /client_max_body_size 2m;/);
+  const backupLocation = nginxSource.match(/location = \/api\/accounts\/backup\/import \{([\s\S]*?)\n  \}/);
+  assert.ok(backupLocation);
+  const backupLocationBody = backupLocation[1];
+  assert.ok(backupLocationBody);
+  assert.match(backupLocationBody, /client_max_body_size 100m;/);
+  assert.ok(
+    nginxSource.indexOf("location = /api/accounts/backup/import") < nginxSource.indexOf("location /api/"),
+    "the exact backup route must be declared before the generic API proxy"
+  );
 });

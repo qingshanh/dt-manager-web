@@ -333,7 +333,7 @@ test("telegram phone card uses code formatting and a note command", () => {
   const text = formatPhoneCard({
     accountId: 433,
     id: 91,
-    phoneNumber: '3197005033038',
+    phoneNumber: '3197005550101',
     displayName: 'NL',
     status: 'active',
     countryCode: 31,
@@ -342,7 +342,7 @@ test("telegram phone card uses code formatting and a note command", () => {
     autoRenew: true,
     allowReceiveSms: true
   });
-  assert.match(text, /<code>3197005033038<\/code>/);
+  assert.match(text, /<code>3197005550101<\/code>/);
   assert.match(text, /\/set_phone_note 433 91/);
 });
 
@@ -823,13 +823,13 @@ test("SMS notification is a safe HTML card with target and code", () => {
   const text = buildSmsTelegramNotificationText({
     account,
     fromNumber: "OPENAI",
-    toNumber: "3197005033038",
+    toNumber: "3197005550101",
     content: "<code> 748402",
     receivedAt: new Date("2026-07-15T00:00:00Z")
   });
   assert.match(text, /<b>🔐 验证码短信<\/b>/);
   assert.match(text, /VMOS &amp; Test/);
-  assert.match(text, /<code>3197005033038<\/code>/);
+  assert.match(text, /<code>3197005550101<\/code>/);
   assert.match(text, /<code>748402<\/code>/);
   assert.doesNotMatch(text, /<code> 748402/);
 });

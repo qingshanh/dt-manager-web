@@ -21,7 +21,7 @@ services:
       NODE_OPTIONS: ${NODE_OPTIONS:---max-old-space-size=512}
       DT_ALLOW_APP_FALLBACK: "false"
       PORT: ${BACKEND_INTERNAL_PORT:-5174}
-      APP_VERSION: ${APP_VERSION:-0.2.10}
+      APP_VERSION: ${APP_VERSION:-0.2.11}
       DATABASE_URL: file:/app/data/dingtone.db
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173,http://127.0.0.1:5173}
     volumes:
@@ -54,8 +54,8 @@ services:
         NODE_IMAGE: ${DOCKER_NODE_IMAGE:-docker.hanxi.cc/library/node:22-alpine}
         NGINX_IMAGE: ${DOCKER_NGINX_IMAGE:-docker.hanxi.cc/library/nginx:1.27-alpine}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
-        APP_VERSION: ${APP_VERSION:-0.2.10}
-        VITE_APP_VERSION: ${VITE_APP_VERSION:-0.2.10}
+        APP_VERSION: ${APP_VERSION:-0.2.11}
+        VITE_APP_VERSION: ${VITE_APP_VERSION:-0.2.11}
     depends_on:
       backend:
         condition: service_healthy
@@ -94,6 +94,7 @@ services:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     environment:
+      # 容器内需监听所有接口才能接收 Docker 端口转发；宿主机发布仍仅限下方 127.0.0.1。
       DT_HELPER_BIND_HOST: 0.0.0.0
       DT_HELPER_PORT: ${HELPER_PORT:-5175}
       DT_HELPER_DEVICE_MODE: ${DT_HELPER_DEVICE_MODE:-remote}

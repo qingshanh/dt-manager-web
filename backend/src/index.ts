@@ -14,7 +14,6 @@ import { createPhoneNumbersRouter } from "./routes/phone-numbers.js";
 import { codeReceiverRouter } from "./routes/code-receiver.js";
 import { settingsRouter } from "./routes/settings.js";
 import { versionRouter } from "./routes/version.js";
-import { createRuntimeRouter } from "./routes/runtime.js";
 import { requireAuth } from "./middleware/auth.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { ensureDefaultAdmin } from "./services/admin.service.js";
@@ -25,16 +24,14 @@ import { accountAutoRefreshService } from "./services/account-auto-refresh.js";
 import { phoneExpiryReminderService } from "./services/phone-expiry-reminder.js";
 import { buildHealthPayload } from "./services/runtime-health.js";
 import { installJsonBodyParsers } from "./services/request-body-limits.js";
-import { buildRuntimeStatus } from "./services/runtime-status.js";
-import { runtimeMetrics } from "./services/runtime-metrics.js";
-import { runtimeWorkQueue } from "./services/runtime-work-queue.js";
-import { getDirectRuntimeResourceSnapshot } from "./services/dingtone/direct-gateway.js";
 import { RuntimeLifecycle } from "./services/runtime-lifecycle.js";
 import { logger } from "./utils/logger.js";
 
 logger.setLevel(config.LOG_LEVEL);
+
 const processStartedAt = new Date();
 const FATAL_LISTEN_EXIT_CODE = 78;
+let runtimeState: "starting" | "running" | "stopping" = "starting";
 let requestRuntimeShutdown: ((reason: string, exitCode: number) => Promise<void>) | null = null;
 
 function formatFatalError(error: unknown) {
@@ -63,37 +60,6 @@ process.on("uncaughtException", (error) => {
 
 const app = express();
 const phoneNumbersRouter = createPhoneNumbersRouter(syncPhoneNumbersFromRemote);
-const runtimeRouter = createRuntimeRouter(() => {
-  const monitorWithSnapshot = accountMonitorService as typeof accountMonitorService & {
-    snapshot?: () => {
-      runnerCount: number;
-      runningCount: number;
-      shuttingDown: boolean;
-      activeDirectMonitorPolls: number;
-      appFallbackCooldownUntil: number;
-      appFallbackProbeInFlight: boolean;
-    };
-  };
-  return buildRuntimeStatus({
-    metrics: runtimeMetrics.snapshot(),
-    monitor: (() => {
-      const snapshot = monitorWithSnapshot.snapshot?.();
-      return snapshot
-        ? {
-            activeRunners: snapshot.runnerCount,
-            runningCount: snapshot.runningCount,
-            shuttingDown: snapshot.shuttingDown,
-            activeDirectMonitorPolls: snapshot.activeDirectMonitorPolls,
-            appFallbackCooldownUntil: snapshot.appFallbackCooldownUntil,
-            appFallbackProbeInFlight: snapshot.appFallbackProbeInFlight
-          }
-        : { activeRunners: 0, shuttingDown: false };
-    })(),
-    direct: getDirectRuntimeResourceSnapshot(),
-    queue: runtimeWorkQueue.snapshot(),
-    appFallbackAllowed: config.DT_ALLOW_APP_FALLBACK
-  });
-});
 
 app.use(helmet());
 app.use(
@@ -123,7 +89,8 @@ app.get("/health", async (_req, res, next) => {
       version: config.APP_VERSION,
       gatewayMode: await getGatewayMode(),
       instanceId: config.DT_RUNTIME_INSTANCE_ID,
-      startedAt: processStartedAt
+      startedAt: processStartedAt,
+      runtimeState
     }));
   } catch (error) {
     next(error);
@@ -138,7 +105,6 @@ app.use("/api/phone-numbers", requireAuth, phoneNumbersRouter);
 app.use("/api/code-receiver", codeReceiverRouter);
 app.use("/api/settings", requireAuth, settingsRouter);
 app.use("/api/version", requireAuth, versionRouter);
-app.use("/api/runtime", requireAuth, runtimeRouter);
 
 app.use(errorHandler);
 
@@ -187,11 +153,13 @@ async function bootstrap() {
   await prisma.$connect();
   await ensureDefaultAdmin();
   await ensureDefaultSettings();
+
   let shuttingDown = false;
   const server = app.listen(config.PORT, () => {
     if (shuttingDown) {
       return;
     }
+    runtimeState = "running";
     logger.info(`Backend listening on http://localhost:${config.PORT}`);
     void getSettingsMap()
       .then((settings) => {
@@ -209,15 +177,16 @@ async function bootstrap() {
     accountAutoRefreshService.start();
     phoneExpiryReminderService.start();
   });
+
   const lifecycle = new RuntimeLifecycle({
     markStopping: () => {
       shuttingDown = true;
-      runtimeMetrics.setGauge("runtime.shuttingDown", 1);
+      runtimeState = "stopping";
     },
     stopTelegram: () => telegramBotService.stop(),
     stopAutoRefresh: () => accountAutoRefreshService.stop(),
     stopExpiryReminder: () => phoneExpiryReminderService.stop(),
-    stopWorkQueue: () => runtimeWorkQueue.stop(),
+    stopWorkQueue: () => undefined,
     stopAccountMonitor: () => accountMonitorService.stopAll(),
     closeHttp: () => closeHttpServer(server),
     forceCloseHttp: () => server.closeAllConnections?.(),
@@ -225,6 +194,7 @@ async function bootstrap() {
     disconnectPrisma: () => prisma.$disconnect(),
     timeoutMs: 15_000
   });
+
   let shutdownExitCode = 0;
   let shutdownPromise: Promise<void> | null = null;
   requestRuntimeShutdown = (reason, exitCode) => {
@@ -253,6 +223,7 @@ async function bootstrap() {
     })();
     return shutdownPromise;
   };
+
   process.once("SIGINT", () => void requestRuntimeShutdown?.("SIGINT", 0));
   process.once("SIGTERM", () => void requestRuntimeShutdown?.("SIGTERM", 0));
   server.on("error", (error: NodeJS.ErrnoException) => {
@@ -280,6 +251,7 @@ function closeHttpServer(server: Server) {
 
 bootstrap().catch(async (error) => {
   logger.error("Bootstrap failed", error);
+  runtimeState = "stopping";
   await prisma.$disconnect();
   process.exit(1);
 });

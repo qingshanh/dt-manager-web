@@ -21,7 +21,7 @@ test("serializeMessage cleans stale direct SMS length-prefix bytes", () => {
     direction: MessageDirection.incoming,
     msgType: MessageType.verification,
     fromNumber: "Anster",
-    toNumber: "18188815435",
+    toNumber: "18185550123",
     rawInfo: null,
     rawK3: null,
     k5Flag: null,

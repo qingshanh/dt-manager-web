@@ -1013,6 +1013,36 @@ test("infers direct SMS target from owned phones in raw push metadata", async ()
   assert.equal(runtime.messages[0]?.toNumber, "+33199000001");
 });
 
+test("uses the unique purchased phone when the parser intentionally leaves an ambiguous target empty", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    nickname: null,
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "test-owner-1",
+    telegramNotify: false
+  });
+  runtime.phones.set(1, [{ phoneNumber: "+61415550123" }]);
+
+  const imported = await storeParsedSmsPushes(
+    1,
+    [{
+      msgType: 561,
+      fromNumber: "(818) 555-0101",
+      toNumber: null,
+      content: "TEST_DIRECT_TARGET",
+      rawInfo: Buffer.from("recipient=61415550123 extra=32465550199", "utf8").toString("base64"),
+      rawK3: Buffer.from("recipient=61415550123", "utf8").toString("base64")
+    }],
+    { db: runtime.db as any, emitEvents: false, sendTelegram: false }
+  );
+
+  assert.equal(imported, 1);
+  assert.equal(runtime.messages[0]?.accountId, 1);
+  assert.equal(runtime.messages[0]?.toNumber, "+61415550123");
+});
+
 test("routes direct SMS pushes to the local account that owns the target phone", async () => {
   const runtime = createMessageRuntimeDb();
   runtime.accounts.set(1, {
@@ -1211,7 +1241,7 @@ test("routes helper SMS messages across different dt_user_id accounts when the t
     dtUserId: "user-two",
     telegramNotify: false
   });
-  runtime.phones.set(1, [{ phoneNumber: "+61491570006" }]);
+  runtime.phones.set(1, [{ phoneNumber: "+61415550123" }]);
   runtime.phones.set(2, [{ phoneNumber: "+447700900123" }]);
 
   const imported = await storeHelperSmsMessages(
@@ -1390,7 +1420,7 @@ test("repairs mojibake sender labels recovered from direct SMS content", async (
 
   const imported = await storeParsedSmsPushes(
     1,
-    [{ msgType: 25, fromNumber: "纭呭熀娴佸姩", toNumber: "61491570006", content: "[纭呭熀娴佸姩]Verification code is: 306497", rawK3: "k3-mojibake-sender" }],
+    [{ msgType: 25, fromNumber: "纭呭熀娴佸姩", toNumber: "61415550123", content: "[纭呭熀娴佸姩]Verification code is: 306497", rawK3: "k3-mojibake-sender" }],
     { db: runtime.db as any, emitEvents: false, sendTelegram: false }
   );
 

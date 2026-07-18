@@ -12,6 +12,7 @@ import { getSettingsMap } from "../settings.service.js";
 import { buildTeamMessageEnvelope, parseTeamMessageMeta } from "../team-message-normalizer.js";
 import { parseDirectActionTemplate, type DirectActionTemplate, type DirectTemplateParams } from "./direct-template.js";
 import { isOfflineMessageIndexPush, parseSmsPush, type ParsedSmsPush } from "./message-parser.js";
+import { buildDirectTransportKey, DirectTransportGovernor, type DirectTransportPermit, type DirectTransportRole } from "./direct-transport-governor.js";
 import type {
   DingtoneGateway,
   DingtoneLoginInput,
@@ -334,6 +335,7 @@ const DIRECT_WEB_OFFLINE_POLL_INTERVAL_MS = 60_000;
 const DIRECT_RECONNECT_BACKOFF_MAX_MS = 1_000;
 const DIRECT_LINK_BOOTSTRAP_WAIT_MS = 1_250;
 const DIRECT_LINK_HEALTHY_AFTER_MS = 15_000;
+const DIRECT_ROUTE_OWNER_GRACE_MS = 15_000;
 const DIRECT_SESSION_OPERATION_IDLE_WAIT_MS = 5_000;
 const DIRECT_PUSH_HOST_CONCURRENCY = 2;
 const DIRECT_PUSH_NON_SMS_FRAME_BATCH_LIMIT = 5;
@@ -341,6 +343,28 @@ const DIRECT_PUSH_NON_SMS_FRAME_PAUSE_MS = 1_000;
 const DIRECT_SOCKET_FRAME_BUDGET_PER_TICK = 20;
 const DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS = 5_000;
 const DIRECT_SESSION_KEEPALIVE_INTERVAL_MS = 5_000;
+const directTransportGovernor = new DirectTransportGovernor();
+
+class DirectListenerCallbackError extends Error {
+  constructor(readonly originalError: unknown) {
+    super("Direct listener callback failed");
+    this.name = "DirectListenerCallbackError";
+  }
+}
+
+async function invokeDirectListenerCallback<TArgs extends unknown[]>(
+  callback: ((...args: TArgs) => Promise<void> | void) | undefined,
+  ...args: TArgs
+) {
+  if (!callback) {
+    return;
+  }
+  try {
+    await callback(...args);
+  } catch (error) {
+    throw new DirectListenerCallbackError(error);
+  }
+}
 
 function calculateDirectPairedKeepaliveDelay(elapsedSinceConnect: number) {
   const elapsed = Math.max(0, elapsedSinceConnect);
@@ -353,6 +377,27 @@ function calculateDirectPairedKeepaliveDelay(elapsedSinceConnect: number) {
 
 export function calculateDirectPairedKeepaliveDelayForTest(elapsedSinceConnect: number) {
   return calculateDirectPairedKeepaliveDelay(elapsedSinceConnect);
+}
+
+async function waitForDirectTransportPermit(input: {
+  key: string;
+  role: DirectTransportRole;
+  probeOwner: object;
+  deadline: number;
+  shouldContinue: () => boolean;
+}): Promise<DirectTransportPermit | null> {
+  while (input.shouldContinue() && Date.now() < input.deadline) {
+    const permit = directTransportGovernor.beforeAttempt(input.key, input.role, input.probeOwner);
+    if (permit.allowed) {
+      return permit;
+    }
+    const remainingMs = input.deadline - Date.now();
+    if (remainingMs <= 0) {
+      return null;
+    }
+    await delay(Math.max(1, Math.min(250, permit.waitMs, remainingMs)));
+  }
+  return null;
 }
 
 function isDirectLinkStable(openedAt: number, now: number) {
@@ -525,7 +570,7 @@ const CAPTURED_LOGIN_FIELDS = {
   deviceId: "And.00000000000000000000000000000000.dttalk",
   userId: "100000000000000",
   token: "00000000000000000000000000000000",
-  email: "placeholder@example.io"
+  email: "placeholder@example.com"
 } as const;
 
 export const ACCESS_CODE_PROBE_CAPABILITY = {
@@ -1450,6 +1495,7 @@ export async function listenDirectSessionPushes(input: {
   let successfulPairs = 0;
   let stablePairs = 0;
   let nextOfflineCatchupAt = 0;
+  let startupOfflineCatchupCompleted = false;
   let nextNotifyOnlyCatchupAt = 0;
   let nextWebOfflinePollAt = 0;
 
@@ -1602,8 +1648,13 @@ export async function listenDirectSessionPushes(input: {
       const pushSession = new DirectSession(runtime, host);
       let linkSession: DirectSession | null = null;
       let linkReservationEpoch: number | null = null;
-      let linkRegistrationEpoch: number | null = null;
+      let routeLeaseEpoch: number | null = null;
+      let linkOwnsRoute = false;
+      const transportKey = buildDirectTransportKey({ host, port: runtime.port, proxyUrl: runtime.proxyUrl });
+      const transportProbeOwner = {};
+      let transportProbeAcquired = false;
       let pushOpenedAt = 0;
+      let linkOpenedAt = 0;
       let pushReportedHealthy = false;
       let pairedFailureReported = false;
       listener.session = pushSession;
@@ -1634,26 +1685,34 @@ export async function listenDirectSessionPushes(input: {
         }
       };
       const reserveRouteRegistration = () => {
+        const now = Date.now();
         if (
-          (linkRegistrationEpoch !== null && routeCoordinator.isOwner(host, linkRegistrationEpoch))
-          || (linkReservationEpoch !== null && routeCoordinator.isOwner(host, linkReservationEpoch))
+          (routeLeaseEpoch !== null && routeCoordinator.isOwner(host, routeLeaseEpoch, now))
+          || (linkReservationEpoch !== null && routeCoordinator.isOwner(host, linkReservationEpoch, now))
         ) {
           return true;
         }
-        if (!routeCoordinator.shouldClaim(host)) {
+        if (!routeCoordinator.shouldClaim(host, now)) {
           return false;
         }
         linkReservationEpoch = routeCoordinator.claim(host);
         return true;
       };
-      const closeLinkSession = async () => {
-        if (linkRegistrationEpoch !== null) {
-          routeCoordinator.release(host, linkRegistrationEpoch);
-          linkRegistrationEpoch = null;
+      const releaseRouteOwnership = () => {
+        if (routeLeaseEpoch !== null) {
+          routeCoordinator.release(host, routeLeaseEpoch);
+          routeLeaseEpoch = null;
         }
         if (linkReservationEpoch !== null) {
           routeCoordinator.release(host, linkReservationEpoch);
           linkReservationEpoch = null;
+        }
+      };
+      const closeLinkSession = async () => {
+        linkOwnsRoute = false;
+        linkOpenedAt = 0;
+        if (routeLeaseEpoch !== null) {
+          routeCoordinator.beginOwnerGrace(host, routeLeaseEpoch, Date.now(), DIRECT_ROUTE_OWNER_GRACE_MS);
         }
         if (!linkSession) {
           return;
@@ -1666,7 +1725,7 @@ export async function listenDirectSessionPushes(input: {
         await closingSession.close().catch(() => undefined);
       };
       const ensureRouteRegistration = async (currentLinkSession: DirectSession) => {
-        if (linkRegistrationEpoch !== null && routeCoordinator.isOwner(host, linkRegistrationEpoch)) {
+        if (routeLeaseEpoch !== null && routeCoordinator.renewOwner(host, routeLeaseEpoch)) {
           return true;
         }
         if (!reserveRouteRegistration() || linkReservationEpoch === null) {
@@ -1693,7 +1752,7 @@ export async function listenDirectSessionPushes(input: {
           if (!isActiveDirectPushListener(listener)) {
             throw new Error("Direct listener was preempted during route registration");
           }
-          linkRegistrationEpoch = reservedEpoch;
+          routeLeaseEpoch = reservedEpoch;
           linkReservationEpoch = null;
           logger.info("Direct paired worker owns the SMS route", {
             host,
@@ -1701,10 +1760,7 @@ export async function listenDirectSessionPushes(input: {
           });
           return true;
         } catch (error) {
-          routeCoordinator.release(host, reservedEpoch);
-          if (linkReservationEpoch === reservedEpoch) {
-            linkReservationEpoch = null;
-          }
+          releaseRouteOwnership();
           if (host === registrationOwnerHost) {
             routeCoordinator.markPrimaryUnavailable();
           }
@@ -1721,49 +1777,55 @@ export async function listenDirectSessionPushes(input: {
         if (linkSession) {
           await closeLinkSession();
         }
+        const transportPermit = await waitForDirectTransportPermit({
+          key: transportKey,
+          role: "link",
+          probeOwner: transportProbeOwner,
+          deadline,
+          shouldContinue: () => isActiveDirectPushListener(listener) && isWithinCurrentListenWindow()
+        });
+        if (!transportPermit) {
+          return null;
+        }
+        transportProbeAcquired ||= transportPermit.probe;
         if (!reserveRouteRegistration()) {
           return null;
         }
         linkSession = new DirectSession(runtime, host);
         listener.sessions?.add(linkSession);
+        let linkTransportReady = false;
         try {
           await linkSession.openLink(input.account);
+          linkOpenedAt = Date.now();
           if (!isActiveDirectPushListener(listener)) {
             throw new Error("Direct listener was preempted after link authentication");
+          }
+          linkOwnsRoute = await ensureRouteRegistration(linkSession);
+          linkTransportReady = true;
+          if (!linkOwnsRoute) {
+            return linkSession;
+          }
+          if (linkOwnsRoute && !startupOfflineCatchupCompleted && Date.now() >= nextOfflineCatchupAt) {
+            await requestOfflineCatchup(linkSession, host, "startup");
+            startupOfflineCatchupCompleted = offlineTemplateError === null && offlineTemplateSent;
           }
           diagnostics.recordCalls(await runPushMaintenanceCalls(linkSession, runtime, input.account));
           if (!isActiveDirectPushListener(listener)) {
             throw new Error("Direct listener was preempted during private-number refresh");
           }
-          await ensureRouteRegistration(linkSession);
           successfulPairs += 1;
-          offlineTemplateAttempted = true;
-          offlineTemplateSent = true;
-          offlineTemplateSendCount += 1;
-          offlineTemplateError = null;
-          nextOfflineCatchupAt = deadline;
           if (nextWebOfflinePollAt <= 0) {
             nextWebOfflinePollAt = Date.now() + DIRECT_WEB_OFFLINE_POLL_INTERVAL_MS;
           }
-          try {
-            await input.onOfflineCatchup?.({
-              host,
-              reason: "startup",
-              attempted: true,
-              sent: true,
-              sendCount: offlineTemplateSendCount,
-              error: null
-            });
-          } catch (error) {
-            logger.warn("Direct offline catch-up status callback failed", {
-              host,
-              reason: "startup",
-              error: error instanceof Error ? error.message : String(error)
-            });
-          }
           return linkSession;
         } catch (error) {
+          if (!linkTransportReady && isDirectTransportError(error)) {
+            directTransportGovernor.recordFailure(transportKey, "link");
+          }
           collectPairTrace();
+          if (linkReservationEpoch !== null) {
+            releaseRouteOwnership();
+          }
           await reportPairedHostFailure(error);
           await closeLinkSession();
           throw error;
@@ -1774,13 +1836,16 @@ export async function listenDirectSessionPushes(input: {
         if (push.sms) {
           rememberDirectSmsHost(input.account, frameHost);
         }
-        if (isNotifyOnlyMessageIndexPush(push) && Date.now() >= nextNotifyOnlyCatchupAt) {
+        if (
+          isNotifyOnlyMessageIndexPush(push)
+          && Date.now() >= nextNotifyOnlyCatchupAt
+          && linkSession?.isOpen()
+          && linkOwnsRoute
+        ) {
           nextNotifyOnlyCatchupAt = Date.now() + DIRECT_NOTIFY_ONLY_CATCHUP_THROTTLE_MS;
           try {
-            const currentLinkSession = await ensureLinkSession();
-            if (currentLinkSession) {
-              await requestOfflineCatchup(currentLinkSession, host, "notify-only");
-            }
+            const currentLinkSession = linkSession;
+            await requestOfflineCatchup(currentLinkSession, host, "notify-only");
           } catch (error) {
             logger.warn("Direct notify-only catch-up could not refresh the paired link", {
               host,
@@ -1791,6 +1856,17 @@ export async function listenDirectSessionPushes(input: {
         await input.onFrame?.(push, frameHost);
       };
 
+      const pushTransportPermit = await waitForDirectTransportPermit({
+        key: transportKey,
+        role: "push",
+        probeOwner: transportProbeOwner,
+        deadline,
+        shouldContinue: () => isActiveDirectPushListener(listener) && isWithinCurrentListenWindow()
+      });
+      if (!pushTransportPermit) {
+        break;
+      }
+      transportProbeAcquired ||= pushTransportPermit.probe;
       try {
         await pushSession.openPush(input.account);
         pushOpenedAt = Date.now();
@@ -1804,11 +1880,11 @@ export async function listenDirectSessionPushes(input: {
             currentLinkSession = null;
           }
           try {
-            if (!currentLinkSession && routeCoordinator.ownerHost() === null && reserveRouteRegistration()) {
+            if (!currentLinkSession && reserveRouteRegistration()) {
               currentLinkSession = await ensureLinkSession();
             }
             if (currentLinkSession) {
-              await ensureRouteRegistration(currentLinkSession);
+              linkOwnsRoute = await ensureRouteRegistration(currentLinkSession);
             }
           } catch (error) {
             lastError = error;
@@ -1855,13 +1931,17 @@ export async function listenDirectSessionPushes(input: {
               pairedFailureReported = false;
             } catch (error) {
               diagnostics.recordHostError(host, error);
-              logger.info("Direct auxiliary link read ended; releasing SMS route for failover", {
+              logger.info("Direct auxiliary link read ended; keeping SMS route during owner grace", {
                 host,
                 pushAttempt: attempts,
                 error: error instanceof Error ? error.message : String(error)
               });
+              if (!listener.preempted && isDirectTransportError(error)) {
+                directTransportGovernor.recordFailure(transportKey, "link");
+              }
               if (linkSession === currentLinkSession) {
                 await closeLinkSession();
+                currentLinkSession = null;
               }
               pairedFailureReported = false;
             }
@@ -1874,14 +1954,20 @@ export async function listenDirectSessionPushes(input: {
               ...(await pushSession.waitForPushes(pushWaitMs, remainingAfterLink, input.onPush, handlePairedFrame))
             );
             pushReadSucceeded = true;
+            const stableNow = Date.now();
             if (
               !pushReportedHealthy
-              && linkRegistrationEpoch !== null
-              && routeCoordinator.isOwner(host, linkRegistrationEpoch)
-              && isDirectLinkStable(pushOpenedAt, Date.now())
+              && routeLeaseEpoch !== null
+              && routeCoordinator.isOwner(host, routeLeaseEpoch)
+              && linkOwnsRoute
+              && currentLinkSession?.isOpen()
+              && isDirectLinkStable(pushOpenedAt, stableNow)
+              && isDirectLinkStable(linkOpenedAt, stableNow)
             ) {
               pushReportedHealthy = true;
               stablePairs += 1;
+              directTransportGovernor.recordSuccess(transportKey, "push");
+              directTransportGovernor.recordSuccess(transportKey, "link");
               await reportHostStatus(host, "connected", null);
             }
           }
@@ -1893,16 +1979,20 @@ export async function listenDirectSessionPushes(input: {
           if (listener.preempted || !isWithinCurrentListenWindow() || diagnostics.totalPushes() >= maxPushFrames) {
             break;
           }
-          if (Date.now() >= nextOfflineCatchupAt && currentLinkSession) {
+          if (Date.now() >= nextOfflineCatchupAt && currentLinkSession && linkOwnsRoute) {
             await requestOfflineCatchup(currentLinkSession, host, "interval");
           }
-          if (Date.now() >= nextWebOfflinePollAt && currentLinkSession) {
+          if (Date.now() >= nextWebOfflinePollAt && currentLinkSession && linkOwnsRoute) {
             await requestWebOfflineMessages(currentLinkSession, host);
           }
         }
       } catch (error) {
         lastError = error;
         diagnostics.recordHostError(host, error);
+        if (!listener.preempted && isDirectTransportError(error)) {
+          directTransportGovernor.recordFailure(transportKey, "push");
+        }
+        releaseRouteOwnership();
         if (host === registrationOwnerHost) {
           routeCoordinator.markPrimaryUnavailable();
         }
@@ -1925,14 +2015,10 @@ export async function listenDirectSessionPushes(input: {
           }
         }
       } finally {
-        if (linkRegistrationEpoch !== null) {
-          routeCoordinator.release(host, linkRegistrationEpoch);
-          linkRegistrationEpoch = null;
+        if (transportProbeAcquired) {
+          directTransportGovernor.abandonProbe(transportKey, transportProbeOwner);
         }
-        if (linkReservationEpoch !== null) {
-          routeCoordinator.release(host, linkReservationEpoch);
-          linkReservationEpoch = null;
-        }
+        releaseRouteOwnership();
         await closeLinkSession();
         await pushSession.close().catch(() => undefined);
         listener.sessions?.delete(pushSession);
@@ -3064,14 +3150,22 @@ class DirectSession {
   }
 
   async openPush(account: DirectSessionAccount) {
-    await this.openPrelogin(account, true);
+    await this.openPrelogin(account);
+    this.startPairedKeepalive(
+      this.socketConnectedAt + DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS,
+      DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS
+    );
   }
 
   async openLink(account: DirectSessionAccount) {
     await this.openPrelogin(account);
-    await this.startSocketKeepalive();
-    await this.bootstrapAuthenticatedSession(account, DIRECT_LINK_BOOTSTRAP_WAIT_MS);
-    await this.primeLinkRegistration(account);
+    await this.bootstrapAuthenticatedSession(account, DIRECT_LINK_BOOTSTRAP_WAIT_MS, async () => {
+      await this.primeLinkRegistration(account);
+    });
+    this.startPairedKeepalive(
+      this.socketConnectedAt + DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS,
+      DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS
+    );
   }
 
   private async primeLinkRegistration(account: DirectSessionAccount) {
@@ -3089,12 +3183,6 @@ class DirectSession {
     await this.sendJson("followerListInfo", { ...shared, trackCode: nextTrackCode() });
     await this.sendJson("getFriendList", { ...shared, trackCode: nextTrackCode() });
     await this.sendJson("infoBus", { ...shared, trackCode: nextTrackCode() });
-    const offlineTemplateSent = await this.sendConfiguredTemplate("dt_direct_template_offline_messages", account, {
-      action: "requestAllOfflineMessage"
-    });
-    if (!offlineTemplateSent) {
-      throw new Error("Direct offline message template is unavailable");
-    }
     await this.sendJson("getBalance", { ...shared, trackCode: nextTrackCode() });
     await this.sendCommonRestJson(
       "glbUserPropertites",
@@ -3115,7 +3203,7 @@ class DirectSession {
     );
   }
 
-  private async openPrelogin(account: DirectSessionAccount, startPairedKeepalive = false) {
+  private async openPrelogin(account: DirectSessionAccount) {
     this.account = account;
     this.trackCodeGenerator = createDirectTrackCodeGenerator(account.dtUserId);
     this.socket = await this.connectSocket(this.host, this.runtime.port, this.runtime.connectTimeoutMs);
@@ -3125,10 +3213,6 @@ class DirectSession {
 
     const connectResp = await this.waitForFrame((frame) => frame.type === 0x8102, this.runtime.ioTimeoutMs, "connect response");
     this.sessionId = Buffer.from(connectResp.raw.subarray(14, 18));
-    if (startPairedKeepalive) {
-      this.startPairedKeepalive();
-    }
-
     const prelogin = buildRequestFrame({
       template: TEMPLATES.getInfoBeforeLogin,
       session: this.sessionId,
@@ -3453,8 +3537,8 @@ class DirectSession {
     while (this.pendingPushes.length > 0 && pushes.length < maxFrames) {
       const push = this.pendingPushes.shift()!;
       pushes.push(push);
-      await onFrame?.(push, this.host);
-      await onPush?.(push);
+      await invokeDirectListenerCallback(onFrame, push, this.host);
+      await invokeDirectListenerCallback(onPush, push);
     }
 
     while (pushes.length < maxFrames && Date.now() < deadline) {
@@ -3466,13 +3550,13 @@ class DirectSession {
         );
         const candidatePush = frameToDirectPush(frame);
         if (candidatePush.sms) {
-          await onFrame?.(candidatePush, this.host);
+          await invokeDirectListenerCallback(onFrame, candidatePush, this.host);
           pushes.push(candidatePush);
-          await onPush?.(candidatePush);
+          await invokeDirectListenerCallback(onPush, candidatePush);
           continue;
         }
         const nonSmsFrame = frame.status === 0x0103 ? candidatePush : frameToDirectFrameSummary(frame);
-        await onFrame?.(nonSmsFrame, this.host);
+        await invokeDirectListenerCallback(onFrame, nonSmsFrame, this.host);
         nonSmsPushFrameCount += 1;
         if (this.shouldLogSkippedNonSmsFrame()) {
           logger.info("Direct push frame skipped because it did not contain an SMS payload", {
@@ -3756,7 +3840,7 @@ class DirectSession {
     });
   }
 
-  private startPairedKeepalive() {
+  private startPairedKeepalive(firstHeartbeatAtMs: number, intervalMs: number) {
     this.stopSocketKeepalive();
     const sendPairedKeepalive = () => {
       if (this.keepaliveWriteInFlight || this.closed) {
@@ -3785,11 +3869,12 @@ class DirectSession {
         return;
       }
       sendPairedKeepalive();
-      this.keepaliveTimer = setInterval(sendPairedKeepalive, DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS);
+      this.keepaliveTimer = setInterval(sendPairedKeepalive, intervalMs);
       this.keepaliveTimer.unref?.();
     };
-    const elapsedSinceConnect = Math.max(0, Date.now() - this.socketConnectedAt);
-    const firstDelayMs = calculateDirectPairedKeepaliveDelay(elapsedSinceConnect);
+    const firstDelayMs = Date.now() >= firstHeartbeatAtMs
+      ? 250
+      : Math.max(250, firstHeartbeatAtMs - Date.now());
     this.keepaliveTimer = setTimeout(startRecurringKeepalive, firstDelayMs);
     this.keepaliveTimer.unref?.();
   }
@@ -3860,46 +3945,35 @@ class DirectSession {
     token: string;
     deviceId?: string | null;
     email?: string | null;
-  }, waitMs = 3_000) {
+  }, waitMs = 3_000, onStarted?: () => Promise<void> | void) {
+    const loginTrackCode = this.nextTrackCode();
     const packet = buildLoginInitPacket({
       session: this.sessionId,
       route: this.route,
       runtime: this.runtime,
       account,
-      loginTrackCode: this.nextTrackCode(),
+      loginTrackCode,
       configTrackCode: this.nextTrackCode()
     });
     this.clearJsonQueue();
     this.beginJsonCapture(waitMs);
     await this.write(packet);
+    await onStarted?.();
     await this.drainBootstrapFrames(waitMs);
     this.bootstrapPayloads = [...this.jsonQueue];
     this.accountPhoneCountryKeys = extractBootstrapPhoneCountryKeys(this.jsonQueue);
     if (this.accountPhoneCountryKeys) {
       directAccountPhoneCountryKeyCache.set(account.dtUserId, this.accountPhoneCountryKeys);
     }
-    const bootstrapError = this.findBootstrapError();
+    const bootstrapError = this.findBootstrapError(loginTrackCode);
     if (bootstrapError) {
       throw new AppError(`Direct session bootstrap failed: ${bootstrapError}`, 401, 401);
     }
     this.clearJsonQueue();
   }
 
-  private findBootstrapError() {
-    for (const payload of this.jsonQueue) {
-      if (!isRecord(payload)) {
-        continue;
-      }
-      const result = payload.Result ?? payload.result;
-      const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode;
-      if (result === 0 || errCode !== undefined) {
-        const reason = stringifyPrimitive(payload.Reason ?? payload.reason ?? payload.message ?? payload.error);
-        return reason
-          ? `${redactSensitiveText(reason)} (${String(errCode ?? "Result=0")})`
-          : `server returned ${String(errCode ?? "Result=0")}`;
-      }
-    }
-    return undefined;
+  private findBootstrapError(expectedTrackCode: string) {
+    return findDirectBootstrapError(this.jsonQueue, expectedTrackCode);
   }
 
   private async drainBootstrapFrames(timeoutMs: number) {
@@ -3912,7 +3986,7 @@ class DirectSession {
           "login bootstrap response"
         );
         const push = frameToDirectPush(frame);
-        if (push.sms) {
+        if (push.sms || isNotifyOnlyMessageIndexPush(push)) {
           this.pendingPushes.push(push);
         }
       } catch (error) {
@@ -4816,6 +4890,50 @@ function buildPreLoginBody(templateBody: Buffer, params: DirectTemplateParams) {
   };
   const jsonBytes = Buffer.from(JSON.stringify(payload), "utf8");
   return Buffer.concat([prefix, Buffer.from([jsonBytes.length]), jsonBytes, suffix]);
+}
+
+const DIRECT_FATAL_SESSION_ERROR_PATTERN = /authen(?:tication)? failed|device\s*id not find|deviceid not find|60011|60014|missing dt_token|missing dt_user_id|bootstrap failed|token (?:is )?not correct|invalid token|token (?:is )?invalid/i;
+
+function directTrackCodesMatch(actual: unknown, expected: string) {
+  if (typeof actual === "string") {
+    return actual === expected;
+  }
+  if (typeof actual === "number" && Number.isFinite(actual)) {
+    const numericExpected = Number(expected);
+    return Number.isFinite(numericExpected) && actual === numericExpected;
+  }
+  return false;
+}
+
+function findDirectBootstrapError(payloads: unknown[], expectedTrackCode: string) {
+  for (const payload of payloads) {
+    if (!isRecord(payload)) {
+      continue;
+    }
+    const result = payload.Result ?? payload.result;
+    const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode;
+    const reason = stringifyPrimitive(payload.Reason ?? payload.reason ?? payload.message ?? payload.error);
+    const actualTrackCode = payload.TrackCode ?? payload.trackCode;
+    const explicitAuthFailure = DIRECT_FATAL_SESSION_ERROR_PATTERN.test(`${String(errCode ?? "")} ${reason ?? ""}`);
+    const matchesLoginTrack = directTrackCodesMatch(actualTrackCode, expectedTrackCode);
+    if (!explicitAuthFailure && !matchesLoginTrack) {
+      continue;
+    }
+    if (explicitAuthFailure || result === 0 || errCode !== undefined) {
+      return reason
+        ? `${redactSensitiveText(reason)} (${String(errCode ?? "Result=0")})`
+        : `server returned ${String(errCode ?? "Result=0")}`;
+    }
+  }
+  return undefined;
+}
+
+export function findDirectBootstrapErrorForTest(payloads: unknown[], expectedTrackCode: string) {
+  return findDirectBootstrapError(payloads, expectedTrackCode);
+}
+
+export function directTrackCodesMatchForTest(actual: unknown, expected: string) {
+  return directTrackCodesMatch(actual, expected);
 }
 
 function buildLoginInitPacket(input: {
@@ -8487,15 +8605,29 @@ function directSessionAccountKey(account: { dtUserId: string; deviceId?: string 
 function createDirectRouteCoordinator(primaryHost: string) {
   let owner: string | null = null;
   let ownerEpoch = 0;
+  let ownerGraceUntil = 0;
   let backupEligible = false;
+  const expireOwnerGrace = (now: number) => {
+    if (owner === null || ownerGraceUntil <= 0 || now < ownerGraceUntil) {
+      return false;
+    }
+    const expiredOwner = owner;
+    owner = null;
+    ownerEpoch += 1;
+    ownerGraceUntil = 0;
+    backupEligible = expiredOwner === primaryHost;
+    return true;
+  };
 
   return {
-    shouldClaim(host: string) {
+    shouldClaim(host: string, now = Date.now()) {
+      expireOwnerGrace(now);
       return owner === null && (host === primaryHost ? !backupEligible : backupEligible);
     },
     claim(host: string) {
       owner = host;
       ownerEpoch += 1;
+      ownerGraceUntil = 0;
       if (host === primaryHost) {
         backupEligible = false;
       }
@@ -8506,6 +8638,7 @@ function createDirectRouteCoordinator(primaryHost: string) {
         return;
       }
       owner = null;
+      ownerGraceUntil = 0;
       if (host === primaryHost) {
         backupEligible = true;
       } else {
@@ -8517,12 +8650,27 @@ function createDirectRouteCoordinator(primaryHost: string) {
         owner = null;
         ownerEpoch += 1;
       }
+      ownerGraceUntil = 0;
       backupEligible = true;
+    },
+    beginOwnerGrace(host: string, epoch: number, now: number, graceMs: number) {
+      if (owner === host && ownerEpoch === epoch && ownerGraceUntil <= 0) {
+        ownerGraceUntil = now + Math.max(0, graceMs);
+      }
+    },
+    renewOwner(host: string, epoch: number, now = Date.now()) {
+      expireOwnerGrace(now);
+      if (owner === host && ownerEpoch === epoch) {
+        ownerGraceUntil = 0;
+        return true;
+      }
+      return false;
     },
     ownerHost() {
       return owner;
     },
-    isOwner(host: string, epoch: number) {
+    isOwner(host: string, epoch: number, now = Date.now()) {
+      expireOwnerGrace(now);
       return owner === host && ownerEpoch === epoch;
     }
   };
@@ -8636,9 +8784,13 @@ function createDirectTrackCodeGenerator(seed: string) {
   let current = BigInt(createDirectTrackCode(seed));
   return () => {
     const value = current;
-    current += 1n;
+    current += 4096n;
     return value.toString();
   };
+}
+
+export function createDirectTrackCodeGeneratorForTest(seed: string) {
+  return createDirectTrackCodeGenerator(seed);
 }
 
 export async function getDirectRuntimeConfig(): Promise<DirectRuntimeConfig> {
@@ -8882,7 +9034,7 @@ function normalizeDirectError(error: unknown) {
 
 function isFatalDirectSessionError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return /authen failed|deviceid not find|60011|missing dt_token|missing dt_user_id|bootstrap failed/i.test(message);
+  return DIRECT_FATAL_SESSION_ERROR_PATTERN.test(message);
 }
 
 export function isSocketClosedError(error: unknown) {
@@ -8891,11 +9043,26 @@ export function isSocketClosedError(error: unknown) {
 }
 
 function isDirectTransportError(error: unknown) {
+  if (error instanceof DirectListenerCallbackError || isFatalDirectSessionError(error)) {
+    return false;
+  }
   const message = error instanceof Error ? error.message : String(error ?? "");
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code ?? "")
+    : "";
   return (
     isSocketClosedError(error) ||
-    /direct (?:gateway|proxy|tls) connection timed out|econnrefused|enotfound|etimedout|network socket disconnected/i.test(message)
+    /^(?:ECONNABORTED|ECONNREFUSED|ECONNRESET|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|ETIMEDOUT|ERR_TLS_CERT_ALTNAME_INVALID|ERR_SSL_)/i.test(code) ||
+    /direct (?:gateway|proxy|tls) connection timed out|direct proxy connect (?:timed out|failed|socket closed)|econnrefused|enotfound|etimedout|network socket disconnected|tls handshake/i.test(message)
   );
+}
+
+export function isDirectTransportErrorForTest(error: unknown) {
+  return isDirectTransportError(error);
+}
+
+export function createDirectCallbackErrorForTest(error: unknown) {
+  return new DirectListenerCallbackError(error);
 }
 
 function isNoResponseAfterPhoneActionWrite(error: unknown) {

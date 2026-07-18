@@ -12,7 +12,7 @@ function inventoryRow(overrides: Record<string, unknown> = {}) {
   return {
     id: 1,
     accountId: 20,
-    phoneNumber: "3197005033038",
+    phoneNumber: "3197005550101",
     countryCode: 31,
     providerId: 2006,
     displayName: "NL note",

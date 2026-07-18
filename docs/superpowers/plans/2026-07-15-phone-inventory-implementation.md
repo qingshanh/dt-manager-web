@@ -271,7 +271,7 @@ test("phone inventory is scoped, grouped in account order, and hides raw JSON", 
       {
         id: 1,
         accountId: 20,
-        phoneNumber: "3197005033038",
+        phoneNumber: "3197005550101",
         countryCode: 31,
         providerId: 2006,
         displayName: "NL",

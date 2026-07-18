@@ -3,6 +3,8 @@ import { config } from "../config.js";
 
 export type GatewayMode = "mock" | "real" | "bridge" | "direct";
 
+const directMonitorAppCatchupDescription = "Enable app/helper/ADB catch-up only for local emulator/helper recovery";
+
 const defaultSettings = [
   ["telegram_bot_token", config.TELEGRAM_BOT_TOKEN, "Telegram bot token"],
   ["telegram_chat_id", config.TELEGRAM_CHAT_ID, "Telegram chat id"],
@@ -54,7 +56,7 @@ const defaultSettings = [
   ["direct_message_listen_seconds", "900", "Direct SMS push listen window in seconds"],
   ["direct_message_refresh_wait_seconds", "8", "Direct SMS refresh wait window in seconds"],
   ["direct_monitor_max_concurrent", "10", "Maximum concurrent direct SMS monitor sockets"],
-  ["direct_monitor_app_catchup_enabled", "false", "Allow direct monitors to scan app/helper/ADB messages as a fallback"],
+  ["direct_monitor_app_catchup_enabled", "false", directMonitorAppCatchupDescription],
   ["direct_monitor_app_catchup_seconds", "15", "Interval for direct monitors to scan app/helper/ADB messages as a fallback"],
   ["code_receiver_api_tokens", "", "Comma/newline separated code receiver API tokens. Use token or adminId:token."],
   ["auto_refresh_interval", String(config.DEFAULT_AUTO_REFRESH_INTERVAL), "Account auto refresh interval in seconds"],

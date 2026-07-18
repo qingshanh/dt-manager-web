@@ -51,4 +51,4 @@ docker compose down
 docker compose --profile real up -d helper
 ```
 
-helper 端口默认只发布到宿主机 `127.0.0.1`。启用前必须在 `.env` 设置非空 `DT_HELPER_TOKEN`，不要把未认证的 Frida/会话接口暴露到公网。正式部署默认 helper 不启动。完成至少 24 小时采样后再根据峰值调整资源限制，不要在缺少数据时直接把后端压到 512MB。
+helper 在容器内监听 `0.0.0.0` 以接收 Docker 端口转发，但端口默认只发布到宿主机 `127.0.0.1`。启用前必须在 `.env` 同时设置非空且相同的 `DT_HELPER_TOKEN` 与 `DT_REAL_BRIDGE_TOKEN`；空令牌会让 helper 明确拒绝启动，缓存私号接口也执行同一鉴权。不要把 Frida/会话接口暴露到公网。正式部署默认 helper 不启动。完成至少 24 小时采样后再根据峰值调整资源限制，不要在缺少数据时直接把后端压到 512MB。

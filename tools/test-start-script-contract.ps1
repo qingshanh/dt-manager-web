@@ -44,6 +44,8 @@ Assert-Match 'pendingProcessSnapshots' "tracking for processes started before ma
 Assert-Match 'Stop-RuntimeProcessIfUnchanged' "PID and creation-time cleanup for unregistered startup processes"
 Assert-Match 'cleanup failed.*preserving runtime manifest|preserv.*manifest' "manifest preservation when partial cleanup fails"
 Assert-Match 'SetEnvironmentVariable\("DT_HELPER_TOKEN"' "helper token inherited through the parent environment"
+Assert-Match 'SetEnvironmentVariable\("DT_REAL_BRIDGE_TOKEN"' "backend bridge token inherited through the parent environment"
+Assert-Match 'IsNullOrWhiteSpace\(\$helperToken\)[\s\S]*NewGuid' "helper launch never uses an empty authentication token"
 Assert-NotMatch '"`\$env:DT_HELPER_TOKEN\s*=' "helper token must not be embedded in a child command line"
 Assert-NotMatch 'Stop-ProjectProcesses' "broad command-line regex cleanup"
 
