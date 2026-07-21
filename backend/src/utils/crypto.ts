@@ -53,6 +53,35 @@ export function createTrackCode() {
   return (base + randomTail).toString();
 }
 
+let lastActivationTrackTimestamp = 0n;
+
+export function createActivationTrackCode() {
+  const now = BigInt(Date.now());
+  const timestamp = now > lastActivationTrackTimestamp ? now : lastActivationTrackTimestamp + 1n;
+  lastActivationTrackTimestamp = timestamp;
+  return ((timestamp << 12n) | 3n).toString();
+}
+
+export function isActivationTrackCode(value: string | null | undefined) {
+  const normalized = value?.trim();
+  if (!normalized || !/^\d{16,19}$/.test(normalized)) {
+    return false;
+  }
+  const numeric = BigInt(normalized);
+  return numeric > 0n && numeric < 2n ** 63n && numeric % 4096n === 3n;
+}
+
+export function advanceActivationTrackCode(value: string, steps = 1) {
+  if (!isActivationTrackCode(value) || !Number.isSafeInteger(steps) || steps < 0) {
+    throw new Error("Invalid activation TrackCode sequence");
+  }
+  const next = BigInt(value) + BigInt(steps) * 4096n;
+  if (next >= 2n ** 63n) {
+    throw new Error("Activation TrackCode sequence overflow");
+  }
+  return next.toString();
+}
+
 export function createMockToken(seed: string) {
   return crypto.createHash("md5").update(`${seed}:${Date.now()}`).digest("hex");
 }

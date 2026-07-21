@@ -64,7 +64,7 @@ import { getGatewayMode, getSettingsMap } from "../services/settings.service.js"
 import { logger } from "../utils/logger.js";
 import { sendPhoneTelegramNotification, sendSmsTelegramNotification } from "../services/telegram-notifier.js";
 import { AppError, assertFound } from "../utils/errors.js";
-import { createDeviceId, createTrackCode, decryptText, encryptText } from "../utils/crypto.js";
+import { createActivationTrackCode, createDeviceId, createTrackCode, decryptText, encryptText, isActivationTrackCode } from "../utils/crypto.js";
 import { ok, paged } from "../utils/response.js";
 import { serializeMessage, serializePhoneNumber, serializeSnapshot } from "../utils/serializers.js";
 
@@ -578,6 +578,14 @@ function runSerializedAccountReorder<T>(adminId: number, run: () => Promise<T>):
   return next;
 }
 
+export function selectVerificationTrackCode(existing: string | null | undefined, loginType: string) {
+  const current = existing?.trim();
+  if (loginType === "email_code" || loginType === "phone_code") {
+    return current && isActivationTrackCode(current) ? current : createActivationTrackCode();
+  }
+  return current || createTrackCode();
+}
+
 accountsRouter.post("/", async (req, res, next) => {
   try {
     const body = createAccountSchema.parse(req.body);
@@ -589,7 +597,7 @@ accountsRouter.post("/", async (req, res, next) => {
       body.app_variant,
       body.login_type
     );
-    const trackCode = existing?.dtTrackCode ?? createTrackCode();
+    const trackCode = selectVerificationTrackCode(existing?.dtTrackCode, body.login_type);
 
     if (body.login_type === "manual_session") {
       const nextStatus = existing?.dtUserId ? existing.status : AccountStatus.pending;
@@ -1045,7 +1053,7 @@ accountsRouter.post("/:id/send-verification-code", async (req, res, next) => {
       throw new AppError("Only email or phone verification-code login can send a verification code.", 400, 400);
     }
     const deviceId = createDeviceId();
-    const trackCode = createTrackCode();
+    const trackCode = createActivationTrackCode();
     await prisma.dtAccount.update({
       where: { id: account.id },
       data: {
@@ -2627,16 +2635,24 @@ async function persistAuthenticatedSession(
     dingtoneId?: string | null;
   }
 ) {
-  await prisma.dtAccount.update({
-    where: { id: accountId },
-    data: {
-      dtUserId: session.dtUserId,
-      dtToken: encryptText(session.token),
-      ...(session.deviceId ? { dtDeviceId: session.deviceId } : {}),
-      ...(session.dingtoneId ? { dtDingtoneId: session.dingtoneId } : {}),
-      lastLoginAt: new Date(),
-      status: AccountStatus.offline,
-      lastError: null
+  await prisma.$transaction(async (transaction) => {
+    await transaction.dtAccount.update({
+      where: { id: accountId },
+      data: {
+        dtUserId: session.dtUserId,
+        dtToken: encryptText(session.token),
+        ...(session.deviceId ? { dtDeviceId: session.deviceId } : {}),
+        lastLoginAt: new Date(),
+        status: AccountStatus.offline,
+        lastError: null
+      }
+    });
+    if (session.dingtoneId) {
+      await transaction.accountSnapshot.upsert({
+        where: { accountId },
+        create: { accountId, dtDingtoneId: session.dingtoneId },
+        update: { dtDingtoneId: session.dingtoneId }
+      });
     }
   });
 
@@ -4463,7 +4479,7 @@ function formatLastError(error: unknown) {
 async function sendVerificationCodeWithVariantFallback(input: VerificationSendInput): Promise<VerificationSendResult> {
   try {
     const result = await dingtoneGateway.sendVerificationCode(input);
-    return { result, appVariant: input.appVariant, deviceId: input.deviceId, trackCode: input.trackCode, switched: false };
+    return { result, appVariant: input.appVariant, deviceId: input.deviceId, trackCode: result.nextTrackCode ?? input.trackCode, switched: false };
   } catch (firstError) {
     if (!shouldRetryVerificationWithOtherVariant(firstError)) {
       throw firstError;
@@ -4471,7 +4487,7 @@ async function sendVerificationCodeWithVariantFallback(input: VerificationSendIn
 
     const fallbackVariant = otherVerificationAppVariant(input.appVariant);
     const fallbackDeviceId = normalizeVerificationDeviceId(createDeviceId(), fallbackVariant, input.loginType);
-    const fallbackTrackCode = createTrackCode();
+    const fallbackTrackCode = createActivationTrackCode();
     try {
       const result = await dingtoneGateway.sendVerificationCode({
         ...input,
@@ -4484,7 +4500,13 @@ async function sendVerificationCodeWithVariantFallback(input: VerificationSendIn
         to: fallbackVariant,
         loginType: input.loginType
       });
-      return { result, appVariant: fallbackVariant, deviceId: fallbackDeviceId, trackCode: fallbackTrackCode, switched: true };
+      return {
+        result,
+        appVariant: fallbackVariant,
+        deviceId: fallbackDeviceId,
+        trackCode: result.nextTrackCode ?? fallbackTrackCode,
+        switched: true
+      };
     } catch (fallbackError) {
       throw new AppError(`Email verification app auto-detection failed: ${formatAppVariantName(input.appVariant)} returned: ${formatVerificationSendError(firstError)}; ${formatAppVariantName(fallbackVariant)} returned: ${formatVerificationSendError(fallbackError)}`, 400, 400);
     }

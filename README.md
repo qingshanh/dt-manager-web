@@ -1,9 +1,9 @@
 # dt-manager-web
 
-## 0.2.11 运行说明
+## 0.2.12 运行说明
 
 - 正式部署默认禁用 App/ADB fallback；仅在本地逆向和测试时显式启用。
-- 0.2.11：Direct SMS sticky route/governor 增强路由稳定性、故障退避和探针恢复。
+- 0.2.12：邮箱发码恢复原生 `clientInfo → checkActivatedUser → registerEmail` 顺序和 443 直连默认值；认证 link EOF 计入 governor，心跳在 bootstrap 后启动。
 
 一个用于管理 TalkU/叮咚账号、手机号、短信监听、验证码接收和 Telegram 控制的本地 Web 面板。项目支持三种网关模式：
 

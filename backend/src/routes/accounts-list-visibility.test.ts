@@ -6,6 +6,7 @@ import {
   accountsRouter,
   buildMessagesWhereForTest,
   otherVerificationAppVariant,
+  selectVerificationTrackCode,
   shouldRetryVerificationWithOtherVariant,
   shouldShowAccountInList
 } from "./accounts.js";
@@ -42,6 +43,17 @@ test("retries verification-code send with the other app on app ownership failure
   assert.equal(shouldRetryVerificationWithOtherVariant(new Error("ConfirmCode is not matched")), false);
 });
 
+test("verification-code accounts replace legacy TrackCodes with native activation sequences", () => {
+  const legacyNative = "268578819";
+  const replacementForLegacyNative = selectVerificationTrackCode(legacyNative, "email_code");
+  assert.match(replacementForLegacyNative, /^\d{16}$/);
+  assert.equal(BigInt(replacementForLegacyNative) % 4096n, 3n);
+  const replacement = selectVerificationTrackCode("40051185300487701", "email_code");
+  assert.match(replacement, /^\d{16}$/);
+  assert.equal(BigInt(replacement) % 4096n, 3n);
+  assert.equal(selectVerificationTrackCode("legacy-manual", "manual_session"), "legacy-manual");
+});
+
 test("message list filters can isolate and exclude system messages", () => {
   assert.deepEqual(buildMessagesWhereForTest(7, { page: 1, pageSize: 20, msg_type: MessageType.system }), {
     accountId: 7,
@@ -69,4 +81,14 @@ test("account list batches count lookups instead of running per-account count qu
   assert.match(source, /prisma\.message\.groupBy\(/);
   assert.match(source, /prisma\.phoneNumber\.groupBy\(/);
   assert.doesNotMatch(source, /accounts\.map\(async \(item\) => \{\s*const \[unreadCount, activePhoneCount\]/s);
+});
+
+test("authenticated sessions persist the public Dingtone id in the snapshot model", () => {
+  const source = readFileSync(new URL("./accounts.ts", import.meta.url), "utf8");
+  const start = source.indexOf("async function persistAuthenticatedSession");
+  const end = source.indexOf("async function mergeDuplicateAccounts", start);
+  const block = start >= 0 && end > start ? source.slice(start, end) : "";
+
+  assert.doesNotMatch(block, /prisma\.dtAccount\.update\([\s\S]*dtDingtoneId/);
+  assert.match(block, /transaction\.accountSnapshot\.upsert\([\s\S]*dtDingtoneId: session\.dingtoneId/);
 });

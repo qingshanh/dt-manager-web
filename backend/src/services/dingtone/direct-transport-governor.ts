@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export type DirectTransportRole = "push" | "link" | "discovery";
 
 export type DirectTransportPermit = {
@@ -32,6 +34,10 @@ type DirectTransportGovernorOptions = {
   random?: () => number;
 };
 
+type DirectTransportAttemptOptions = {
+  allowLinkProbe?: boolean;
+};
+
 export class DirectTransportGovernor {
   private readonly minDelayMs: number;
   private readonly maxDelayMs: number;
@@ -56,7 +62,12 @@ export class DirectTransportGovernor {
     this.random = options.random ?? Math.random;
   }
 
-  beforeAttempt(key: string, role: DirectTransportRole, probeOwner?: object): DirectTransportPermit {
+  beforeAttempt(
+    key: string,
+    role: DirectTransportRole,
+    probeOwner?: object,
+    options: DirectTransportAttemptOptions = {}
+  ): DirectTransportPermit {
     const entry = this.entries.get(key);
     if (!entry) {
       return { allowed: true, waitMs: 0, probe: false };
@@ -83,7 +94,8 @@ export class DirectTransportGovernor {
         }
         return { allowed: false, waitMs: this.minDelayMs, probe: false };
       }
-      if (role !== "push" || !probeOwner) {
+      const canStartProbe = role === "push" || (role === "link" && options.allowLinkProbe === true);
+      if (!canStartProbe || !probeOwner) {
         return { allowed: false, waitMs: this.minDelayMs, probe: false };
       }
       entry.probeInFlight = true;
@@ -186,17 +198,27 @@ export class DirectTransportGovernor {
   }
 }
 
-export function buildDirectTransportKey(input: { host: string; port: number; proxyUrl?: string | null }) {
+export function buildDirectTransportKey(input: {
+  host: string;
+  port: number;
+  proxyUrl?: string | null;
+  accountScope?: string | null;
+}) {
+  const target = `${input.host.trim().toLowerCase()}:${input.port}`;
+  const accountScope = input.accountScope?.trim();
+  const scopedTarget = accountScope
+    ? `account:${createHash("sha256").update(accountScope).digest("hex").slice(0, 16)}->${target}`
+    : target;
   const proxyUrl = input.proxyUrl?.trim();
   if (!proxyUrl) {
-    return `${input.host}:${input.port}`;
+    return scopedTarget;
   }
   try {
     const parsed = new URL(proxyUrl);
     const protocol = parsed.protocol.toLowerCase();
     const port = parsed.port || (protocol === "https:" ? "443" : "80");
-    return `proxy:${protocol}//${parsed.hostname.toLowerCase()}:${port}`;
+    return `proxy:${protocol}//${parsed.hostname.toLowerCase()}:${port}->${scopedTarget}`;
   } catch {
-    return "proxy:invalid";
+    return `proxy:invalid->${scopedTarget}`;
   }
 }

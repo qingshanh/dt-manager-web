@@ -6,6 +6,7 @@ import fs from "node:fs";
 import { config } from "../../config.js";
 import { BoundedBuffer } from "../../utils/bounded-buffer.js";
 import { AppError } from "../../utils/errors.js";
+import { advanceActivationTrackCode } from "../../utils/crypto.js";
 import { logger } from "../../utils/logger.js";
 import { TtlLruCache } from "../../utils/ttl-lru-cache.js";
 import { getSettingsMap } from "../settings.service.js";
@@ -325,7 +326,8 @@ const DINGTONE_BUSINESS_APP_ID = "me.dingtone.im";
 const TALKU_APK_CERTIFICATE_SIGN = "bf6bf7a31a53d5c06dd1c7d03fd3d917";
 const TALKU_DIRECT_API_CERTIFICATE_SIGN = "458cf4f3e576f61a26187d218e4af9d3";
 const DIRECT_ACTIVATION_CLIENT_VERSION = 1023;
-const DIRECT_ACTIVATE_EMAIL_CLIENT_VERSION = -1610218240;
+const DIRECT_TALKU_ACTIVATION_CLIENT_VERSION = -1610218751;
+const DIRECT_DINGDONG_ACTIVATION_CLIENT_VERSION = -1610218240;
 const DIRECT_ACTIVATION_EMAIL_CRYPTO_IV = Buffer.from("5875b9f15ed445239539cb455cdcbed7", "hex");
 const DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS = 4_000;
 const DIRECT_OFFLINE_CATCHUP_INTERVAL_MS = 30_000;
@@ -336,6 +338,7 @@ const DIRECT_RECONNECT_BACKOFF_MAX_MS = 1_000;
 const DIRECT_LINK_BOOTSTRAP_WAIT_MS = 1_250;
 const DIRECT_LINK_HEALTHY_AFTER_MS = 15_000;
 const DIRECT_ROUTE_OWNER_GRACE_MS = 15_000;
+const DIRECT_ROUTE_REGISTRATION_CONFIRM_TIMEOUT_MS = 4_000;
 const DIRECT_SESSION_OPERATION_IDLE_WAIT_MS = 5_000;
 const DIRECT_PUSH_HOST_CONCURRENCY = 2;
 const DIRECT_PUSH_NON_SMS_FRAME_BATCH_LIMIT = 5;
@@ -383,11 +386,14 @@ async function waitForDirectTransportPermit(input: {
   key: string;
   role: DirectTransportRole;
   probeOwner: object;
+  allowLinkProbe?: boolean;
   deadline: number;
   shouldContinue: () => boolean;
 }): Promise<DirectTransportPermit | null> {
   while (input.shouldContinue() && Date.now() < input.deadline) {
-    const permit = directTransportGovernor.beforeAttempt(input.key, input.role, input.probeOwner);
+    const permit = directTransportGovernor.beforeAttempt(input.key, input.role, input.probeOwner, {
+      allowLinkProbe: input.allowLinkProbe
+    });
     if (permit.allowed) {
       return permit;
     }
@@ -403,7 +409,7 @@ async function waitForDirectTransportPermit(input: {
 function isDirectLinkStable(openedAt: number, now: number) {
   return openedAt > 0 && now - openedAt >= DIRECT_LINK_HEALTHY_AFTER_MS;
 }
-const DINGDONG_SESSION_KEEPALIVE_INTERVAL_MS = 2_000;
+const DINGDONG_SESSION_KEEPALIVE_INTERVAL_MS = 5_000;
 const CAPTURED_OFFLINE_FIELDS = {
   deviceId: "And.11111111111111111111111111111111.dttalk"
 } as const;
@@ -659,27 +665,14 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     const email = normalizeEmailLoginTarget(input.email);
     const runtime = await getDirectRuntimeConfig();
 
-    let activatedUser: any = null;
-    try {
-      const rawPayload = await callDirectActivationApi(
-        runtime,
-        { appVariant: input.appVariant, deviceId: input.deviceId },
-        "checkActivatedUser",
-        "checkActivatedUser",
-        buildCheckActivatedEmailQuery(email, input.trackCode)
-      );
-      activatedUser = extractActivatedEmailUser(rawPayload);
-    } catch {
-      // Ignore lookup failures so code delivery can continue.
-    }
-
-    const payload = await callDirectRegisterEmail(runtime, input, email);
+    const { activatedUser, payload, nextTrackCode } = await callDirectEmailVerificationSequence(runtime, input, email);
     return {
       message: `Verification email sent to ${email}`,
       verificationCode: pickString(payload, ["returnedAccessCode", "confirmCode", "accessCode"]) ?? undefined,
       verificationFlow: "register",
       expectedDtUserId: activatedUser?.dtUserId,
-      expectedDingtoneId: activatedUser?.dingtoneId
+      expectedDingtoneId: activatedUser?.dingtoneId,
+      nextTrackCode
     };
   }
 
@@ -1630,9 +1623,23 @@ export async function listenDirectSessionPushes(input: {
     }
     const hosts = uniqueHosts([baseHosts[0] ?? runtime.primaryHost, ...discoveredHosts, ...baseHosts]);
     const workerHosts = hosts.slice(0, DIRECT_PUSH_HOST_CONCURRENCY);
-    const registrationOwnerHost = workerHosts[0] ?? runtime.primaryHost;
+    const registrationOwnerHost = hosts[0] ?? runtime.primaryHost;
     const routeCoordinator = createDirectRouteCoordinator(registrationOwnerHost);
-    const runPairedHostWorker = async (host: string) => {
+    const activeWorkerHosts = new Set<string>();
+    let nextWorkerHostIndex = 0;
+    const acquireWorkerHost = () => {
+      for (let offset = 0; offset < hosts.length; offset += 1) {
+        const candidate = hosts[nextWorkerHostIndex % hosts.length]!;
+        nextWorkerHostIndex = (nextWorkerHostIndex + 1) % hosts.length;
+        if (activeWorkerHosts.has(candidate)) {
+          continue;
+        }
+        activeWorkerHosts.add(candidate);
+        return candidate;
+      }
+      return null;
+    };
+    const runPairedHostWorker = async (_initialHost: string) => {
       while (!listener.preempted && hasRemainingListenWindow() && diagnostics.totalPushes() < maxPushFrames) {
       const operationIdle = await waitForDirectSessionOperationIdle(input.account, DIRECT_SESSION_OPERATION_IDLE_WAIT_MS);
       if (!operationIdle) {
@@ -1644,13 +1651,24 @@ export async function listenDirectSessionPushes(input: {
       if (listener.preempted || !isWithinCurrentListenWindow() || diagnostics.totalPushes() >= maxPushFrames) {
         break;
       }
+      const host = acquireWorkerHost();
+      if (!host) {
+        await delay(100);
+        continue;
+      }
+      try {
 
       const pushSession = new DirectSession(runtime, host);
       let linkSession: DirectSession | null = null;
       let linkReservationEpoch: number | null = null;
       let routeLeaseEpoch: number | null = null;
       let linkOwnsRoute = false;
-      const transportKey = buildDirectTransportKey({ host, port: runtime.port, proxyUrl: runtime.proxyUrl });
+      const transportKey = buildDirectTransportKey({
+        host,
+        port: runtime.port,
+        proxyUrl: runtime.proxyUrl,
+        accountScope: directTransportAccountScope(input.account)
+      });
       const transportProbeOwner = {};
       let transportProbeAcquired = false;
       let pushOpenedAt = 0;
@@ -1725,10 +1743,11 @@ export async function listenDirectSessionPushes(input: {
         await closingSession.close().catch(() => undefined);
       };
       const ensureRouteRegistration = async (currentLinkSession: DirectSession) => {
-        if (routeLeaseEpoch !== null && routeCoordinator.renewOwner(host, routeLeaseEpoch)) {
+        const renewingLease = routeLeaseEpoch !== null && routeCoordinator.renewOwner(host, routeLeaseEpoch);
+        if (renewingLease && linkOwnsRoute) {
           return true;
         }
-        if (!reserveRouteRegistration() || linkReservationEpoch === null) {
+        if (!renewingLease && (!reserveRouteRegistration() || linkReservationEpoch === null)) {
           logger.info("Direct secondary paired workers stay authenticated without replacing the primary SMS route", {
             host,
             registrationOwnerHost,
@@ -1736,10 +1755,13 @@ export async function listenDirectSessionPushes(input: {
           });
           return false;
         }
+        const registrationEpoch = renewingLease ? routeLeaseEpoch : linkReservationEpoch;
+        if (registrationEpoch === null) {
+          return false;
+        }
         if (!isActiveDirectPushListener(listener)) {
           throw new Error("Direct listener was preempted before route registration");
         }
-        const reservedEpoch = linkReservationEpoch;
         try {
           if (!isActiveDirectPushListener(listener)) {
             throw new Error("Direct listener was preempted before route registration");
@@ -1752,7 +1774,7 @@ export async function listenDirectSessionPushes(input: {
           if (!isActiveDirectPushListener(listener)) {
             throw new Error("Direct listener was preempted during route registration");
           }
-          routeLeaseEpoch = reservedEpoch;
+          routeLeaseEpoch = registrationEpoch;
           linkReservationEpoch = null;
           logger.info("Direct paired worker owns the SMS route", {
             host,
@@ -1781,6 +1803,7 @@ export async function listenDirectSessionPushes(input: {
           key: transportKey,
           role: "link",
           probeOwner: transportProbeOwner,
+          allowLinkProbe: pushSession.isOpen(),
           deadline,
           shouldContinue: () => isActiveDirectPushListener(listener) && isWithinCurrentListenWindow()
         });
@@ -1880,8 +1903,18 @@ export async function listenDirectSessionPushes(input: {
             currentLinkSession = null;
           }
           try {
-            if (!currentLinkSession && reserveRouteRegistration()) {
-              currentLinkSession = await ensureLinkSession();
+            if (!currentLinkSession) {
+              const routeReserved = reserveRouteRegistration();
+              if (!routeReserved && routeCoordinator.ownerHost() === null) {
+                logger.info("Direct standby gateway yielded because no route owner can promote it", {
+                  host,
+                  registrationOwnerHost
+                });
+                break;
+              }
+              if (routeReserved) {
+                currentLinkSession = await ensureLinkSession();
+              }
             }
             if (currentLinkSession) {
               linkOwnsRoute = await ensureRouteRegistration(currentLinkSession);
@@ -1893,7 +1926,7 @@ export async function listenDirectSessionPushes(input: {
               await reportPairedHostFailure(error);
               await closeLinkSession();
             }
-            logger.warn("Direct paired link registration failed; keeping push socket open", {
+            logger.warn("Direct paired link registration failed; rotating SMS gateway", {
               host,
               pushAttempt: attempts,
               error: error instanceof Error ? error.message : String(error)
@@ -1902,7 +1935,7 @@ export async function listenDirectSessionPushes(input: {
               throw normalizeDirectError(error);
             }
             await delay(Math.min(DIRECT_RECONNECT_BACKOFF_MAX_MS, 500));
-            continue;
+            break;
           }
           const remainingFrames = Number.isFinite(maxPushFrames)
             ? Math.min(DIRECT_PUSH_READ_BATCH_LIMIT, Math.max(0, maxPushFrames - diagnostics.totalPushes()))
@@ -1931,15 +1964,16 @@ export async function listenDirectSessionPushes(input: {
               pairedFailureReported = false;
             } catch (error) {
               diagnostics.recordHostError(host, error);
-              logger.info("Direct auxiliary link read ended; keeping SMS route during owner grace", {
+              if (!listener.preempted && isDirectTransportError(error)) {
+                directTransportGovernor.recordFailure(transportKey, "link");
+              }
+              logger.info("Direct auxiliary link read ended; releasing SMS route for immediate failover", {
                 host,
                 pushAttempt: attempts,
                 error: error instanceof Error ? error.message : String(error)
               });
-              if (!listener.preempted && isDirectTransportError(error)) {
-                directTransportGovernor.recordFailure(transportKey, "link");
-              }
               if (linkSession === currentLinkSession) {
+                releaseRouteOwnership();
                 await closeLinkSession();
                 currentLinkSession = null;
               }
@@ -2025,6 +2059,9 @@ export async function listenDirectSessionPushes(input: {
         if (listener.session === pushSession) {
           listener.session = undefined;
         }
+      }
+      } finally {
+        activeWorkerHosts.delete(host);
       }
       }
     };
@@ -2391,16 +2428,32 @@ async function runPushLinkRegistration(
   runtime: DirectRuntimeConfig,
   account: DirectSessionAccount
 ) {
+  const startedAt = Date.now();
   const appVersion = resolveDirectAppVersion(account, runtime);
-  return sendPushTemplateCall(session, "listenPrime.updateClientLink", "updateClientLink", {
-    deviceId: accountDeviceId(account),
-    userId: account.dtUserId,
-    token: account.token,
-    clientVersion: appVersion,
-    appVersion,
-    apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign),
-    trackCode: session.nextTrackCode()
-  });
+  try {
+    await session.registerClientLink({
+      deviceId: accountDeviceId(account),
+      userId: account.dtUserId,
+      token: account.token,
+      clientVersion: appVersion,
+      appVersion,
+      apkCertificateSign: resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign),
+      trackCode: session.nextTrackCode()
+    });
+    return {
+      name: "listenPrime.updateClientLink",
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      payload: { confirmed: true }
+    } satisfies DirectProbeCallResult;
+  } catch (error) {
+    return {
+      name: "listenPrime.updateClientLink",
+      ok: false,
+      durationMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error)
+    } satisfies DirectProbeCallResult;
+  }
 }
 
 async function sendPushTemplateCall(
@@ -3120,6 +3173,7 @@ class DirectSession {
   private jsonQueueBytes = 0;
   private readonly jsonWaiters = new DirectWaiterQueue<ApiResult>();
   private jsonCaptureUntil = 0;
+  private routeRegistrationCaptureUntil = 0;
   private skippedNonSmsLogCount = 0;
   private keepaliveTimer: NodeJS.Timeout | null = null;
   private keepaliveWriteInFlight = false;
@@ -3162,10 +3216,7 @@ class DirectSession {
     await this.bootstrapAuthenticatedSession(account, DIRECT_LINK_BOOTSTRAP_WAIT_MS, async () => {
       await this.primeLinkRegistration(account);
     });
-    this.startPairedKeepalive(
-      this.socketConnectedAt + DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS,
-      DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS
-    );
+    await this.startSocketKeepalive();
   }
 
   private async primeLinkRegistration(account: DirectSessionAccount) {
@@ -3296,6 +3347,34 @@ class DirectSession {
     });
     dumpDirectDebugFrame(String(templateName), request);
     await this.write(request);
+  }
+
+  async registerClientLink(
+    params: DirectTemplateParams,
+    timeoutMs = Math.min(this.runtime.ioTimeoutMs, DIRECT_ROUTE_REGISTRATION_CONFIRM_TIMEOUT_MS)
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    this.routeRegistrationCaptureUntil = deadline;
+    try {
+      await this.sendJson("updateClientLink", params);
+      while (Date.now() < deadline) {
+        const frame = await this.waitForFrame(
+          (candidate) => candidate.type === 0x8107,
+          Math.max(250, deadline - Date.now()),
+          "updateClientLink confirmation"
+        );
+        if (isDirectRouteRegistrationConfirmation(frame, this.route)) {
+          return;
+        }
+        const push = frameToDirectPush(frame);
+        if (push.sms || isNotifyOnlyMessageIndexPush(push)) {
+          this.pendingPushes.push(push);
+        }
+      }
+      throw new AppError("Timed out waiting for updateClientLink confirmation", 504, 504);
+    } finally {
+      this.routeRegistrationCaptureUntil = 0;
+    }
   }
 
   async callCommonRestJson(label: string, apiName: string, query: string, timeoutMs = this.runtime.ioTimeoutMs) {
@@ -3723,6 +3802,7 @@ class DirectSession {
         parsed.type !== 0x8107 ||
         parsed.status === 0x0101 ||
         parsed.status === 0x0103 ||
+        (parsed.status === 0x0102 && Date.now() <= this.routeRegistrationCaptureUntil) ||
         this.rawWaiters.size > 0;
       const shouldTraceFrame = shouldQueueRawFrame || Boolean(jsonPayload) || Boolean(process.env.DT_DIRECT_DEBUG_DUMP_DIR);
       if (!shouldTraceFrame) {
@@ -4636,8 +4716,7 @@ function buildRequestFrame(input: {
   );
 
   const apiName = findTrailingLengthPrefixedAscii(prefix);
-  if (apiName) {
-    prefix = patchPrefixPayloadLength(prefix, apiName, templateCompressedLength, compressed.length);
+  if (apiName && apiName !== "registerCommon" && apiName !== "activateCommon") {
     prefix = patchEmbeddedCommonRestPayloadLength(prefix, apiName, compressed.length);
   }
 
@@ -4653,39 +4732,6 @@ function buildRequestFrame(input: {
   ]);
 
   return encodeFrame(input.session, input.status, body);
-}
-
-function patchPrefixPayloadLength(prefix: Buffer, apiName: string, oldCompressedLength: number, newCompressedLength: number) {
-  if (apiName !== "registerCommon" && apiName !== "activateCommon") {
-    return prefix;
-  }
-  const apiBytes = Buffer.from(apiName, "utf8");
-  const apiIndex = prefix.indexOf(apiBytes);
-  if (apiIndex < 8) {
-    return prefix;
-  }
-
-  const apiLengthOffset = apiIndex - 4;
-  if (prefix.readUInt32BE(apiLengthOffset) !== apiBytes.length) {
-    return prefix;
-  }
-
-  let lengthOffset = -1;
-  if (apiIndex >= 13 && prefix[apiIndex - 5] === 0x32 && prefix.readUInt32BE(apiIndex - 9) === 1) {
-    lengthOffset = apiIndex - 13;
-  } else if (apiIndex >= 12 && prefix.readUInt32BE(apiIndex - 8) === 0) {
-    lengthOffset = apiIndex - 12;
-  }
-
-  if (lengthOffset >= 0) {
-    const oldLength = prefix.readUInt32BE(lengthOffset);
-    const newLength = oldLength + (newCompressedLength - oldCompressedLength);
-    const patched = Buffer.from(prefix);
-    patched.writeUInt32BE(newLength, lengthOffset);
-    return patched;
-  }
-
-  return prefix;
 }
 
 function buildTemplateSendFrame(input: {
@@ -4706,6 +4752,16 @@ function buildTemplateSendFrame(input: {
     const { body } = getDirectTemplateBody(input.template);
     return encodeFrame(input.session, input.status, patchLengthPrefixedTemplateFields(replaceRouteBytes(body, input.route), input.params));
   }
+}
+
+export function buildTemplateSendFrameForTest(template: Buffer, params: DirectTemplateParams) {
+  return buildTemplateSendFrame({
+    template,
+    session: Buffer.alloc(4),
+    route: Buffer.alloc(8),
+    status: 0x0102,
+    params
+  });
 }
 
 function templateQueryParam(template: Buffer, key: string) {
@@ -6502,10 +6558,7 @@ function buildActivationTemplateParamsPreservingCapturedEmailProof(query: string
 }
 
 function buildRegisterEmailTemplateParams(query: string): DirectTemplateParams {
-  return {
-    ...queryToDirectTemplateParams(query),
-    __appendQueryKeys: "appType,appId"
-  };
+  return queryToDirectTemplateParams(query);
 }
 
 function queryToDirectTemplateParams(query: string): DirectTemplateParams {
@@ -6540,23 +6593,18 @@ function buildRegisterEmailQueryAttempts(input: DingtoneLoginInput, runtime: Dir
   return registerEmailIdentityAttemptsForVariant(input.appVariant).map((options) => buildRegisterEmailQuery(input, runtime, email, options));
 }
 
+export function buildRegisterEmailQueryAttemptsForTest(input: DingtoneLoginInput, runtime: DirectRuntimeConfig, email: string) {
+  return buildRegisterEmailQueryAttempts(input, runtime, email);
+}
+
 export function registerEmailIdentityAttemptsForVariant(appVariant?: 'dingtone' | 'dingdong') {
   if (appVariant === 'dingdong') {
     return [
-      { appType: 3, appId: DINGTONE_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
-      { appType: 3, appId: DINGTONE_BUSINESS_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
-      { appType: 2, appId: DINGTONE_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
-      { appType: 2, appId: DINGTONE_BUSINESS_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
-      { appType: undefined, appId: DINGTONE_APP_ID, clientInfoAppId: DINGTONE_APP_ID, includeTopLevelAppId: false },
-      { appType: undefined, appId: DINGTONE_BUSINESS_APP_ID, clientInfoAppId: DINGTONE_APP_ID, includeTopLevelAppId: false }
+      { appId: DINGTONE_BUSINESS_APP_ID, clientInfoAppId: DINGTONE_APP_ID, includeTopLevelAppId: false }
     ];
   }
   return [
-    { appType: 2, appId: TALKU_APP_ID, clientInfoAppId: TALKU_APP_ID },
-    { appType: 3, appId: TALKU_APP_ID, clientInfoAppId: TALKU_APP_ID },
-    { appType: 3, appId: DINGTONE_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
-    { appType: 3, appId: DINGTONE_BUSINESS_APP_ID, clientInfoAppId: DINGTONE_APP_ID },
-    { appType: undefined, appId: TALKU_APP_ID, clientInfoAppId: TALKU_APP_ID, includeTopLevelAppId: false }
+    { appId: TALKU_APP_ID, clientInfoAppId: TALKU_APP_ID, includeTopLevelAppId: false }
   ];
 }
 
@@ -6580,16 +6628,17 @@ function buildRegisterEmailQuery(
     queryPair("reaskActiveCode", 0),
     queryPair("deviceOSVer", "9"),
     queryPair("showAccessCode", 1),
+    queryPair("noCode", 0),
     queryPair("simCC", "CN"),
     queryPair("isRooted", 1),
     queryPair("isSimulator", "false"),
     queryPair("TrackCode", input.trackCode),
-    queryPair("json", buildRegisterEmailJson(email)),
+    queryPair("json", buildRegisterEmailJson(email, input.appVariant)),
     queryPair("clientInfo", buildActivationClientInfo(input, runtime, { appId: options.clientInfoAppId }))
   ]);
 }
 
-function buildCheckActivatedEmailQuery(email: string, trackCode: string) {
+function buildCheckActivatedEmailQuery(input: DingtoneLoginInput, email: string, trackCode: string) {
   const condition = {
     Type: 1,
     SearchWord: nativeActivationEmailMd5(email.toLowerCase()),
@@ -6597,11 +6646,11 @@ function buildCheckActivatedEmailQuery(email: string, trackCode: string) {
   };
   const json = JSON.stringify({ Condition: [condition] });
   return [
-    queryPair("json", json),
-    queryPair("jsonCondition", json),
-    queryPair("countryCode", 0),
-    queryPair("areaCode", 0),
-    queryPair("TrackCode", trackCode)
+    queryPair("deviceId", activationRestDeviceId(input.deviceId, input.appVariant)),
+    queryPair("TrackCode", trackCode),
+    queryPair("appId", activationBusinessAppIdForVariant(input.appVariant)),
+    queryPair("apiVersion", 2),
+    queryPair("json", json)
   ].join("&");
 }
 
@@ -6625,32 +6674,32 @@ function buildActivateEmailQuery(input: DingtoneLoginInput, runtime: DirectRunti
     queryPair("rooted", 1)
   ];
   query.push(
-    queryPair("json", buildActivationEmailJson(email)),
+    queryPair("json", buildActivationEmailJson(email, input.appVariant)),
     queryPair("clientInfo", buildActivationClientInfo(input, runtime))
   );
   return query.join("&");
 }
 
-function buildActivationEmailJson(email: string) {
+function buildActivationEmailJson(email: string, appVariant?: "dingtone" | "dingdong") {
   const lowerEmail = email.toLowerCase();
   return JSON.stringify({
     Email: email,
     EmailMd5: nativeActivationEmailMd5(lowerEmail),
     EmailEncrypt: encryptActivationTarget(lowerEmail),
     RawEmailMD5: nativeActivationEmailMd5(email),
-    ClientVersion: DIRECT_ACTIVATE_EMAIL_CLIENT_VERSION,
+    ClientVersion: directActivationClientVersion(appVariant),
     type: 1
   });
 }
 
-function buildRegisterEmailJson(email: string) {
+function buildRegisterEmailJson(email: string, appVariant?: "dingtone" | "dingdong") {
   const lowerEmail = email.toLowerCase();
   return JSON.stringify({
     Email: email,
     EmailMd5: nativeActivationEmailMd5(lowerEmail),
-    EmailEncrypt: encryptActivationTarget(lowerEmail, { extraPaddingBlock: true }),
+    EmailEncrypt: encryptActivationTarget(lowerEmail),
     RawEmailMD5: nativeActivationEmailMd5(email),
-    ClientVersion: -1610218751,
+    ClientVersion: directActivationClientVersion(appVariant),
     Language: 1,
     ShowAccessCode: 1,
     type: 1
@@ -6690,13 +6739,128 @@ function buildActivationClientInfo(input: DingtoneLoginInput, runtime: DirectRun
     platform: "Android",
     manufacture: "OPPO",
     osVersion: "9",
-    deviceOSVer: "9",
-    deviceOSVersion: "9",
     deviceModel: "PCRT00",
     clientTime: Date.now(),
-    ipv4: "10.0.2.15",
-    signMd5: appVariantSign(input.appVariant, clientDeviceId, runtime.apkCertificateSign)
+    ipv4: "10.0.2.15"
   });
+}
+
+function directActivationClientVersion(appVariant?: "dingtone" | "dingdong") {
+  return appVariant === "dingdong"
+    ? DIRECT_DINGDONG_ACTIVATION_CLIENT_VERSION
+    : DIRECT_TALKU_ACTIVATION_CLIENT_VERSION;
+}
+
+function activationClientInfoTrackCode(trackCode: string) {
+  const numeric = BigInt(trackCode);
+  const bootstrapOffset = 2n * 4096n + 3n;
+  if (numeric <= bootstrapOffset || numeric % 4096n !== 3n) {
+    throw new Error("Invalid activation TrackCode bootstrap sequence");
+  }
+  return (numeric - bootstrapOffset).toString();
+}
+
+type DirectEmailVerificationSequenceDeps = {
+  hostCandidates?: (runtime: DirectRuntimeConfig, identity: DirectActivationIdentity) => string[];
+  createSession?: (runtime: DirectRuntimeConfig, host: string) => DirectSession;
+};
+
+async function callDirectEmailVerificationSequence(
+  runtime: DirectRuntimeConfig,
+  input: DingtoneLoginInput,
+  email: string,
+  deps: DirectEmailVerificationSequenceDeps = {}
+) {
+  const identity = { appVariant: input.appVariant, deviceId: input.deviceId };
+  const registerTrackCode = advanceActivationTrackCode(input.trackCode);
+  const nextTrackCode = advanceActivationTrackCode(input.trackCode, 2);
+  const registerQuery = buildRegisterEmailQueryAttempts({ ...input, trackCode: registerTrackCode }, runtime, email)[0];
+  if (!registerQuery) {
+    throw new AppError("Direct registerEmail identity is not configured.", 503, 503);
+  }
+
+  let lastError: unknown;
+  const hosts = deps.hostCandidates?.(runtime, identity) ?? directActivationHostCandidates(runtime, identity);
+  for (const host of hosts) {
+    const session = deps.createSession?.(runtime, host) ?? new DirectSession(runtime, host);
+    let activatedUser: ReturnType<typeof extractActivatedEmailUser> = null;
+    try {
+      await session.openActivation(identity);
+      await session.callCommonRestJson(
+        "clientInfo",
+        "clientInfo",
+        buildDirectSessionClientInfoQuery(
+          {
+            dtUserId: "0",
+            token: "",
+            deviceId: activationDeviceId(identity),
+            appVariant: input.appVariant
+          },
+          runtime,
+          activationClientInfoTrackCode(input.trackCode)
+        )
+      );
+      try {
+        const lookupPayload = await session.callCommonRestJson(
+          "checkActivatedUser",
+          "checkActivatedUser",
+          buildCheckActivatedEmailQuery(input, email, input.trackCode)
+        );
+        activatedUser = extractActivatedEmailUser(lookupPayload);
+      } catch (error) {
+        logger.warn("Direct email lookup failed on the shared activation session; continuing with registerEmail", {
+          host,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+
+      const payload = await session.callConfiguredRegisterEmailTemplate(
+        "registerEmail",
+        activationDeviceId(identity),
+        buildRegisterEmailTemplateParams(registerQuery),
+        activationTemplateSettingKeys("registerEmail", identity)
+      );
+      assertDirectActivationOk(payload, "registerEmail");
+      return { activatedUser, payload, nextTrackCode };
+    } catch (error) {
+      lastError = error;
+      logger.warn("Direct email verification sequence failed", {
+        host,
+        port: runtime.port,
+        useTls: runtime.useTls,
+        error: error instanceof Error ? error.message : String(error),
+        trace: session.getTrace().slice(-6).map((frame) => ({
+          frameType: frame.frameType,
+          status: frame.status,
+          routeHex: frame.routeHex,
+          bodyLength: frame.bodyLength,
+          bodyHexPreview: frame.bodyHexPreview.slice(0, 160),
+          jsonPayload: summarizeJsonPayload(frame.jsonPayload)
+        }))
+      });
+    } finally {
+      await session.close().catch(() => undefined);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new AppError("Direct registerEmail failed", 400, 400);
+}
+
+export function callDirectEmailVerificationSequenceForTest(
+  runtime: DirectRuntimeConfig,
+  input: DingtoneLoginInput,
+  email: string,
+  deps: DirectEmailVerificationSequenceDeps
+) {
+  return callDirectEmailVerificationSequence(runtime, input, email, deps);
+}
+
+export function buildRegisterEmailClientInfoForTest(
+  input: DingtoneLoginInput,
+  runtime: DirectRuntimeConfig,
+  appId: string
+) {
+  return buildActivationClientInfo(input, runtime, { appId });
 }
 
 function nativeActivationEmailMd5(value: string) {
@@ -6706,12 +6870,11 @@ function nativeActivationEmailMd5(value: string) {
     .digest("hex");
 }
 
-function encryptActivationTarget(value: string, options?: { extraPaddingBlock?: boolean }) {
+function encryptActivationTarget(value: string) {
   const md5 = nativeActivationEmailMd5(value);
   const key = Buffer.from(md5.slice(0, 16), "utf8").map((byte) => (~byte) & 0xff);
   const input = Buffer.from(value, "utf8");
-  const aligned = Math.ceil(input.length / 16) * 16;
-  const padLength = options?.extraPaddingBlock ? aligned - input.length + 16 : (16 - (input.length % 16) || 16);
+  const padLength = 16 - (input.length % 16) || 16;
   const plain = Buffer.concat([input, Buffer.alloc(padLength, padLength & 0xff)]);
   const cipher = crypto.createCipheriv("aes-128-cbc", key, DIRECT_ACTIVATION_EMAIL_CRYPTO_IV);
   cipher.setAutoPadding(false);
@@ -6808,13 +6971,6 @@ function activationBusinessAppIdForVariant(appVariant?: "dingtone" | "dingdong")
 
 function resolveDirectAppVersion(identity: { appVariant?: "dingtone" | "dingdong" } | undefined, runtime: DirectRuntimeConfig) {
   return identity?.appVariant === "dingdong" ? runtime.dingdongAppVersion : runtime.appVersion;
-}
-
-function appVariantSign(appVariant: "dingtone" | "dingdong" | undefined, deviceId: string, fallback: string) {
-  if (appVariant === "dingdong") {
-    return fallback;
-  }
-  return resolveDirectAccountApkCertificateSign({ appVariant, deviceId }, fallback);
 }
 
 export function inferAccessCodeCountryCode(target: string) {
@@ -6998,6 +7154,27 @@ function parseFrame(raw: Buffer): ParsedFrame {
     route: type === 0x8107 && body.length >= 16 ? body.subarray(8, 16) : undefined,
     body
   };
+}
+
+function isDirectRouteRegistrationConfirmation(
+  frame: Pick<ParsedFrame, "type" | "status" | "body">,
+  expectedRoute: Buffer
+) {
+  return (
+    frame.type === 0x8107
+    && frame.status === 0x0102
+    && expectedRoute.length === 8
+    && frame.body.length >= 16
+    && frame.body.subarray(0, 8).equals(expectedRoute)
+    && frame.body.subarray(8, 16).equals(expectedRoute)
+  );
+}
+
+export function isDirectRouteRegistrationConfirmationForTest(
+  frame: Pick<ParsedFrame, "type" | "status" | "body">,
+  expectedRoute: Buffer
+) {
+  return isDirectRouteRegistrationConfirmation(frame, expectedRoute);
 }
 
 function frameToDirectFrameSummary(frame: ParsedFrame): DirectProbePushResult {
@@ -8602,6 +8779,10 @@ function directSessionAccountKey(account: { dtUserId: string; deviceId?: string 
   return account.dtUserId;
 }
 
+function directTransportAccountScope(account: DirectSessionAccount) {
+  return [account.appVariant ?? "dingtone", directSessionAccountKey(account), accountDeviceId(account)].join(":");
+}
+
 function createDirectRouteCoordinator(primaryHost: string) {
   let owner: string | null = null;
   let ownerEpoch = 0;
@@ -8685,7 +8866,7 @@ function getPrioritizedDirectPushHosts(
   account: { dtUserId: string; deviceId?: string | null }
 ) {
   const preferredHosts = directSmsHostAffinity.get(directSessionAccountKey(account)) ?? [];
-  return uniqueHosts([...preferredHosts, ...APP_DIRECT_PUSH_HOSTS, runtime.primaryHost, runtime.backupHost]);
+  return uniqueHosts([runtime.primaryHost, ...preferredHosts, ...APP_DIRECT_PUSH_HOSTS, runtime.backupHost]);
 }
 
 function rememberDirectSmsHost(account: { dtUserId: string; deviceId?: string | null }, host: string) {
@@ -8793,22 +8974,32 @@ export function createDirectTrackCodeGeneratorForTest(seed: string) {
   return createDirectTrackCodeGenerator(seed);
 }
 
-export async function getDirectRuntimeConfig(): Promise<DirectRuntimeConfig> {
-  const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
+function buildDirectRuntimeConfig(settings: Record<string, string>): DirectRuntimeConfig {
+  const port = Number(settings.dt_server_port || config.DT_SERVER_PORT) || config.DT_SERVER_PORT;
+  const useTls = parseBooleanSetting(settings.dt_direct_use_tls, config.DT_DIRECT_USE_TLS);
   return {
     primaryHost: settings.dt_server_ip || config.DT_SERVER_IP,
     backupHost: settings.dt_backup_ip || config.DT_BACKUP_IP,
-    port: Number(settings.dt_server_port || config.DT_SERVER_PORT) || config.DT_SERVER_PORT,
-    registerEmailPort: parsePositiveIntSetting(settings.dt_direct_register_email_port, 465, 1, 65535),
+    port,
+    registerEmailPort: parsePositiveIntSetting(settings.dt_direct_register_email_port, port, 1, 65535),
     connectTimeoutMs: 10_000,
     ioTimeoutMs: 15_000,
-    useTls: parseBooleanSetting(settings.dt_direct_use_tls, config.DT_DIRECT_USE_TLS),
-    registerEmailUseTls: parseBooleanSetting(settings.dt_direct_register_email_use_tls, true),
+    useTls,
+    registerEmailUseTls: parseBooleanSetting(settings.dt_direct_register_email_use_tls, useTls),
     appVersion: config.DT_APP_VERSION,
     dingdongAppVersion: settings.dt_dingdong_app_version || config.DT_DINGDONG_APP_VERSION,
     apkCertificateSign: config.DT_APK_CERTIFICATE_SIGN,
     proxyUrl: (settings.dt_proxy_url || config.DT_PROXY_URL || "").trim()
   };
+}
+
+export function buildDirectRuntimeConfigForTest(settings: Record<string, string>) {
+  return buildDirectRuntimeConfig(settings);
+}
+
+export async function getDirectRuntimeConfig(): Promise<DirectRuntimeConfig> {
+  const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
+  return buildDirectRuntimeConfig(settings);
 }
 
 async function getConfiguredDirectTemplate(key: DirectTemplateSettingKey): Promise<DirectActionTemplate | null> {

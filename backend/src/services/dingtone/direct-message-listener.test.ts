@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import * as directGatewayModule from "./direct-gateway.js";
 import {
   calculateDirectPairedKeepaliveDelayForTest,
   createDirectTrackCodeGeneratorForTest,
@@ -71,7 +72,7 @@ test("push and link transports share a preemptible governor and clear only after
   assert.match(source, /import \{ buildDirectTransportKey, DirectTransportGovernor, type DirectTransportPermit, type DirectTransportRole \} from "\.\/direct-transport-governor\.js"/);
   assert.match(source, /const directTransportGovernor = new DirectTransportGovernor\(\)/);
   assert.match(source, /async function waitForDirectTransportPermit/);
-  assert.match(source, /const transportKey = buildDirectTransportKey\(\{ host, port: runtime\.port, proxyUrl: runtime\.proxyUrl \}\)/);
+  assert.match(source, /const transportKey = buildDirectTransportKey\(\{[\s\S]*host,[\s\S]*port: runtime\.port,[\s\S]*proxyUrl: runtime\.proxyUrl,[\s\S]*accountScope: directTransportAccountScope\(input\.account\)[\s\S]*\}\)/);
   assert.match(source, /const transportProbeOwner = \{\}/);
 
   const workerStart = source.indexOf("const runPairedHostWorker = async");
@@ -83,6 +84,8 @@ test("push and link transports share a preemptible governor and clear only after
   const linkOpen = workerText.indexOf("await linkSession.openLink(input.account)");
   assert.ok(pushPermit >= 0 && pushPermit < pushOpen);
   assert.ok(linkPermit >= 0 && linkPermit < linkOpen);
+  const linkPermitText = workerText.slice(Math.max(0, linkPermit - 240), linkOpen);
+  assert.match(linkPermitText, /allowLinkProbe: pushSession\.isOpen\(\)/);
   assert.equal((workerText.match(/probeOwner: transportProbeOwner/g) ?? []).length, 2);
   assert.match(source, /return permit;/);
   assert.match(source, /return null;/);
@@ -124,17 +127,19 @@ test("outer push worker records each real socket failure once and ignores normal
   assert.equal((workerText.match(/directTransportGovernor\.recordFailure\(transportKey, "push"\)/g) ?? []).length, 1);
 });
 
-test("paired link read failures enter the governor once without counting normal preemption", () => {
+test("authenticated auxiliary link EOF records a shared link transport failure", () => {
   const workerStart = source.indexOf("const runPairedHostWorker = async");
   const workerEnd = source.indexOf("await Promise.allSettled(workerHosts.map(runPairedHostWorker))", workerStart);
   const workerText = workerStart >= 0 && workerEnd > workerStart ? source.slice(workerStart, workerEnd) : "";
-  const readCatchStart = workerText.indexOf('logger.info("Direct auxiliary link read ended; keeping SMS route during owner grace"');
+  const readLogStart = workerText.indexOf('logger.info("Direct auxiliary link read ended; releasing SMS route for immediate failover"');
+  const readCatchStart = workerText.lastIndexOf("catch (error) {", readLogStart);
   const readCatchEnd = workerText.indexOf("pairedFailureReported = false", readCatchStart);
   const readCatchText = readCatchStart >= 0 && readCatchEnd > readCatchStart
     ? workerText.slice(readCatchStart, readCatchEnd)
     : "";
   assert.match(readCatchText, /if \(!listener\.preempted && isDirectTransportError\(error\)\) \{\s*directTransportGovernor\.recordFailure\(transportKey, "link"\);\s*\}/);
-  assert.equal((readCatchText.match(/recordFailure\(transportKey, "link"\)/g) ?? []).length, 1);
+  assert.equal((workerText.match(/recordFailure\(transportKey, "link"\)/g) ?? []).length, 2);
+  assert.match(readCatchText, /if \(linkSession === currentLinkSession\) \{\s*releaseRouteOwnership\(\);\s*await closeLinkSession\(\);/);
   assert.match(readCatchText, /await closeLinkSession\(\)/);
 });
 
@@ -169,14 +174,20 @@ test("link health timestamp resets on close and starts only after authenticated 
   assert.match(workerText.slice(ensureStart, ensureEnd), /await linkSession\.openLink\(input\.account\);\s*linkOpenedAt = Date\.now\(\)/);
 });
 
-test("direct message listener keeps two paired gateway workers active within a window", () => {
+test("direct message listener keeps two paired workers active and rotates failed gateway hosts", () => {
   assert.match(source, /const discoveredHosts = input\.shouldContinue/);
   assert.match(source, /discoverDirectPushHostsForListener\(discoverySession, runtime, input\.account\)/);
   assert.match(source, /const hosts = uniqueHosts\(\[baseHosts\[0\] \?\? runtime\.primaryHost, \.\.\.discoveredHosts, \.\.\.baseHosts\]\)/);
   assert.match(source, /const DIRECT_PUSH_HOST_CONCURRENCY = 2/);
   assert.match(source, /const workerHosts = hosts\.slice\(0, DIRECT_PUSH_HOST_CONCURRENCY\)/);
+  assert.match(source, /const activeWorkerHosts = new Set<string>\(\)/);
+  assert.match(source, /const acquireWorkerHost = \(\) =>/);
+  assert.match(source, /if \(activeWorkerHosts\.has\(candidate\)\) \{\s*continue;\s*\}/);
+  assert.match(source, /activeWorkerHosts\.add\(candidate\)/);
+  assert.match(source, /const host = acquireWorkerHost\(\)/);
+  assert.match(source, /finally \{\s*activeWorkerHosts\.delete\(host\);\s*\}/);
   assert.match(source, /await Promise\.allSettled\(workerHosts\.map\(runPairedHostWorker\)\)/);
-  assert.match(source, /const runPairedHostWorker = async \(host: string/);
+  assert.match(source, /const runPairedHostWorker = async \(_initialHost: string\)/);
   assert.match(source, /const isWithinCurrentListenWindow = \(\) => Date\.now\(\) < deadline/);
   assert.match(source, /await pushSession\.openPush\(input\.account\)/);
   assert.match(source, /await linkSession\.openLink\(input\.account\)/);
@@ -193,6 +204,26 @@ test("direct message listener keeps two paired gateway workers active within a w
   assert.doesNotMatch(source, /hostDeadline/);
 });
 
+test("an unconfirmed paired route leaves the current host so another candidate can register", () => {
+  const workerStart = source.indexOf("const runPairedHostWorker = async");
+  const workerEnd = source.indexOf("await Promise.allSettled(workerHosts.map(runPairedHostWorker))", workerStart);
+  const workerText = workerStart >= 0 && workerEnd > workerStart ? source.slice(workerStart, workerEnd) : "";
+  const failureStart = workerText.indexOf('logger.warn("Direct paired link registration failed; rotating SMS gateway"');
+  const failureEnd = workerText.indexOf("const remainingFrames", failureStart);
+  const failureText = failureStart >= 0 && failureEnd > failureStart ? workerText.slice(failureStart, failureEnd) : "";
+  assert.match(failureText, /await delay\(Math\.min\(DIRECT_RECONNECT_BACKOFF_MAX_MS, 500\)\);\s*break;/);
+  assert.doesNotMatch(failureText, /continue;/);
+});
+
+test("an ineligible standby host yields when no route owner exists", () => {
+  const workerStart = source.indexOf("const runPairedHostWorker = async");
+  const workerEnd = source.indexOf("await Promise.allSettled(workerHosts.map(runPairedHostWorker))", workerStart);
+  const workerText = workerStart >= 0 && workerEnd > workerStart ? source.slice(workerStart, workerEnd) : "";
+  assert.match(workerText, /const routeReserved = reserveRouteRegistration\(\)/);
+  assert.match(workerText, /if \(!routeReserved && routeCoordinator\.ownerHost\(\) === null\) \{[\s\S]*Direct standby gateway yielded because no route owner can promote it[\s\S]*break;/);
+  assert.match(workerText, /if \(routeReserved\) \{\s*currentLinkSession = await ensureLinkSession\(\);\s*\}/);
+});
+
 test("direct message listener discovers account-specific gateways without overwriting the SMS route", () => {
   const start = source.indexOf("async function discoverDirectPushHostsForListener");
   const end = source.indexOf("async function runPushMaintenanceCalls", start);
@@ -206,7 +237,7 @@ test("direct message listener discovers account-specific gateways without overwr
 });
 
 test("primary routing is deterministic and backup registration requires promotion", () => {
-  assert.match(source, /const registrationOwnerHost = workerHosts\[0\] \?\? runtime\.primaryHost/);
+  assert.match(source, /const registrationOwnerHost = hosts\[0\] \?\? runtime\.primaryHost/);
   assert.match(source, /const routeCoordinator = createDirectRouteCoordinator\(registrationOwnerHost\)/);
   assert.match(source, /if \(!routeCoordinator\.shouldClaim\(host, now\)\)/);
   assert.match(source, /routeCoordinator\.markPrimaryUnavailable\(\)/);
@@ -393,13 +424,13 @@ test("fatal paired link failures are not reported again by the worker catch", ()
   assert.match(source, /if \(!pairedFailureReported\) \{\s*await reportHostStatus\(host, "failed",/);
 });
 
-test("direct message listener prioritizes gateways that delivered SMS", () => {
+test("direct message listener keeps the official control gateway first and then uses SMS affinity", () => {
   assert.match(source, /"20\.97\.117\.109"/);
   assert.match(source, /"206\.189\.228\.89"/);
   assert.match(source, /const directSmsHostAffinity = new TtlLruCache/);
   assert.match(source, /rememberDirectSmsHost\(input\.account, frameHost\)/);
   assert.match(source, /getPrioritizedDirectPushHosts\(runtime, input\.account\)/);
-  assert.match(source, /uniqueHosts\(\[\.\.\.preferredHosts, \.\.\.APP_DIRECT_PUSH_HOSTS, runtime\.primaryHost, runtime\.backupHost\]\)/);
+  assert.match(source, /uniqueHosts\(\[runtime\.primaryHost, \.\.\.preferredHosts, \.\.\.APP_DIRECT_PUSH_HOSTS, runtime\.backupHost\]\)/);
 });
 
 test("direct message listener fails the monitor cycle when no gateway session opens", () => {
@@ -422,13 +453,57 @@ test("direct message listener enters push read loop without asset refresh prime 
   assert.doesNotMatch(source, /listenPrime\.glbUserPropertites/);
   assert.doesNotMatch(source, /listenPrime\.gwebInfoBus/);
 });
-test("direct message listener rebuilds an owner link without registering the route twice", () => {
+test("direct message listener re-registers the SMS route on every rebuilt owner link", () => {
   const registerStart = source.indexOf("const ensureRouteRegistration = async");
   const registerEnd = source.indexOf("const ensureLinkSession = async", registerStart);
   const registerText = registerStart >= 0 && registerEnd > registerStart ? source.slice(registerStart, registerEnd) : "";
-  assert.match(registerText, /routeCoordinator\.renewOwner\(host, routeLeaseEpoch\)[\s\S]*return true/);
+  assert.match(registerText, /const renewingLease = routeLeaseEpoch !== null && routeCoordinator\.renewOwner\(host, routeLeaseEpoch\)/);
+  assert.match(registerText, /if \(renewingLease && linkOwnsRoute\) \{\s*return true;\s*\}/);
+  assert.doesNotMatch(registerText, /if \(renewingLease\) \{\s*return true;\s*\}/);
+  assert.match(registerText, /const registrationEpoch = renewingLease \? routeLeaseEpoch : linkReservationEpoch/);
   assert.ok(registerText.indexOf("renewOwner") < registerText.indexOf("runPushLinkRegistration"));
-  assert.doesNotMatch(registerText, /confirmOwner/);
+});
+test("paired route ownership requires the server confirmation for the current route", () => {
+  const isConfirmation = (directGatewayModule as Record<string, unknown>)
+    .isDirectRouteRegistrationConfirmationForTest;
+  assert.equal(typeof isConfirmation, "function");
+  if (typeof isConfirmation !== "function") {
+    return;
+  }
+
+  const route = Buffer.from("ec87000300503c2e", "hex");
+  const otherRoute = Buffer.from("ec87000300503c2f", "hex");
+  const invoke = isConfirmation as (
+    frame: { type: number; status?: number; body: Buffer },
+    expectedRoute: Buffer
+  ) => boolean;
+  assert.equal(invoke({ type: 0x8107, status: 0x0102, body: Buffer.concat([route, route, Buffer.alloc(77)]) }, route), true);
+  assert.equal(invoke({ type: 0x8107, status: 0x0102, body: Buffer.concat([route, Buffer.alloc(8), Buffer.alloc(77)]) }, route), false);
+  assert.equal(invoke({ type: 0x8107, status: 0x0102, body: Buffer.concat([otherRoute, otherRoute]) }, route), false);
+  assert.equal(invoke({ type: 0x8107, status: 0x0103, body: Buffer.concat([route, route]) }, route), false);
+  assert.equal(invoke({ type: 0x8106, status: 0x0102, body: Buffer.concat([route, route]) }, route), false);
+});
+test("route registration waits for confirmation without swallowing SMS pushes", () => {
+  const registrationStart = source.indexOf("  async registerClientLink(");
+  const registrationEnd = source.indexOf("  async callCommonRestJson", registrationStart);
+  const registrationText = registrationStart >= 0 && registrationEnd > registrationStart
+    ? source.slice(registrationStart, registrationEnd)
+    : "";
+  const captureArmed = registrationText.indexOf("this.routeRegistrationCaptureUntil = deadline");
+  const registrationWrite = registrationText.indexOf('await this.sendJson("updateClientLink", params)');
+  assert.ok(captureArmed >= 0 && captureArmed < registrationWrite, "confirmation capture must be armed before the request write");
+  assert.match(registrationText, /await this\.sendJson\("updateClientLink", params\)/);
+  assert.match(registrationText, /isDirectRouteRegistrationConfirmation\(frame, this\.route\)/);
+  assert.match(registrationText, /const push = frameToDirectPush\(frame\);\s*if \(push\.sms \|\| isNotifyOnlyMessageIndexPush\(push\)\) \{\s*this\.pendingPushes\.push\(push\);\s*\}/);
+  assert.match(registrationText, /finally \{\s*this\.routeRegistrationCaptureUntil = 0;\s*\}/);
+  assert.match(source, /parsed\.status === 0x0102 && Date\.now\(\) <= this\.routeRegistrationCaptureUntil/);
+
+  const runStart = source.indexOf("async function runPushLinkRegistration");
+  const runEnd = source.indexOf("async function sendPushTemplateCall", runStart);
+  const runText = runStart >= 0 && runEnd > runStart ? source.slice(runStart, runEnd) : "";
+  assert.match(runText, /await session\.registerClientLink\(/);
+  assert.match(runText, /payload: \{ confirmed: true \}/);
+  assert.doesNotMatch(runText, /sendPushTemplateCall/);
 });
 test("direct message listener repairs the link without closing a healthy push socket", () => {
   const start = source.indexOf("const ensureLinkSession = async");
@@ -450,7 +525,7 @@ test("auxiliary link closure starts grace without releasing the worker route lea
   assert.match(source, /const releaseRouteOwnership = \(\) =>/);
   assert.match(source, /let currentLinkSession = linkSession as DirectSession \| null/);
   assert.match(source, /if \(currentLinkSession && !currentLinkSession\.isOpen\(\)\) \{\s*await closeLinkSession\(\);\s*currentLinkSession = null/);
-  assert.match(source, /if \(!currentLinkSession && reserveRouteRegistration\(\)\)/);
+  assert.match(source, /if \(!currentLinkSession\) \{\s*const routeReserved = reserveRouteRegistration\(\)/);
 });
 test("direct message listener reserves one route owner before opening an authenticated link", () => {
   const workerStart = source.indexOf("const runPairedHostWorker = async");
@@ -466,7 +541,7 @@ test("direct message listener reserves one route owner before opening an authent
   const create = ensureText.indexOf("new DirectSession(runtime, host)");
   assert.ok(reserve >= 0);
   assert.ok(create > reserve);
-  assert.match(workerText, /if \(!currentLinkSession && reserveRouteRegistration\(\)\) \{\s*currentLinkSession = await ensureLinkSession\(\);\s*\}/);
+  assert.match(workerText, /if \(routeReserved\) \{\s*currentLinkSession = await ensureLinkSession\(\);\s*\}/);
   assert.match(ensureText, /if \(!reserveRouteRegistration\(\)\) \{\s*return null;\s*\}/);
   assert.doesNotMatch(workerText, /Direct SMS route is reserved by another paired worker/);
 });
@@ -595,15 +670,17 @@ test("direct push socket probe mirrors the app's paired connection order", () =>
   assert.doesNotMatch(text, /runPushLinkRegistration\(pushSession/);
   assert.doesNotMatch(text, /runPushMaintenanceCalls/);
 });
-test("paired direct sockets align the first five-second heartbeat to socket connection time", () => {
+test("authenticated link heartbeat starts only after bootstrap registration completes", () => {
   assert.match(source, /const DIRECT_LINK_BOOTSTRAP_WAIT_MS = 1_250/);
   assert.match(source, /const DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS = 5_000/);
   const openStart = source.indexOf("  async openPush(account: DirectSessionAccount)");
   const openEnd = source.indexOf("  private async openPrelogin", openStart);
   const openText = openStart >= 0 && openEnd > openStart ? source.slice(openStart, openEnd) : "";
   assert.match(openText, /await this\.openPrelogin\(account\);\s*this\.startPairedKeepalive\(\s*this\.socketConnectedAt \+ DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS,\s*DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS\s*\)/);
-  assert.match(openText, /async openLink\(account: DirectSessionAccount\)\s*\{\s*await this\.openPrelogin\(account\);\s*await this\.bootstrapAuthenticatedSession\(account, DIRECT_LINK_BOOTSTRAP_WAIT_MS, async \(\) => \{\s*await this\.primeLinkRegistration\(account\);\s*\}\);\s*this\.startPairedKeepalive\(\s*this\.socketConnectedAt \+ DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS,\s*DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS\s*\);\s*\}/);
-  assert.doesNotMatch(openText, /startSocketKeepalive/);
+  const linkStart = openText.indexOf("  async openLink(account: DirectSessionAccount)");
+  const linkText = linkStart >= 0 ? openText.slice(linkStart) : "";
+  assert.match(linkText, /await this\.openPrelogin\(account\);\s*await this\.bootstrapAuthenticatedSession\(account, DIRECT_LINK_BOOTSTRAP_WAIT_MS, async \(\) => \{\s*await this\.primeLinkRegistration\(account\);\s*\}\);\s*await this\.startSocketKeepalive\(\);/);
+  assert.doesNotMatch(linkText, /startPairedKeepalive/);
   const preloginStart = source.indexOf("  private async openPrelogin(");
   const preloginEnd = source.indexOf("  async openActivation", preloginStart);
   const preloginText = preloginStart >= 0 && preloginEnd > preloginStart ? source.slice(preloginStart, preloginEnd) : "";
@@ -688,6 +765,13 @@ test("session TrackCode generator advances by the native low-12-bit stride", () 
   assert.equal(directTrackCodesMatchForTest(first, first), true);
   assert.equal(directTrackCodesMatchForTest(second, first), false);
 });
+test("registerEmail uses standard PKCS7 padding for non-block-aligned email addresses", () => {
+  const start = source.indexOf("function buildRegisterEmailJson(");
+  const end = source.indexOf("function buildActivationClientInfo", start);
+  const text = start >= 0 && end > start ? source.slice(start, end) : "";
+  assert.match(text, /EmailEncrypt: encryptActivationTarget\(lowerEmail\)/);
+  assert.doesNotMatch(text, /extraPaddingBlock/);
+});
 test("authenticated bootstrap correlates ordinary errors with its login TrackCode", () => {
   const start = source.indexOf("  private async bootstrapAuthenticatedSession(");
   const end = source.indexOf("  private async drainBootstrapFrames(", start);
@@ -710,11 +794,11 @@ test("direct link session reproduces the app's pre-registration initialization o
   const prelogin = openText.indexOf("await this.openPrelogin(account)");
   const bootstrap = openText.indexOf("await this.bootstrapAuthenticatedSession(account, DIRECT_LINK_BOOTSTRAP_WAIT_MS");
   const prime = openText.indexOf("await this.primeLinkRegistration(account)");
-  const keepaliveArmed = openText.indexOf("this.startPairedKeepalive(");
+  const keepaliveArmed = openText.indexOf("await this.startSocketKeepalive()");
   assert.ok(prelogin >= 0);
   assert.ok(bootstrap > prelogin);
+  assert.ok(keepaliveArmed > bootstrap);
   assert.ok(prime > bootstrap);
-  assert.ok(keepaliveArmed > prime);
 
   const bootstrapStart = source.indexOf("  private async bootstrapAuthenticatedSession(");
   const bootstrapEnd = source.indexOf("  private findBootstrapError", bootstrapStart);
@@ -857,7 +941,7 @@ test("direct listener reconnects after a closed socket instead of treating it as
 });
 test("direct listener keeps the authenticated socket alive with an in-session keepalive frame", () => {
   assert.match(source, /const DIRECT_SESSION_KEEPALIVE_INTERVAL_MS = 5_000/);
-  assert.match(source, /const DINGDONG_SESSION_KEEPALIVE_INTERVAL_MS = 2_000/);
+  assert.match(source, /const DINGDONG_SESSION_KEEPALIVE_INTERVAL_MS = 5_000/);
   assert.match(source, /function directSessionKeepaliveIntervalMs\(account/);
   assert.match(source, /account\?\.appVariant === "dingdong"\s*\? DINGDONG_SESSION_KEEPALIVE_INTERVAL_MS\s*:\s*DIRECT_SESSION_KEEPALIVE_INTERVAL_MS/);
   assert.match(source, /private keepaliveWriteCount = 0/);

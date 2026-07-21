@@ -46,7 +46,7 @@ test("health payload returns null instance id and clamps negative uptime", () =>
 
 test("health payload exposes the coordinated runtime state when supplied", () => {
   const payload = buildHealthPayload({
-    version: "0.2.11",
+    version: "0.2.12",
     gatewayMode: "direct",
     startedAt: new Date("2026-07-18T00:00:00.000Z"),
     now: new Date("2026-07-18T00:00:01.000Z"),

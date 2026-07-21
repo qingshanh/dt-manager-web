@@ -65,6 +65,26 @@ test("one half-open paired probe can acquire push and link once without admittin
   assert.deepEqual(governor.beforeAttempt(key, "link", ownerA), { allowed: false, waitMs: 500, probe: false });
 });
 
+test("an authenticated link can initiate the half-open probe while its paired push socket remains open", () => {
+  let now = 0;
+  const governor = new DirectTransportGovernor({
+    now: () => now,
+    random: () => 0.5,
+    openAfterFailures: 1,
+    openDurationMs: 1_000
+  });
+  const key = "paired-link-recovery:80";
+  const owner = {};
+
+  governor.recordFailure(key, "link");
+  now = 1_000;
+
+  assert.deepEqual(
+    (governor.beforeAttempt as any)(key, "link", owner, { allowLinkProbe: true }),
+    { allowed: true, waitMs: 0, probe: true }
+  );
+});
+
 test("abandoned half-open probe releases only its owner and retries after the minimum delay", () => {
   let now = 0;
   const governor = new DirectTransportGovernor({
@@ -176,7 +196,32 @@ test("transport keys redact proxy credentials and direct keys contain only host 
       port: 80,
       proxyUrl: "http://private-user:private-password@proxy.example:3066/sensitive-path?token=secret"
     }),
-    "proxy:http://proxy.example:3066"
+    "proxy:http://proxy.example:3066->20.97.117.109:80"
+  );
+  assert.notEqual(
+    buildDirectTransportKey({ host: "20.97.117.109", port: 80, proxyUrl: "http://proxy.example:3066" }),
+    buildDirectTransportKey({ host: "206.189.228.89", port: 80, proxyUrl: "http://proxy.example:3066" })
   );
   assert.equal(buildDirectTransportKey({ host: "20.97.117.109", port: 80, proxyUrl: "" }), "20.97.117.109:80");
+});
+
+test("transport keys isolate accounts sharing one gateway without exposing account identity", () => {
+  const accountA = "dingtone:account-433:user-145000000000001";
+  const accountB = "dingtone:account-440:user-145000000000002";
+  const keyA = buildDirectTransportKey({
+    host: "20.97.117.109",
+    port: 80,
+    proxyUrl: "",
+    accountScope: accountA
+  } as any);
+  const keyB = buildDirectTransportKey({
+    host: "20.97.117.109",
+    port: 80,
+    proxyUrl: "",
+    accountScope: accountB
+  } as any);
+
+  assert.notEqual(keyA, keyB);
+  assert.doesNotMatch(keyA, /account-433|145000000000001/);
+  assert.doesNotMatch(keyB, /account-440|145000000000002/);
 });

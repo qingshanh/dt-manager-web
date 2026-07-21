@@ -922,7 +922,7 @@ function checkDirectEmailActivationNativeParams() {
     activationBlock.includes('queryPair("simCC", "CN")') &&
     activationBlock.includes('queryPair("simu", 0)') &&
     activationBlock.includes('queryPair("rooted", 1)') &&
-    activationBlock.includes('queryPair("json", buildActivationEmailJson(email))') &&
+    activationBlock.includes('queryPair("json", buildActivationEmailJson(email, input.appVariant))') &&
     activationBlock.includes('queryPair("clientInfo", buildActivationClientInfo(input, runtime))') &&
     activationBlock.includes('queryPair("pushMessageToken", "FCM.")');
   const activationJsonShape =
@@ -931,7 +931,7 @@ function checkDirectEmailActivationNativeParams() {
     activationJsonBlock.includes("EmailEncrypt: encryptActivationTarget(lowerEmail)") &&
     activationJsonBlock.includes("RawEmailMD5: nativeActivationEmailMd5(email)") &&
     gatewayText.includes("DIRECT_ACTIVATION_EMAIL_CRYPTO_IV") &&
-    activationJsonBlock.includes("ClientVersion: DIRECT_ACTIVATE_EMAIL_CLIENT_VERSION") &&
+    activationJsonBlock.includes("ClientVersion: directActivationClientVersion(appVariant)") &&
     activationJsonBlock.includes("type: 1");
   const sendVerificationBlock = extractMethodBlock(gatewayText, "async sendVerificationCode(input: DingtoneLoginInput)");
   const avoidsRecoverPasswordFallback =
@@ -970,7 +970,9 @@ function checkDirectEmailActivationNativeParams() {
     loginBlock.includes("input.deviceId ?? templateDeviceId ?? extractActivationDeviceId(payload)");
   const persistsActivationDingtoneId =
     persistBlock.includes("dingtoneId?: string | null") &&
-    persistBlock.includes("dtDingtoneId: session.dingtoneId");
+    persistBlock.includes("transaction.accountSnapshot.upsert") &&
+    persistBlock.includes("dtDingtoneId: session.dingtoneId") &&
+    !persistBlock.slice(0, persistBlock.indexOf("if (session.dingtoneId)")).includes("dtDingtoneId");
   return {
     name: "direct_email_activation_native_params",
     ok:
@@ -1007,13 +1009,7 @@ function checkDirectActivationVariantTemplates() {
   const templateText = readSourceFile("src/services/dingtone/direct-template.ts");
   const settingsText = readSourceFile("src/services/settings.service.ts");
   const importText = readSourceFile("src/scripts/import-direct-template.ts");
-  const activationApiBlock = extractFunctionBlock(gatewayText, "callDirectActivationApi");
-  const registerBranchStart = activationApiBlock.indexOf('if (apiName === "registerEmail")');
-  const registerBranchEnd = activationApiBlock.indexOf('activationTemplateSettingKeys("registerEmail", identity)', registerBranchStart);
-  const registerBranch =
-    registerBranchStart >= 0 && registerBranchEnd >= registerBranchStart
-      ? activationApiBlock.slice(registerBranchStart, registerBranchEnd)
-      : "";
+  const registerSequenceBlock = extractFunctionBlock(gatewayText, "callDirectEmailVerificationSequence");
   const hasVariantKeys =
     templateText.includes('"dt_direct_template_register_email_talku"') &&
     templateText.includes('"dt_direct_template_register_email_dingdong"') &&
@@ -1028,11 +1024,11 @@ function checkDirectActivationVariantTemplates() {
     gatewayText.includes('activationTemplateSettingKeys("registerEmail", identity)') &&
     !gatewayText.includes('getConfiguredDirectTemplate("dt_direct_template_register_email"))');
   const registerPatchesCurrentEmail =
-    activationApiBlock.includes("buildRegisterEmailTemplateParams(query)") &&
+    registerSequenceBlock.includes("buildRegisterEmailTemplateParams(registerQuery)") &&
     gatewayText.includes("function buildRegisterEmailTemplateParams(query: string)") &&
-    gatewayText.includes('__appendQueryKeys: "appType,appId"') &&
-    activationApiBlock.includes("callConfiguredRegisterEmailTemplate") &&
-    activationApiBlock.includes('activationTemplateSettingKeys("registerEmail", identity)');
+    !gatewayText.includes('__appendQueryKeys: "appType,appId"') &&
+    registerSequenceBlock.includes("callConfiguredRegisterEmailTemplate") &&
+    registerSequenceBlock.includes('activationTemplateSettingKeys("registerEmail", identity)');
   const routeChecksAccountVariant =
     routeText.includes("appVariant: account.appVariant") &&
     routeText.includes("normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType)");
@@ -1199,7 +1195,7 @@ function checkDirectVerificationRandomDeviceIds() {
     /body\.device_id\s*\?\?\s*existing\?\.dtDeviceId\s*\?\?\s*createDeviceId\(\)/m.test(createAccountBlock);
   const resendUsesFreshPair =
     resendBlock.includes("const deviceId = createDeviceId();") &&
-    resendBlock.includes("const trackCode = createTrackCode();") &&
+    resendBlock.includes("const trackCode = createActivationTrackCode();") &&
     resendBlock.includes("dtDeviceId: deviceId") &&
     resendBlock.includes("dtTrackCode: trackCode");
   const sendCallIndex = Math.max(
@@ -1240,7 +1236,7 @@ function checkDirectVerificationRandomDeviceIds() {
 
 function checkDirectProxySupport() {
   const gatewayText = readSourceFile("src/services/dingtone/direct-gateway.ts");
-  const runtimeBlock = extractFunctionBlock(gatewayText, "getDirectRuntimeConfig");
+  const runtimeBlock = extractFunctionBlock(gatewayText, "buildDirectRuntimeConfig");
   const connectBlock = extractMethodBlock(gatewayText, "private async connectSocket");
   const proxyFunctionBlock = extractFunctionBlock(gatewayText, "connectSocketViaHttpProxy");
   const runtimeReadsProxy =

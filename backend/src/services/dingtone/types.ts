@@ -133,6 +133,7 @@ export type VerificationRequestResult = {
   verificationFlow?: "recover" | "register";
   expectedDtUserId?: string;
   expectedDingtoneId?: string;
+  nextTrackCode?: string;
 };
 
 export type DingtoneGateway = {
