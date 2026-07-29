@@ -430,7 +430,7 @@ function PhoneTags({ phone }: { phone: PhoneInventoryPhone }) {
       {phone.is_good_number && <Tag color="purple">靓号</Tag>}
       {phone.auto_renew && <Tag color="cyan">自动续费</Tag>}
       <Tag color={phone.allow_receive_sms === false ? 'error' : phone.allow_receive_sms === true ? 'success' : 'default'}>
-        短信{phone.allow_receive_sms === false ? '关闭' : phone.allow_receive_sms === true ? '开启' : '未知'}
+        {phone.allow_receive_sms === false ? '短信接收关闭' : phone.allow_receive_sms === true ? '短信接收开启' : '短信设置未确认'}
       </Tag>
     </Space>
   );
@@ -458,7 +458,7 @@ function PhoneDetails({ phone }: { phone: PhoneInventoryPhone }) {
       <Descriptions.Item label="主号码">{phone.is_primary ? '是' : '否'}</Descriptions.Item>
       <Descriptions.Item label="靓号">{phone.is_good_number ? '是' : '否'}</Descriptions.Item>
       <Descriptions.Item label="短信接收">
-        {phone.allow_receive_sms === null ? '未知' : phone.allow_receive_sms ? '开启' : '关闭'}
+        {phone.allow_receive_sms === null ? '设置未确认' : phone.allow_receive_sms ? '接收开启' : '接收关闭'}
       </Descriptions.Item>
       <Descriptions.Item label="携号转出信息">{phone.portout_info || '-'}</Descriptions.Item>
       <Descriptions.Item label="本地创建时间">{formatDate(phone.created_at)}</Descriptions.Item>

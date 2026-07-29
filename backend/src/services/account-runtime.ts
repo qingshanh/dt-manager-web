@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma.js";
 import { AppError, assertFound } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
 import { repairUtf8Mojibake, serializeSnapshot } from "../utils/serializers.js";
+import { resolveRefreshedAccountNickname } from "../utils/account-name.js";
 import { decryptText } from "../utils/crypto.js";
 import { dingtoneGateway } from "./dingtone/index.js";
 import { RealDingtoneGateway } from "./dingtone/real-gateway.js";
@@ -19,10 +20,34 @@ const ADB_POINT_WAIT_MS = 5_000;
 const PUBLIC_ENRICHMENT_WAIT_MS = 8_000;
 const PHONE_LIST_WAIT_MS = 25_000;
 
+export type AccountRuntimeRefreshOptions = {
+  includePhoneNumbers?: boolean;
+  allowHelperSnapshot?: boolean;
+  allowAdbPoint?: boolean;
+  includePublicEnrichment?: boolean;
+  persistCachedSnapshot?: boolean;
+  gatewaySnapshotWaitMs?: number;
+  helperSnapshotWaitMs?: number;
+  adbPointWaitMs?: number;
+  publicEnrichmentWaitMs?: number;
+  phoneListWaitMs?: number;
+};
+
 export async function refreshAccountRuntimeData(
   accountId: number,
-  gateway: Pick<DingtoneGateway, "refreshSnapshot" | "listPhoneNumbers"> = dingtoneGateway
+  gateway: Pick<DingtoneGateway, "refreshSnapshot" | "listPhoneNumbers"> = dingtoneGateway,
+  options: AccountRuntimeRefreshOptions = {}
 ) {
+  const includePhoneNumbers = options.includePhoneNumbers ?? true;
+  const allowHelperSnapshot = options.allowHelperSnapshot ?? true;
+  const allowAdbPoint = options.allowAdbPoint ?? true;
+  const includePublicEnrichment = options.includePublicEnrichment ?? true;
+  const persistCachedSnapshot = options.persistCachedSnapshot ?? true;
+  const gatewaySnapshotWaitMs = options.gatewaySnapshotWaitMs ?? GATEWAY_SNAPSHOT_WAIT_MS;
+  const helperSnapshotWaitMs = options.helperSnapshotWaitMs ?? HELPER_SNAPSHOT_WAIT_MS;
+  const adbPointWaitMs = options.adbPointWaitMs ?? ADB_POINT_WAIT_MS;
+  const publicEnrichmentWaitMs = options.publicEnrichmentWaitMs ?? PUBLIC_ENRICHMENT_WAIT_MS;
+  const phoneListWaitMs = options.phoneListWaitMs ?? PHONE_LIST_WAIT_MS;
   const account = await assertFound(
     await prisma.dtAccount.findUnique({
       where: { id: accountId }
@@ -45,7 +70,7 @@ export async function refreshAccountRuntimeData(
       phone: account.phone,
       appVariant: account.appVariant
     }),
-    GATEWAY_SNAPSHOT_WAIT_MS,
+    gatewaySnapshotWaitMs,
     null
   ).catch((error: unknown) => {
     snapshotError = error;
@@ -58,12 +83,12 @@ export async function refreshAccountRuntimeData(
     logger.warn("Account snapshot refresh did not complete in time, using cached snapshot", {
       accountId,
       dtUserId,
-      timeoutMs: GATEWAY_SNAPSHOT_WAIT_MS,
+      timeoutMs: gatewaySnapshotWaitMs,
       error: snapshotError instanceof Error ? snapshotError.message : snapshotError ? String(snapshotError) : null
     });
   }
   const baseSnapshot = gatewaySnapshot ?? snapshotFromStored(previousSnapshot!);
-  const helperSnapshotCandidate = (await shouldMergeHelperSnapshot(account.loginType, baseSnapshot))
+  const helperSnapshotCandidate = allowHelperSnapshot && (await shouldMergeHelperSnapshot(account.loginType, baseSnapshot))
     ? await withSoftTimeout(
         helperSnapshotGateway.refreshSnapshot({
           dtUserId,
@@ -73,77 +98,84 @@ export async function refreshAccountRuntimeData(
           phone: account.phone,
           appVariant: account.appVariant
         }),
-        HELPER_SNAPSHOT_WAIT_MS,
+        helperSnapshotWaitMs,
         null
       ).catch(() => null)
     : null;
   const helperSnapshot = snapshotBelongsToDtUserId(helperSnapshotCandidate, dtUserId) ? helperSnapshotCandidate : null;
   const baseMergedSnapshot = mergeSnapshots(baseSnapshot, helperSnapshot);
-  const adbPointSnapshot = (await shouldMergeAdbPointSnapshot(account.loginType, baseMergedSnapshot))
-    ? await withSoftTimeout(readPointSnapshotFromAdb(account.appVariant, dtUserId), ADB_POINT_WAIT_MS, null).catch(() => null)
+  const adbPointSnapshot = allowAdbPoint && (await shouldMergeAdbPointSnapshot(account.loginType, baseMergedSnapshot))
+    ? await withSoftTimeout(readPointSnapshotFromAdb(account.appVariant, dtUserId), adbPointWaitMs, null).catch(() => null)
     : null;
   const mergedGatewaySnapshot = mergeSnapshots(baseMergedSnapshot, adbPointSnapshot);
-  const snapshot = await withSoftTimeout(
-    enrichSnapshotWithPublicData({
-      appVariant: account.appVariant,
-      dtUserId,
-      snapshot: mergedGatewaySnapshot,
-      previousRawJson: previousSnapshot?.rawJson
-    }),
-    PUBLIC_ENRICHMENT_WAIT_MS,
-    mergedGatewaySnapshot
-  ).catch(() => mergedGatewaySnapshot);
-  await prisma.accountSnapshot.upsert({
-    where: { accountId },
-    update: mapSnapshot(snapshot, previousSnapshot),
-    create: {
-      accountId,
-      ...mapSnapshot(snapshot, previousSnapshot)
-    }
-  });
+  const snapshot = includePublicEnrichment
+    ? await withSoftTimeout(
+        enrichSnapshotWithPublicData({
+          appVariant: account.appVariant,
+          dtUserId,
+          snapshot: mergedGatewaySnapshot,
+          previousRawJson: previousSnapshot?.rawJson
+        }),
+        publicEnrichmentWaitMs,
+        mergedGatewaySnapshot
+      ).catch(() => mergedGatewaySnapshot)
+    : mergedGatewaySnapshot;
+  if (gatewaySnapshot || persistCachedSnapshot) {
+    await prisma.accountSnapshot.upsert({
+      where: { accountId },
+      update: mapSnapshot(snapshot, previousSnapshot),
+      create: {
+        accountId,
+        ...mapSnapshot(snapshot, previousSnapshot)
+      }
+    });
+  }
 
   let phoneListError: unknown;
   let phoneNumbers: DingtonePhoneNumber[] = [];
+  let phoneListAttempted = false;
   let phoneListResolved = false;
-  const remotePhoneNumbers = await withSoftTimeout(
-    gateway.listPhoneNumbers({ dtUserId, token, deviceId: account.dtDeviceId, appVariant: account.appVariant }),
-    PHONE_LIST_WAIT_MS,
-    null
-  ).catch((error: unknown) => {
-    phoneListError = error;
-    return null;
-  });
-  if (remotePhoneNumbers !== null) {
-    phoneListResolved = true;
-    phoneNumbers = remotePhoneNumbers;
-  } else if (phoneListError) {
-    logger.warn("Phone list refresh failed, keeping local phone records", {
-      accountId,
-      dtUserId,
-      error: phoneListError instanceof Error ? phoneListError.message : String(phoneListError)
+  if (includePhoneNumbers) {
+    phoneListAttempted = true;
+    const remotePhoneNumbers = await withSoftTimeout(
+      gateway.listPhoneNumbers({ dtUserId, token, deviceId: account.dtDeviceId, appVariant: account.appVariant }),
+      phoneListWaitMs,
+      null
+    ).catch((error: unknown) => {
+      phoneListError = error;
+      return null;
     });
-  }
-  if (phoneNumbers.length === 0 && helperSnapshot) {
-    phoneNumbers = (await withSoftTimeout(
-      helperSnapshotGateway.listPhoneNumbers({ dtUserId, token, deviceId: account.dtDeviceId, appVariant: account.appVariant }),
-      HELPER_SNAPSHOT_WAIT_MS,
-      []
-    ).catch(() => [])) as DingtonePhoneNumber[];
-  }
+    if (remotePhoneNumbers !== null) {
+      phoneListResolved = true;
+      phoneNumbers = remotePhoneNumbers;
+    } else if (phoneListError) {
+      logger.warn("Phone list refresh failed, keeping local phone records", {
+        accountId,
+        dtUserId,
+        error: phoneListError instanceof Error ? phoneListError.message : String(phoneListError)
+      });
+    }
+    if (phoneNumbers.length === 0 && helperSnapshot) {
+      phoneNumbers = (await withSoftTimeout(
+        helperSnapshotGateway.listPhoneNumbers({ dtUserId, token, deviceId: account.dtDeviceId, appVariant: account.appVariant }),
+        helperSnapshotWaitMs,
+        []
+      ).catch(() => [])) as DingtonePhoneNumber[];
+    }
 
-  if (phoneNumbers.length > 0) {
-    await syncPhoneNumbers(accountId, phoneNumbers);
-  } else {
-    logger.warn("Direct refresh returned an empty phone list, keeping local records", {
-      accountId,
-      dtUserId
-    });
+    if (phoneNumbers.length > 0) {
+      await syncPhoneNumbers(accountId, phoneNumbers);
+    } else {
+      logger.warn("Direct refresh returned an empty phone list, keeping local records", {
+        accountId,
+        dtUserId
+      });
+    }
   }
 
   const normalizedNickname = normalizeOptionalString(account.nickname);
-  const snapshotName = normalizeOptionalString(snapshot.fullName);
-  if (!normalizedNickname || shouldReplaceNickname(normalizedNickname, snapshotName, account)) {
-    const autoName = snapshotName || account.email || account.phone || account.dtUserId || "Untitled Account";
+  const autoName = resolveRefreshedAccountNickname(account.nickname, snapshot.fullName, account);
+  if (!normalizedNickname || autoName !== normalizedNickname) {
     await prisma.dtAccount.update({
       where: { id: accountId },
       data: {
@@ -163,6 +195,7 @@ export async function refreshAccountRuntimeData(
     assetSignals: {
       gatewaySnapshotResolved: Boolean(gatewaySnapshot),
       balanceResolved: gatewaySnapshot?.primaryBalance !== undefined,
+      phoneListAttempted,
       phoneListResolved,
       remotePhoneCount: phoneNumbers.length,
       primaryBalance: gatewaySnapshot?.primaryBalance ?? null,
@@ -386,30 +419,6 @@ function normalizeOptionalString(value: string | null | undefined) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function shouldReplaceNickname(
-  currentNickname: string | null,
-  snapshotName: string | null,
-  account?: { email?: string | null; phone?: string | null; dtUserId?: string | null }
-) {
-  if (!currentNickname || !snapshotName) {
-    return false;
-  }
-  const normalizedNickname = normalizeOptionalString(currentNickname);
-  if (normalizedNickname && isAutoGeneratedAccountName(normalizedNickname, account)) {
-    return true;
-  }
-  const repairedNickname = repairUtf8Mojibake(currentNickname);
-  return repairedNickname !== currentNickname && repairedNickname === snapshotName;
-}
-
-function isAutoGeneratedAccountName(value: string, input?: { email?: string | null; phone?: string | null; dtUserId?: string | null }) {
-  const normalized = normalizeOptionalString(value);
-  if (!normalized || !input) {
-    return false;
-  }
-  return [input.email, input.phone, input.dtUserId].some((item) => normalizeOptionalString(item) === normalized);
 }
 
 function requireString(value: string | null, message: string) {

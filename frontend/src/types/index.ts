@@ -33,17 +33,21 @@ export interface AdminUser {
 export type LoginType = 'email_code' | 'phone_code' | 'email_password' | 'phone_password' | 'manual_session';
 export type AppVariant = 'dingtone' | 'dingdong';
 export type AccountStatus = 'pending' | 'offline' | 'online' | 'error' | 'expired';
+export type AccountMonitorState = 'running' | 'retrying' | 'stopped';
 
 export interface DtAccountListItem {
   id: number;
   nickname: string;
   app_variant: AppVariant;
+  login_type: LoginType;
   email: string | null;
   phone: string | null;
   dt_user_id: string | null;
   dt_device_id: string;
   status: AccountStatus;
   monitor_enabled: boolean;
+  monitor_state: AccountMonitorState;
+  requires_relogin: boolean;
   telegram_notify: boolean;
   sort_order: number;
   last_error: string | null;
@@ -93,6 +97,8 @@ export interface DtAccountDetail {
   dt_device_id: string;
   status: AccountStatus;
   monitor_enabled: boolean;
+  monitor_state: AccountMonitorState;
+  requires_relogin: boolean;
   telegram_notify: boolean;
   proxy_enabled: boolean;
   last_login_at: string | null;
@@ -263,6 +269,7 @@ export interface PhoneNumber {
   raw_json: string | null;
   created_at: string;
   updated_at: string;
+  active_operation?: PhoneActionOperation | null;
 }
 
 export interface PhoneInventoryPhone extends Omit<PhoneNumber, 'raw_json'> {
@@ -311,15 +318,40 @@ export interface PhoneInventoryRefreshResult {
 
 export interface PhoneSmsReceptionRepairResult {
   checked: number;
-  repaired: number;
+  queued: number;
   already_enabled: number;
   unknown: number;
   failed: Array<{ phone_number: string; error: string }>;
+  operations: PhoneActionOperation[];
+  diagnostics: PhoneSmsReceptionDiagnostic[];
   phone_numbers: PhoneNumber[];
+}
+
+export interface PhoneSmsReceptionDiagnostic {
+  phone_number: string;
+  filter_status: 'allowed' | 'blocked' | 'not_returned';
+  routing_status: 'ready' | 'incomplete' | 'not_applicable';
+  listener_status: 'active' | 'disabled' | 'unhealthy' | 'starting' | 'not_applicable';
+  delivery_evidence: 'received' | 'unverified';
+  delivery_status:
+    | 'received'
+    | 'filter_blocked'
+    | 'phone_inactive'
+    | 'routing_incomplete'
+    | 'listener_disabled'
+    | 'listener_unhealthy'
+    | 'listener_starting'
+    | 'unverified';
+  repairable: boolean;
+  severity: 'success' | 'warning' | 'error' | 'default';
+  summary: string;
+  received_count: number;
+  last_received_at: string | null;
 }
 
 export interface UpdatePhoneLabelBody {
   display_name: string;
+  request_id?: string;
 }
 
 export interface RequestPhoneNumberBody {
@@ -519,7 +551,51 @@ export interface PhoneActionVerification {
 
 export interface PhoneActionResult {
   phone: PhoneNumber;
-  verification?: PhoneActionVerification;
+  operation: PhoneActionOperation;
+  reused: boolean;
+}
+
+export type PhoneActionOperationState =
+  | 'prepared'
+  | 'writing'
+  | 'awaiting_confirmation'
+  | 'confirmed'
+  | 'failed_before_write'
+  | 'manual_review';
+
+export type PhoneActionOperationType =
+  | 'renew'
+  | 'cancel'
+  | 'pause'
+  | 'resume'
+  | 'update_label'
+  | 'enable_sms'
+  | 'reactivate';
+
+export interface PhoneActionOperation {
+  id: number;
+  account_id: number;
+  phone_id: number;
+  action: PhoneActionOperationType;
+  state: PhoneActionOperationState;
+  app_variant: AppVariant;
+  confirmation_source: string | null;
+  response_class: string | null;
+  error_summary: string | null;
+  quoted_price: number | null;
+  balance_before: number | null;
+  balance_after: number | null;
+  baseline_expiry: string | null;
+  confirmed_expiry: string | null;
+  extension_months: number | null;
+  reconcile_attempts: number;
+  created_at: string;
+  updated_at: string;
+  confirmed_at: string | null;
+}
+
+export interface PhoneActionOperationEnvelope {
+  operation: PhoneActionOperation;
 }
 
 export interface RefreshMessagesResult {
@@ -607,6 +683,7 @@ export interface SSENewMessageEvent {
   toNumber: string | null;
   content: string;
   msgType?: string;
+  k5Flag?: number | null;
   receivedAt: string;
 }
 

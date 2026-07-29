@@ -101,7 +101,7 @@ test("telegram editMessageText sends chat and message ids", async () => {
 Run:
 
 ```powershell
-Set-Location -LiteralPath 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web\backend'
+Set-Location -LiteralPath 'D:\work\dt-manager-web\backend'
 node --import tsx --test src/services/telegram.test.ts
 ```
 
@@ -988,7 +988,7 @@ Docker/default config version=0.2.5
 - [ ] **Step 4: 运行完整后端测试**
 
 ```powershell
-Set-Location -LiteralPath 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web\backend'
+Set-Location -LiteralPath 'D:\work\dt-manager-web\backend'
 $tests = Get-ChildItem -LiteralPath 'src' -Recurse -Filter '*.test.ts' -File | Select-Object -ExpandProperty FullName
 node --import tsx --test $tests
 ```
@@ -999,7 +999,7 @@ Expected: 所有测试 PASS，失败数为 0；总数应高于实施前的 189�
 
 ```powershell
 npm run build
-npm --prefix 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web\frontend' run build
+npm --prefix 'D:\work\dt-manager-web\frontend' run build
 ```
 
 Expected: 两个命令 exit 0。
@@ -1049,9 +1049,9 @@ Expected:
 - [ ] **Step 9: 做提交前敏感信息检查**
 
 ```powershell
-git -C 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web' status --short
-git -C 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web' diff --check
-git -C 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web' diff --stat
+git -C 'D:\work\dt-manager-web' status --short
+git -C 'D:\work\dt-manager-web' diff --check
+git -C 'D:\work\dt-manager-web' diff --stat
 ```
 
 人工确认未包含：

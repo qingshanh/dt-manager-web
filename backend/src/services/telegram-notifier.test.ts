@@ -14,7 +14,8 @@ const account = {
   email: null,
   phone: null,
   dtUserId: "123",
-  telegramNotify: true
+  telegramNotify: true,
+  appVariant: "dingtone" as const
 };
 
 test("SMS notification is escaped HTML with target and verification code", () => {
@@ -67,6 +68,71 @@ test("phone notification keeps verification fields without leaking raw JSON", ()
   assert.match(text, /remote_phone_list/);
   assert.match(text, /confirmed &lt;remote&gt; &amp; safe/);
   assert.doesNotMatch(text, /SECRET_TOKEN|SECRET_PASSWORD|rawJson|raw_json/);
+});
+
+test("expiry notification shows the full number, variant currency, balance, cost and renewal period", () => {
+  const text = notifierModule.buildPhoneExpiryTelegramNotificationText({
+    account: { ...account, appVariant: "dingdong" },
+    phone: {
+      phoneNumber: "447400006160",
+      status: "active",
+      validPeriodDays: 3,
+      rawJson: JSON.stringify({ price: 900 })
+    },
+    balance: 24564.46,
+    ownedPhoneNumbers: ["12025550101", "12025550102", "12025550103", "12025550104"],
+    remainingText: "还剩 2 天",
+    expiresAt: "2026-07-25T12:00:00.000Z"
+  });
+
+  assert.match(text, /<code>447400006160<\/code>/);
+  assert.match(text, /当前叮咚币：24564\.46/);
+  assert.match(text, /续期所需：900 叮咚币/);
+  assert.match(text, /每次续期：3 个月/);
+  assert.match(text, /2026-07-25T12:00:00\.000Z/);
+  assert.match(text, /账户号码数量：4 个/);
+  assert.match(text, /号码 1：<code>12025550101<\/code>/);
+  assert.match(text, /号码 4：<code>12025550104<\/code>/);
+});
+
+test("renewal success notification includes before and after balances, duration and new expiry", () => {
+  const text = notifierModule.buildPhoneTelegramNotificationText({
+    account,
+    phone: {
+      phoneNumber: "447400006160",
+      status: "active",
+      validPeriodDays: 3,
+      expiredTime: "1790000000000",
+      rawJson: JSON.stringify({ price: 900 })
+    },
+    action: "renew",
+    balanceBefore: 24564.46,
+    balanceAfter: 23664.46,
+    ownedPhoneNumbers: ["12025550101", "12025550102", "12025550103", "12025550104"],
+    renewalDuration: "3 个月",
+    renewedUntil: "2026-10-25T12:00:00.000Z"
+  });
+
+  assert.match(text, /续期前说道币：24564\.46/);
+  assert.match(text, /续期后说道币：23664\.46/);
+  assert.match(text, /续期时长：3 个月/);
+  assert.match(text, /续期后到期：2026-10-25T12:00:00\.000Z/);
+  assert.match(text, /账户号码数量：4 个/);
+  assert.match(text, /号码 1：<code>12025550101<\/code>/);
+  assert.match(text, /号码 4：<code>12025550104<\/code>/);
+});
+
+test("account status notification explains recovery without leaking the raw session error", () => {
+  const text = notifierModule.buildAccountStatusTelegramNotificationText({
+    account,
+    status: "expired",
+    reason: "Direct bootstrap failed token=secret deviceId=device-secret",
+    canVerificationRelogin: true
+  });
+
+  assert.match(text, /账户登录已失效/);
+  assert.match(text, /发送登录验证码/);
+  assert.doesNotMatch(text, /secret|device-secret|Direct bootstrap failed/);
 });
 
 test("copy-code markup stays isolated from HTML and within Telegram limits", () => {

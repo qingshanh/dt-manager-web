@@ -116,6 +116,10 @@ export type DingtonePhonePurchasePreview = {
   rawJson?: string;
 };
 
+export type DingtonePhoneMutationResult<T extends Record<string, unknown> = Record<string, unknown>> =
+  | { outcome: "response"; payload: T }
+  | { outcome: "unknown_after_write"; error: string };
+
 export type DingtonePhoneCountryOption = {
   countryKey: string;
   label: string;
@@ -163,27 +167,27 @@ export type DingtoneGateway = {
     }
   ): Promise<DingtonePhoneNumber>;
   renewPhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
     phoneNumber: string,
     phone?: Partial<DingtonePhoneNumber>
   ): Promise<Partial<DingtonePhoneNumber>>;
   updatePhoneNumberLabel?(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
     phoneNumber: string,
     displayName: string
   ): Promise<Partial<DingtonePhoneNumber>>;
   cancelPhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
     phoneNumber: string,
     phone?: Partial<DingtonePhoneNumber>
   ): Promise<void>;
   pausePhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
     phoneNumber: string,
     phone?: Partial<DingtonePhoneNumber>
   ): Promise<void>;
   resumePhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
     phoneNumber: string,
     phone?: Partial<DingtonePhoneNumber>
   ): Promise<void>;

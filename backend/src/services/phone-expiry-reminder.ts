@@ -1,10 +1,14 @@
 import { PhoneStatus } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
+import { decryptText } from "../utils/crypto.js";
 import { logger } from "../utils/logger.js";
 import { BackgroundLoop } from "./background-loop.js";
-import { sendAccountTelegramNotification } from "./telegram-notifier.js";
+import { DirectDingtoneGateway } from "./dingtone/direct-gateway.js";
+import { phoneExpiryActionKeyboard } from "./telegram-bot-ui.js";
+import { sendPhoneExpiryTelegramNotification } from "./telegram-notifier.js";
 
 const CHECK_INTERVAL_MS = 60 * 60_000;
+const expiryGateway = new DirectDingtoneGateway();
 
 type ExpiryMilestone = "7d" | "3d" | "1d" | "expired";
 
@@ -29,6 +33,7 @@ class PhoneExpiryReminderService {
   }
 
   private async runCycle() {
+    const balanceByAccount = new Map<number, Promise<number | null>>();
     const phones = await prisma.phoneNumber.findMany({
         where: { status: { in: [PhoneStatus.active, PhoneStatus.expired] } },
         include: {
@@ -39,7 +44,16 @@ class PhoneExpiryReminderService {
               email: true,
               phone: true,
               dtUserId: true,
-              telegramNotify: true
+              dtToken: true,
+              dtDeviceId: true,
+              appVariant: true,
+              telegramNotify: true,
+              phoneNumbers: {
+                where: { status: { not: PhoneStatus.cancelled } },
+                orderBy: { id: "asc" },
+                select: { phoneNumber: true }
+              },
+              snapshot: { select: { primaryBalance: true } }
             }
           }
         }
@@ -59,15 +73,28 @@ class PhoneExpiryReminderService {
         if (previous?.value === String(expiresAt)) {
           continue;
         }
-        const sent = await sendAccountTelegramNotification(phone.account, expiryTitle(milestone), [
-          ["账号", phone.account.nickname ?? phone.account.email ?? phone.account.dtUserId],
-          ["面板账号ID", phone.account.id],
-          ["手机号", phone.phoneNumber],
-          ["备注", phone.displayName],
-          ["状态", phone.status],
-          ["剩余时间", formatRemaining(remainingMs)],
-          ["到期时间", new Date(expiresAt).toISOString()]
-        ]).catch((error) => {
+        const balancePromise = balanceByAccount.get(phone.accountId) ?? resolveCurrentBalance(phone.account);
+        balanceByAccount.set(phone.accountId, balancePromise);
+        const balance = await balancePromise;
+        const sent = await sendPhoneExpiryTelegramNotification({
+          account: phone.account,
+          phone: {
+            phoneNumber: phone.phoneNumber,
+            displayName: phone.displayName ?? undefined,
+            status: phone.status,
+            countryCode: phone.countryCode ?? undefined,
+            providerId: phone.providerId ?? undefined,
+            packageServiceId: readPackageServiceId(phone.rawJson),
+            validPeriodDays: phone.validPeriodDays ?? undefined,
+            expiredTime: phone.expiredTime ?? undefined,
+            rawJson: phone.rawJson ?? undefined
+          },
+          balance,
+          ownedPhoneNumbers: phone.account.phoneNumbers.map((item) => item.phoneNumber),
+          remainingText: formatRemaining(remainingMs),
+          expiresAt: new Date(expiresAt).toISOString(),
+          title: expiryTitle(milestone)
+        }, phoneExpiryActionKeyboard(phone.accountId, phone.id)).catch((error) => {
           logger.warn("Failed to send phone expiry Telegram notification", {
             accountId: phone.accountId,
             phoneNumber: phone.phoneNumber,
@@ -84,6 +111,45 @@ class PhoneExpiryReminderService {
           });
         }
     }
+  }
+}
+
+function readPackageServiceId(rawJson: string | null) {
+  if (!rawJson) return undefined;
+  try {
+    const raw = JSON.parse(rawJson) as Record<string, unknown>;
+    const value = raw.packageServiceId ?? raw.package_service_id;
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolveCurrentBalance(account: {
+  id: number;
+  dtUserId: string | null;
+  dtToken: string | null;
+  dtDeviceId: string;
+  appVariant: "dingtone" | "dingdong";
+  snapshot: { primaryBalance: number | null } | null;
+}) {
+  const cached = account.snapshot?.primaryBalance ?? null;
+  const token = decryptText(account.dtToken);
+  if (!account.dtUserId || !token) return cached;
+  try {
+    const snapshot = await expiryGateway.refreshSnapshot({
+      dtUserId: account.dtUserId,
+      token,
+      deviceId: account.dtDeviceId,
+      appVariant: account.appVariant
+    });
+    return snapshot.primaryBalance ?? cached;
+  } catch (error) {
+    logger.warn("Phone expiry reminder could not refresh account balance; using cached balance", {
+      accountId: account.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return cached;
   }
 }
 

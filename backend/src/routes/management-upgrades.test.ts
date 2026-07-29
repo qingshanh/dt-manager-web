@@ -290,19 +290,31 @@ test("version service identifies every commit and checks origin main", () => {
 test("phone actions normalize second timestamps and verify that renewal advanced expiry", () => {
   const gateway = readProjectFile("backend/src/services/dingtone/direct-gateway.ts");
   const routes = readProjectFile("backend/src/routes/accounts.ts");
+  const renewalConfirmation = readProjectFile("backend/src/services/phone-renewal-confirmation.ts");
+  const reconciliation = readProjectFile("backend/src/services/phone-action-reconciliation.ts");
 
   assert.match(gateway, /expireTime > 1_000_000_000_000 \? expireTime : expireTime \* 1000/);
-  assert.match(routes, /const renewalBaseline = useDirect \? await getDirectPhoneBaseline\(account, phoneItem\) : phoneItem/);
+  assert.match(routes, /parsePhoneExpiry\(phoneItem\.expiredTime\) !== null[\s\S]*?\? phoneItem[\s\S]*?: await getDirectPhoneBaseline\(account, phoneItem\)/);
   assert.match(routes, /assertPhoneRenewalAdvanced\(phoneItem, matched\)/);
-  assert.match(routes, /previousExpiry !== null && currentExpiry !== null && currentExpiry > previousExpiry/);
-  assert.match(routes, /Remote verification failed: renewed phone expiry did not advance/);
+  assert.match(renewalConfirmation, /previousExpiry !== null && currentExpiry !== null && currentExpiry > previousExpiry/);
+  assert.match(routes, /resolvePhoneRenewalConfirmation/);
+  assert.match(renewalConfirmation, /renewal_pending/);
+  assert.match(routes, /phoneActionCoordinator\.execute/);
+  assert.match(reconciliation, /current > baseline/);
+  assert.match(reconciliation, /markPhoneActionManualReview/);
+  assert.doesNotMatch(routes, /pendingPhoneRenewals|schedulePhoneRenewalReconciliation/);
 });
 
-test("phone number preview stops after one endpoint pass on transport failures", () => {
+test("phone number preview makes one registered native CommonRest attempt before template fallback", () => {
   const gateway = readProjectFile("backend/src/services/dingtone/direct-gateway.ts");
 
-  assert.match(gateway, /this\.withSession\(runtime, account, async \(session\) => \{[\s\S]*?\}, 1\);/);
-  assert.match(gateway, /if \(isDirectTransportError\(error\)\) \{\s*break;\s*\}/);
-  assert.match(gateway, /function isDirectTransportError\(error: unknown\)/);
-  assert.match(gateway, /socket ended/);
+  assert.match(gateway, /this\.withRegisteredSession\(runtime, account, async \(session\) => \{[\s\S]*?\}, 1\);/);
+  assert.match(gateway, /const \[query\] = buildRequestPrivateNumberQueryAttempts\(/);
+  assert.match(gateway, /buildAuthenticatedCommonRestQuery\(account, runtime, trackCode, apiParams\)/);
+  assert.match(gateway, /queryPair\("deviceId", accountDeviceId\(account\)\)/);
+  assert.match(gateway, /queryPair\("userId", account\.dtUserId\)/);
+  assert.match(gateway, /queryPair\("token", account\.token\)/);
+  assert.match(gateway, /"Direct requestPrivateNumber native CommonRest preview failed"/);
+  assert.match(gateway, /this\.callConfiguredPhoneTemplate\("dt_direct_template_request_phone"/);
+  assert.doesNotMatch(gateway, /for \(let index = 0; index < 200/);
 });

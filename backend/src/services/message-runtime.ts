@@ -119,7 +119,7 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
     }
   });
 
-  if ((options.emitEvents ?? true) && !systemMessage) {
+  if ((options.emitEvents ?? true) && (!systemMessage || isTeamCreditFlag(normalizedPush.k5Flag))) {
     eventBus.emitEvent({
       adminId: targetAccount.adminId,
       type: "new_message",
@@ -131,6 +131,7 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
         toNumber: normalizedPush.toNumber,
         content,
         msgType,
+        k5Flag: normalizedPush.k5Flag ?? null,
         receivedAt: message.receivedAt.toISOString()
       }
     });
@@ -263,6 +264,7 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
         data: {
           fromNumber: teamName,
           content: storedContent,
+          msgType: MessageType.system,
           k5Flag: replacementK5Flag,
           isRead: true,
           ...(replacementReceivedAt ? { receivedAt: replacementReceivedAt } : {})
@@ -306,7 +308,7 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
       options.sendTelegram ?? true
     );
   }
-  if ((options.emitEvents ?? true) && !systemMessage) {
+  if ((options.emitEvents ?? true) && (!systemMessage || isTeamCreditFlag(rowForStorage.type))) {
     eventBus.emitEvent({
       adminId: targetAccount.adminId,
       type: "new_message",
@@ -318,6 +320,7 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
         toNumber,
         content: storedContent,
         msgType,
+        k5Flag: rowForStorage.type ?? null,
         receivedAt: message.receivedAt.toISOString()
       }
     });
@@ -328,6 +331,10 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
     fromNumber: sender
   });
   return true;
+}
+
+function isTeamCreditFlag(value: number | null | undefined) {
+  return value === 531 || value === 532;
 }
 
 async function findDuplicateHelperSmsMessage(accountId: number, row: HelperSmsMessageRecord, db: MessageRuntimeDb, targetOverride?: string | null) {

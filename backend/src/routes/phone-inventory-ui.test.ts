@@ -27,9 +27,44 @@ test("backend exposes scoped global phone inventory and confirmed refresh", () =
   assert.match(route, /export function createPhoneNumbersRouter/);
   assert.doesNotMatch(route, /from "\.\/accounts\.js"/);
   assert.match(accounts, /export async function syncPhoneNumbersFromRemote/);
-  assert.match(accounts, /phone_numbers:\s*phoneNumbers\.map\(serializePhoneNumber\)/);
-  assert.match(accounts, /refresh_error:\s*null/);
-  assert.match(accounts, /cached:\s*false/);
+  assert.match(accounts, /waitForPhoneInventorySync\(accountId\)/);
+  assert.match(accounts, /phone_numbers:\s*result\.phoneNumbers\.map\(serializePhoneNumber\)/);
+  assert.match(accounts, /refresh_pending:\s*result\.refreshPending/);
+  assert.match(accounts, /loadCachedPhoneNumbers\(accountId\)/);
+  assert.match(accounts, /refresh_error:\s*formatPhoneInventoryRefreshError\(error\)/);
+  assert.match(accounts, /cached:\s*true/);
+});
+
+test("interactive refreshes are bounded and never call cached data fresh", () => {
+  const accounts = read("backend/src/routes/accounts.ts");
+  const refreshStart = accounts.indexOf('accountsRouter.post("/:id/refresh"');
+  const refreshEnd = accounts.indexOf('accountsRouter.get("/:id/point"', refreshStart);
+  const refreshBlock = accounts.slice(refreshStart, refreshEnd);
+  const phoneStart = accounts.indexOf('accountsRouter.post("/:id/phone-numbers/sync"');
+  const phoneEnd = accounts.indexOf('accountsRouter.post("/:id/phone-numbers/enable-sms-reception"', phoneStart);
+  const phoneBlock = accounts.slice(phoneStart, phoneEnd);
+
+  assert.match(refreshBlock, /accountMonitorService\.withMaintenance/);
+  assert.match(refreshBlock, /includePhoneNumbers:\s*false/);
+  assert.match(refreshBlock, /allowHelperSnapshot:\s*false/);
+  assert.match(refreshBlock, /allowAdbPoint:\s*false/);
+  assert.match(refreshBlock, /includePublicEnrichment:\s*false/);
+  assert.match(refreshBlock, /persistCachedSnapshot:\s*false/);
+  assert.match(refreshBlock, /assetSignals\.gatewaySnapshotResolved/);
+  assert.match(refreshBlock, /freshness:/);
+  assert.match(phoneBlock, /refresh_pending:/);
+  assert.match(phoneBlock, /waitForPhoneInventorySync/);
+});
+
+test("direct phone inventory synchronization never falls back to helper or ADB", () => {
+  const accounts = read("backend/src/routes/accounts.ts");
+  const syncBlock = accounts.slice(
+    accounts.indexOf("export async function syncPhoneNumbersFromRemote"),
+    accounts.indexOf("async function verifyDirectPhoneAction")
+  );
+
+  assert.match(syncBlock, /Phone inventory synchronization requires a valid direct account session/);
+  assert.doesNotMatch(syncBlock, /executeHelperAction|listPhoneNumbersFromAdb|helperRefreshGateway/);
 });
 
 test("frontend exposes phone inventory types, filtered cache keys, and invalidation", () => {
@@ -69,12 +104,12 @@ test("inventory loading commits and finishes only for the latest request", () =>
   assert.match(page, /if \(loadRequestGuardRef\.current\.isLatest\(requestId\)\) \{[\s\S]*setLoading\(false\)/);
 });
 
-test("single-account phone synchronization allows the backend remote refresh window", () => {
+test("single-account phone synchronization uses a bounded interactive window", () => {
   const endpoints = read("frontend/src/services/endpoints.ts");
   const syncBlock = endpoints.match(/export async function syncPhoneNumbers\([\s\S]*?\n\}/)?.[0];
   assert.ok(syncBlock, "syncPhoneNumbers endpoint should exist");
-  assert.match(syncBlock, /\{ timeout: 120_000 \}/);
-  assert.doesNotMatch(syncBlock, /12_000/);
+  assert.match(syncBlock, /\{ timeout: 20_000 \}/);
+  assert.doesNotMatch(syncBlock, /120_000/);
 });
 
 test("phone inventory page is routed, grouped, filterable, and limited to safe actions", () => {

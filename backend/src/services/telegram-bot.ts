@@ -1,11 +1,16 @@
-import { AccountStatus, MessageDirection, MessageType, PhoneStatus } from "@prisma/client";
+import { AccountStatus, MessageDirection, MessageType, PhoneActionType, PhoneStatus } from "@prisma/client";
 import type { DtAccount, PhoneNumber } from "@prisma/client";
+import { createHash, randomUUID } from "node:crypto";
 import { prisma } from "../lib/prisma.js";
 import { decryptText } from "../utils/crypto.js";
 import { logger } from "../utils/logger.js";
 import { serializePhoneNumber } from "../utils/serializers.js";
+import { resolveAccountDisplayName } from "../utils/account-name.js";
 import { accountMonitorService } from "./account-monitor.js";
+import { completeAccountVerificationRelogin, requestAccountVerificationRelogin } from "./account-verification-relogin.js";
 import { refreshAccountRuntimeData } from "./account-runtime.js";
+import { phoneActionCoordinator } from "./phone-action-coordinator.js";
+import { resolvePhoneRenewalConfirmation, resolvePhoneRenewalMonths } from "./phone-renewal-confirmation.js";
 import { BackgroundLoop } from "./background-loop.js";
 import {
   DirectDingtoneGateway,
@@ -17,7 +22,13 @@ import {
 import type { DingtonePhoneNumber, DingtonePhonePurchaseCandidate } from "./dingtone/types.js";
 import { storeParsedSmsPushes } from "./message-runtime.js";
 import { getSettingsMap } from "./settings.service.js";
-import { sendPhoneTelegramNotification } from "./telegram-notifier.js";
+import {
+  formatCoinBalance,
+  formatPhoneRenewalPeriod,
+  getPhoneRenewalCost,
+  phoneCurrencyLabel,
+  sendPhoneTelegramNotification
+} from "./telegram-notifier.js";
 import { telegramService, type TelegramUpdate } from "./telegram.js";
 import { parseTelegramCallback, type TelegramPanelCallback } from "./telegram-bot-callbacks.js";
 import {
@@ -35,6 +46,7 @@ import {
   limitTelegramMessage,
   mainPanelKeyboard,
   phoneAccountKeyboard,
+  phoneActionConfirmationKeyboard,
   phoneDetailKeyboard,
   phoneListKeyboard
 } from "./telegram-bot-ui.js";
@@ -45,6 +57,7 @@ const TELEGRAM_NOTE_MAX_LENGTH = 100;
 const TELEGRAM_ACCOUNT_PAGE_SIZE = 8;
 const TELEGRAM_PHONE_ACCOUNT_PAGE_SIZE = 8;
 const TELEGRAM_ACCOUNT_PHONE_PAGE_SIZE = 6;
+const activeTelegramPhoneActions = new Set<string>();
 type PhoneMatch = "confirmed" | "unverified" | "mismatch";
 type TelegramBotDb = Pick<typeof prisma, "dtAccount" | "phoneNumber" | "message">;
 
@@ -223,6 +236,9 @@ export class TelegramBotService {
         return;
       case "/notify":
         await this.reply(settings, chatId, await toggleNotifyText(args[0], args[1]));
+        return;
+      case "/login_code":
+        await this.reply(settings, chatId, await completeVerificationReloginText(Number(args[0]), args[1]));
         return;
       case "/set_note":
         await this.reply(settings, chatId, await setNoteText(Number(args[0]), args.slice(1).join(" ")));
@@ -409,6 +425,7 @@ async function ensureBotCommands(botToken: string, apiBaseUrl?: string | null) {
         { command: "start_monitor", description: "启动监听：/start_monitor 3 或 all" },
         { command: "stop_monitor", description: "停止监听：/stop_monitor 3 或 all" },
         { command: "notify", description: "开关账户通知：/notify 3 on" },
+        { command: "login_code", description: "提交重登验证码：/login_code 3 1234" },
         { command: "set_note", description: "修改账户备注：/set_note 3 备注" },
         { command: "clear_note", description: "清空账户备注：/clear_note 3" },
         { command: "set_phone_note", description: "修改号码备注：/set_phone_note 3 121 备注" },
@@ -687,6 +704,17 @@ export async function handleTelegramCallback(callback: TelegramPanelCallback): P
   }
   if (callback.scope === "phone") {
     if (callback.action === "note") return phoneNoteCommandReply(callback.accountId, callback.phoneId);
+    if (callback.action === "renew_request" || callback.action === "cancel_request") {
+      return phoneActionConfirmationReply(callback.accountId, callback.phoneId, callback.action === "renew_request" ? "renew" : "cancel");
+    }
+    if (callback.action === "renew_confirm" || callback.action === "cancel_confirm") {
+      return executeConfirmedPhoneCallback(
+        callback.accountId,
+        callback.phoneId,
+        callback.action === "renew_confirm" ? "renew" : "cancel",
+        callback.version
+      );
+    }
     return phoneDetailReply(callback.accountId, callback.phoneId);
   }
   if (callback.action === "detail") return accountDetailReply(callback.accountId);
@@ -694,6 +722,7 @@ export async function handleTelegramCallback(callback: TelegramPanelCallback): P
   if (callback.action === "phones") return accountPhoneListReply(callback.accountId, callback.page);
   if (callback.action === "refresh") return accountMutationReply(callback.accountId, () => refreshAccountText(callback.accountId));
   if (callback.action === "refresh_phones") return accountMutationReply(callback.accountId, () => refreshPhonesText(callback.accountId));
+  if (callback.action === "relogin_send_code") return requestVerificationReloginReply(callback.accountId);
   return applyTelegramAccountTargetState({ accountId: callback.accountId, action: callback.action });
 }
 
@@ -765,6 +794,32 @@ function htmlNotice(text: string): BotReply {
   return { text: `<b>${escapeTelegramHtml(sanitizeTelegramError(text))}</b>`, replyMarkup: mainPanelKeyboard(), parseMode: "HTML" };
 }
 
+async function requestVerificationReloginReply(accountId: number): Promise<BotReply> {
+  await requestAccountVerificationRelogin(accountId);
+  return {
+    text: [
+      "<b>登录验证码已发送</b>",
+      "收到验证码后，请在当前聊天发送：",
+      `<code>/login_code ${accountId} 验证码</code>`,
+      "验证码验证成功后会自动恢复账户监听。"
+    ].join("\n"),
+    parseMode: "HTML",
+    replyMarkup: accountActionKeyboard((await loadTelegramAccountDetail(accountId))!)
+  };
+}
+
+async function completeVerificationReloginText(accountId: number, code: string | undefined) {
+  if (!Number.isSafeInteger(accountId) || accountId <= 0 || !code) {
+    return "用法：/login_code <账户ID> <验证码>";
+  }
+  return withTelegramCommandError(async () => {
+    const result = await completeAccountVerificationRelogin(accountId, code);
+    return result.monitorStarted
+      ? `账户 #${accountId} 已重新登录，监听已恢复。`
+      : `账户 #${accountId} 已重新登录，但监听恢复失败，请点击“恢复监听”重试。`;
+  });
+}
+
 export function sanitizeTelegramError(value: unknown) {
   return String(value ?? "")
     .replace(/\bbearer\s+[^\s"',;}]+/gi, "Bearer [redacted]")
@@ -795,7 +850,86 @@ export function telegramUserErrorText(error: unknown) {
 }
 
 function isSlowTelegramCallback(callback: TelegramPanelCallback) {
-  return callback.scope === "account" && (callback.action === "refresh" || callback.action === "refresh_phones");
+  return (
+    (callback.scope === "account" && (callback.action === "refresh" || callback.action === "refresh_phones" || callback.action === "relogin_send_code")) ||
+    (callback.scope === "phone" && (callback.action === "renew_confirm" || callback.action === "cancel_confirm"))
+  );
+}
+
+async function phoneActionConfirmationReply(accountId: number, phoneId: number, action: "renew" | "cancel"): Promise<BotReply> {
+  const phone = await prisma.phoneNumber.findFirst({
+    where: { id: phoneId, accountId },
+    include: { account: { include: { snapshot: true } } }
+  });
+  if (!phone) return htmlNotice("号码不存在，请刷新号码列表后重试。");
+  if (action === "renew" && phone.status === PhoneStatus.cancelled) return htmlNotice("已取消号码不能续期。");
+  if (action === "cancel" && (phone.status === PhoneStatus.cancelled || phone.status === PhoneStatus.expired)) {
+    return htmlNotice("该号码已经取消或过期，无需再次取消。");
+  }
+  const currency = phoneCurrencyLabel(phone.account.appVariant);
+  const cost = getPhoneRenewalCost(mapStoredPhoneContext(phone));
+  const lines = [
+    `<b>${action === "renew" ? "确认续期号码" : "确认取消号码"}</b>`,
+    `账号：${escapeTelegramHtml(accountName(phone.account))} <code>#${accountId}</code>`,
+    `手机号：<code>${escapeTelegramHtml(phone.phoneNumber)}</code>`,
+    `号码状态：<code>${escapeTelegramHtml(phone.status)}</code>`,
+    ...(action === "renew"
+      ? [
+          `当前${currency}：${escapeTelegramHtml(formatCoinBalance(phone.account.snapshot?.primaryBalance))}`,
+          `续期所需：${escapeTelegramHtml(cost === null ? "暂未获取" : `${formatCoinBalance(cost)} ${currency}`)}`,
+          `每次续期：${escapeTelegramHtml(formatPhoneRenewalPeriod(mapStoredPhoneContext(phone)))}`,
+          `当前到期：${escapeTelegramHtml(formatPhoneExpiryTime(phone.expiredTime))}`,
+          "确认后会产生真实扣费。"
+        ]
+      : ["取消后号码将停止使用，此操作不可逆。"])
+  ];
+  return {
+    text: lines.join("\n"),
+    replyMarkup: phoneActionConfirmationKeyboard(action, accountId, phoneId, buildPhoneActionVersion(phone)),
+    parseMode: "HTML"
+  };
+}
+
+async function executeConfirmedPhoneCallback(
+  accountId: number,
+  phoneId: number,
+  action: "renew" | "cancel",
+  expectedVersion: string
+): Promise<BotReply> {
+  const phone = await prisma.phoneNumber.findFirst({ where: { id: phoneId, accountId } });
+  if (!phone) return htmlNotice("号码不存在，请刷新号码列表后重试。");
+  if (buildPhoneActionVersion(phone) !== expectedVersion) {
+    return {
+      text: "<b>号码信息已经变化</b>\n旧确认按钮已失效，请重新查看号码后操作。",
+      replyMarkup: phoneDetailKeyboard(accountId, phoneId),
+      parseMode: "HTML"
+    };
+  }
+  const lockKey = `${accountId}:${phoneId}`;
+  if (activeTelegramPhoneActions.has(lockKey)) return htmlNotice("该号码正在处理中，请稍后查看结果。");
+  activeTelegramPhoneActions.add(lockKey);
+  try {
+    const result = await phoneActionText(
+      accountId,
+      { phoneRef: String(phoneId), confirm: true },
+      action,
+      `telegram:${accountId}:${phoneId}:${action}:${expectedVersion}`
+    );
+    return {
+      text: `<b>${action === "renew" ? "续期处理结果" : "取消处理结果"}</b>\n${escapeTelegramHtml(result)}`,
+      replyMarkup: phoneDetailKeyboard(accountId, phoneId),
+      parseMode: "HTML"
+    };
+  } finally {
+    activeTelegramPhoneActions.delete(lockKey);
+  }
+}
+
+export function buildPhoneActionVersion(phone: Pick<PhoneNumber, "id" | "accountId" | "status" | "expiredTime" | "updatedAt">) {
+  return createHash("sha256")
+    .update([phone.id, phone.accountId, phone.status, phone.expiredTime ?? "", phone.updatedAt.toISOString()].join(":"))
+    .digest("hex")
+    .slice(0, 10);
 }
 
 function telegramPagination(total: number, requestedPage: number, pageSize: number) {
@@ -1350,7 +1484,8 @@ export function parsePhoneActionArgs(args: string[]) {
 async function phoneActionText(
   accountId: number,
   parsedArgs: ReturnType<typeof parsePhoneActionArgs>,
-  action: "renew" | "pause" | "resume" | "cancel"
+  action: "renew" | "pause" | "resume" | "cancel",
+  requestId: string = randomUUID()
 ) {
   return withTelegramCommandError(async () => {
     const { phoneRef, confirm } = parsedArgs;
@@ -1375,54 +1510,106 @@ async function phoneActionText(
       return "未找到该号码。";
     }
     const direct = directAccount(account);
+    const balanceBefore = action === "renew" ? await resolveLiveAccountBalance(account, direct) : null;
     const renewalBaseline = action === "renew" ? await getBotPhoneBaseline(direct, phone.phoneNumber) : null;
-    if (action === "renew") {
-      await botGateway.renewPhoneNumber(direct, phone.phoneNumber, mapStoredPhoneContext(phone));
-    } else if (action === "pause") {
-      await botGateway.pausePhoneNumber(direct, phone.phoneNumber, mapStoredPhoneContext(phone));
-    } else if (action === "resume") {
-      await botGateway.resumePhoneNumber(direct, phone.phoneNumber, mapStoredPhoneContext(phone));
-    } else {
-      await botGateway.cancelPhoneNumber(direct, phone.phoneNumber, mapStoredPhoneContext(phone));
+    const quotedPrice = action === "renew" ? getPhoneRenewalCost(mapStoredPhoneContext(phone)) : null;
+    const extensionMonths = action === "renew" ? resolvePhoneRenewalMonths(phone) : null;
+    if (action === "renew" && (balanceBefore === null || quotedPrice === null)) {
+      throw new Error("续费前无法确认当前余额或精确续费价格，请先刷新号码与余额。");
     }
-    const expectedStatus =
-      action === "renew" ? null : action === "resume" ? PhoneStatus.active : action === "pause" ? PhoneStatus.paused : PhoneStatus.cancelled;
-    const verified = await verifyPhoneStatus(direct, phone.phoneNumber, expectedStatus, renewalBaseline?.expiredTime);
-    const updated = await prisma.phoneNumber.update({
-      where: { id: phone.id },
-      data: mapPhoneNumber({ ...verified, phoneNumber: phone.phoneNumber })
-    });
-    const verificationNote = buildBotPhoneActionVerificationNote(action, updated.status);
-    await sendPhoneTelegramNotification({
-      account,
-      phone: mapStoredPhoneContext(updated),
-      action,
-      verificationSource: "remote_phone_list",
-      verificationNote
-    }).catch((error) => {
-      logger.warn("Failed to send Telegram notification for phone action from bot", {
+    if (action === "renew" && balanceBefore! < quotedPrice!) {
+      throw new Error("当前余额不足以支付本次续费。");
+    }
+
+    let responsePatch: Partial<DingtonePhoneNumber> | null = null;
+    const operationAction = {
+      renew: PhoneActionType.renew,
+      pause: PhoneActionType.pause,
+      resume: PhoneActionType.resume,
+      cancel: PhoneActionType.cancel
+    }[action];
+    const envelope = await phoneActionCoordinator.execute({
+      operation: {
         accountId,
-        phoneNumber: updated.phoneNumber,
-        action,
-        error: sanitizeTelegramError(errorMessage(error))
-      });
+        phoneId: phone.id,
+        action: operationAction,
+        appVariant: account.appVariant,
+        idempotencyKey: requestId,
+        baselineStatus: phone.status,
+        baselineExpiry: renewalBaseline?.expiredTime ?? phone.expiredTime,
+        balanceBefore,
+        quotedPrice,
+        extensionMonths,
+        requestFingerprint: `telegram:${action}:${phone.id}:${extensionMonths ?? "none"}:${quotedPrice ?? "none"}`,
+        requestPayload: action === "renew"
+          ? { extensionMonths }
+          : { status: action === "pause" ? "paused" : action === "resume" ? "active" : "cancelled" }
+      },
+      mutate: async () => {
+        const mutation = action === "renew"
+          ? await botGateway.renewPhoneNumberMutation(direct, phone.phoneNumber, mapStoredPhoneContext(phone))
+          : action === "pause"
+            ? await botGateway.pausePhoneNumberMutation(direct, phone.phoneNumber, mapStoredPhoneContext(phone))
+            : action === "resume"
+              ? await botGateway.resumePhoneNumberMutation(direct, phone.phoneNumber, mapStoredPhoneContext(phone))
+              : await botGateway.cancelPhoneNumberMutation(direct, phone.phoneNumber, mapStoredPhoneContext(phone));
+        if (mutation.outcome === "response") responsePatch = mutation.payload as Partial<DingtonePhoneNumber>;
+        return mutation;
+      },
+      classifyResponse: action === "renew"
+        ? (payload) => {
+            const confirmation = resolvePhoneRenewalConfirmation({
+              previous: renewalBaseline ?? phone,
+              action: payload as Partial<DingtonePhoneNumber>
+            });
+            return confirmation.confirmed
+              ? {
+                  confirmationSource: confirmation.source,
+                  responseClass: "response_confirmed",
+                  confirmedExpiry: confirmation.phone.expiredTime,
+                  extensionMonths,
+                  evidenceAt: new Date()
+                }
+              : null;
+          }
+        : undefined
     });
-    return [
-      `操作完成：${formatPhoneLine(updated)}`,
-      `远端确认：${phoneActionVerificationText(action, updated.status)}`
-    ].join("\n");
+
+    if (envelope.operation.state === "confirmed" && responsePatch) {
+      await prisma.phoneNumber.update({
+        where: { id: phone.id },
+        data: mapPhoneNumber(responsePatch)
+      });
+    }
+    if (envelope.operation.state === "confirmed") {
+      return `${action === "renew" ? "续费" : action === "cancel" ? "取消" : action === "pause" ? "暂停" : "恢复"}已确认。`;
+    }
+    if (envelope.operation.state === "failed_before_write") {
+      return `操作未提交：${envelope.operation.errorSummary ?? "写入前失败"}`;
+    }
+    if (envelope.operation.state === "manual_review") {
+      return "操作结果仍不明确，请勿重复操作，并在面板查看人工复核状态。";
+    }
+    return `操作已提交，状态：${envelope.operation.state}。系统会只读确认远端结果，请勿重复操作。`;
   });
 }
 
 async function requireAccount(accountId: number) {
-  const account = await prisma.dtAccount.findUnique({ where: { id: accountId } });
+  const account = await prisma.dtAccount.findUnique({ where: { id: accountId }, include: { snapshot: true } });
   if (!account || !account.dtUserId || !account.dtToken) {
     throw new Error("账户不存在或缺少 direct 会话。");
   }
   return account;
 }
 
-function directAccount(account: { dtUserId: string | null; dtToken: string | null; dtDeviceId?: string | null; email?: string | null; phone?: string | null }) {
+function directAccount(account: {
+  dtUserId: string | null;
+  dtToken: string | null;
+  dtDeviceId?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  appVariant?: "dingtone" | "dingdong";
+}) {
   const token = decryptText(account.dtToken);
   if (!account.dtUserId || !token) {
     throw new Error("账户 direct 会话不完整。");
@@ -1432,8 +1619,47 @@ function directAccount(account: { dtUserId: string | null; dtToken: string | nul
     token,
     deviceId: account.dtDeviceId,
     email: account.email,
-    phone: account.phone
+    phone: account.phone,
+    appVariant: account.appVariant
   };
+}
+
+async function resolveLiveAccountBalance(
+  account: { id: number; snapshot?: { primaryBalance: number | null } | null },
+  direct: ReturnType<typeof directAccount>
+) {
+  const cached = account.snapshot?.primaryBalance ?? null;
+  try {
+    const snapshot = await botGateway.refreshSnapshot(direct);
+    return snapshot.primaryBalance ?? cached;
+  } catch (error) {
+    logger.warn("Telegram phone action could not refresh account balance; using cached balance", {
+      accountId: account.id,
+      error: sanitizeTelegramError(errorMessage(error))
+    });
+    return cached;
+  }
+}
+
+function formatRenewalExtension(before?: string | null, after?: string | null) {
+  const beforeEpoch = parsePhoneEpoch(before);
+  const afterEpoch = parsePhoneEpoch(after);
+  if (!beforeEpoch || !afterEpoch || afterEpoch <= beforeEpoch) return null;
+  const days = Math.round((afterEpoch - beforeEpoch) / 86_400_000);
+  if (days >= 28) return `${Math.max(1, Math.round(days / 31))} 个月`;
+  return `${Math.max(1, days)} 天`;
+}
+
+function formatPhoneExpiryTime(value?: string | null) {
+  const epoch = parsePhoneEpoch(value);
+  return epoch ? new Date(epoch).toISOString() : value || "暂未获取";
+}
+
+function parsePhoneEpoch(value?: string | null) {
+  if (!value) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed > 1_000_000_000_000 ? parsed : parsed * 1000;
 }
 
 async function withTelegramCommandError(operation: () => Promise<string>) {
@@ -1729,7 +1955,7 @@ function parsePositiveInt(value: string | undefined, fallback: number) {
 }
 
 function accountName(input: { nickname?: string | null; email?: string | null; phone?: string | null; dtUserId?: string | null }) {
-  return input.nickname?.trim() || input.email?.trim() || input.phone?.trim() || input.dtUserId?.trim() || "未命名账户";
+  return resolveAccountDisplayName(input, "未命名账户");
 }
 
 function normalizePhoneDigits(value: string) {

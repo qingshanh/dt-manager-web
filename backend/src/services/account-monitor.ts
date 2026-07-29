@@ -7,6 +7,14 @@ import { decryptText } from "../utils/crypto.js";
 import { LatestAsyncWriter } from "../utils/latest-async-writer.js";
 import { eventBus } from "./event-bus.js";
 import { refreshAccountRuntimeData } from "./account-runtime.js";
+import {
+  hasDirectPushPhonePurchaseNotice,
+  hasPhonePurchaseNotice,
+  shouldCommitDirectPhoneInventoryRefresh,
+  shouldContinueDirectPhoneInventoryListen,
+  shouldRefreshDirectPhoneInventoryAfterPoll
+} from "./phone-inventory-refresh.js";
+import { syncPhoneNumbers } from "./phone-number-store.js";
 import { dingtoneGateway } from "./dingtone/index.js";
 import {
   DirectDingtoneGateway,
@@ -24,6 +32,9 @@ import { dumpSmsMessagesFromNotifications } from "./adb-notification-ui.js";
 import { dumpSmsMessagesFromUi, openMessagesInbox } from "./adb-message-ui.js";
 import { getGatewayMode, getSettingsMap } from "./settings.service.js";
 import { transferMonitorRunnerInPlace } from "./account-monitor-runner-transfer.js";
+import { isRetryableMonitorTransportError } from "./account-list-monitor-state.js";
+import { sendAccountStatusTelegramNotification } from "./telegram-notifier.js";
+import { accountRecoveryKeyboard } from "./telegram-bot-ui.js";
 
 type MonitorConfig = {
   pollIntervalMs: number;
@@ -53,6 +64,8 @@ type MonitorRunner = {
   appCatchupIntervalMs: number;
   appUiFallbackEnabled: boolean;
   lastRefreshAt: number | null;
+  lastPhoneInventoryRefreshAt: number | null;
+  phoneInventoryRefreshPending: boolean;
   lastCyclePreempted: boolean;
   lastCycleUsedDirectSlot: boolean;
   lastCycleSkippedDirectSlot: boolean;
@@ -151,6 +164,8 @@ export class AccountMonitorService {
       appCatchupIntervalMs: monitorConfig.appCatchupIntervalMs,
       appUiFallbackEnabled: monitorConfig.appUiFallbackEnabled,
       lastRefreshAt: null,
+      lastPhoneInventoryRefreshAt: null,
+      phoneInventoryRefreshPending: false,
       lastCyclePreempted: false,
       lastCycleUsedDirectSlot: false,
       lastCycleSkippedDirectSlot: false,
@@ -246,6 +261,30 @@ export class AccountMonitorService {
     return Boolean(runner && !runner.stopped);
   }
 
+  async withMaintenance<T>(accountId: number, operation: () => Promise<T>): Promise<T> {
+    const wasRunning = this.isRunning(accountId);
+    if (wasRunning) {
+      await this.stop(accountId, {
+        preserveMonitorEnabled: true,
+        targetStatus: AccountStatus.online,
+        emitStatus: false
+      });
+    }
+
+    try {
+      return await operation();
+    } finally {
+      if (wasRunning) {
+        await this.start(accountId).catch((error) => {
+          logger.warn("Failed to restore account monitor after maintenance", {
+            accountId,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        });
+      }
+    }
+  }
+
   async stopAll() {
     this.shuttingDown = true;
     if (!this.stopAllPromise) {
@@ -339,6 +378,11 @@ export class AccountMonitorService {
         logger.info("Restored account monitor after backend restart", { accountId: account.id });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        await prisma.dtAccount.update({
+          where: { id: account.id },
+          data: { status: AccountStatus.offline, monitorEnabled: false, lastError: message }
+        }).catch(() => null);
+        void notifyAccountMonitorUnavailable(account.id, "offline", message);
         logger.warn("Failed to restore account monitor after backend restart", {
           accountId: account.id,
           error: message
@@ -531,6 +575,23 @@ export class AccountMonitorService {
           })
         : null;
       const createdMessages = directPollResult ? directPollResult.createdMessages : await this.pollHelperMessages(runner);
+      if (
+        useDirectFlow
+        && shouldRefreshDirectPhoneInventoryAfterPoll({
+          stopped: runner.stopped,
+          listened: Boolean(directPollResult?.listened),
+          now: Date.now(),
+          lastRefreshAt: runner.lastPhoneInventoryRefreshAt,
+          pendingPurchase: runner.phoneInventoryRefreshPending
+        })
+      ) {
+        phoneCount = await this.refreshDirectPhoneInventory(runner, {
+          dtUserId,
+          token: requireDecryptedToken(token),
+          deviceId: account.dtDeviceId,
+          appVariant: account.appVariant
+        });
+      }
       runner.lastCyclePreempted = Boolean(directPollResult?.preempted);
       runner.lastCycleUsedDirectSlot = Boolean(directPollResult?.listened);
       runner.lastCycleSkippedDirectSlot = Boolean(directPollResult?.skippedForConcurrency);
@@ -619,13 +680,16 @@ export class AccountMonitorService {
           type: "account_status",
           payload: { accountId: runner.accountId, status: "expired", message }
         });
+        void notifyAccountMonitorUnavailable(runner.accountId, "expired", message);
         throw new AppError(message, 401, 401);
       }
 
-      const shouldSurfaceTransientError =
-        classification !== "transient" ||
-        runner.consecutiveFailures >= runner.maxRetryCount ||
-        !/socket closed|timed out waiting for direct push frame/i.test(message);
+      const shouldSurfaceTransientError = shouldSurfaceMonitorError(
+        message,
+        classification,
+        runner.consecutiveFailures,
+        runner.maxRetryCount
+      );
 
       await prisma.dtAccount.update({
         where: { id: runner.accountId },
@@ -638,7 +702,7 @@ export class AccountMonitorService {
           : {
               status: AccountStatus.online,
               monitorEnabled: true,
-              lastError: null
+              lastError: isRetryableMonitorTransportError(message) ? message : null
             }
       });
       eventBus.emitEvent({
@@ -653,7 +717,7 @@ export class AccountMonitorService {
           : {
               accountId: runner.accountId,
               status: "online",
-              message: "Transient direct gateway disconnect recovered automatically"
+              message: "Transient monitor transport failed; retry remains scheduled"
             }
       });
       logger.warn("Account monitor cycle failed", {
@@ -694,6 +758,35 @@ export class AccountMonitorService {
       appCatchupIntervalMs: Math.max(15_000, appCatchupIntervalSeconds * 1000),
       appUiFallbackEnabled
     };
+  }
+
+  private async refreshDirectPhoneInventory(
+    runner: MonitorRunner,
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" }
+  ) {
+    try {
+      const phoneNumbers = await directMonitorGateway.listPhoneNumbers(account);
+      if (!shouldCommitDirectPhoneInventoryRefresh(runner)) {
+        return 0;
+      }
+      if (phoneNumbers.length > 0) {
+        await syncPhoneNumbers(runner.accountId, phoneNumbers);
+        runner.phoneInventoryRefreshPending = false;
+      }
+      runner.lastPhoneInventoryRefreshAt = Date.now();
+      logger.info("Automatic phone inventory refresh completed", {
+        accountId: runner.accountId,
+        remotePhoneCount: phoneNumbers.length,
+        pendingPurchase: runner.phoneInventoryRefreshPending
+      });
+      return phoneNumbers.length;
+    } catch (error) {
+      logger.warn("Automatic phone inventory refresh failed", {
+        accountId: runner.accountId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return 0;
+    }
   }
 
   private async pollDirectMessages(
@@ -844,7 +937,13 @@ export class AccountMonitorService {
           appVariant: account.appVariant
         },
         listenSeconds: runner.listenSeconds,
-        shouldContinue: () => !runner.stopped && this.hasDedicatedDirectSlots(runner),
+        shouldContinue: () => shouldContinueDirectPhoneInventoryListen({
+          stopped: runner.stopped,
+          hasDedicatedSlots: this.hasDedicatedDirectSlots(runner),
+          now: Date.now(),
+          lastRefreshAt: runner.lastPhoneInventoryRefreshAt,
+          pendingPurchase: runner.phoneInventoryRefreshPending
+        }),
         onListenWindowExtended: async () => {
           if (runner.stopped) {
             return;
@@ -870,6 +969,9 @@ export class AccountMonitorService {
           }
           runner.lastDirectSmsAt = push.receivedAt;
           runner.lastDirectSmsTarget = push.sms.toNumber ?? null;
+          if (hasDirectPushPhonePurchaseNotice(push.sms)) {
+            runner.phoneInventoryRefreshPending = true;
+          }
           try {
             createdMessages += await storeParsedSmsPushes(runner.accountId, [push.sms]);
             updateLiveDiagnostic(true);
@@ -882,6 +984,9 @@ export class AccountMonitorService {
         },
         onWebOfflineMessages: async (messages: DirectWebOfflineMessage[]) => {
           try {
+            if (hasPhonePurchaseNotice(messages)) {
+              runner.phoneInventoryRefreshPending = true;
+            }
             createdMessages += await storeHelperSmsMessages(runner.accountId, messages, {
               sendTelegram: false
             });
@@ -1079,6 +1184,37 @@ function runSerializedAppFallbackScan<T>(run: () => Promise<T>): Promise<T> {
   return next;
 }
 
+async function notifyAccountMonitorUnavailable(accountId: number, status: "expired" | "offline", reason: string) {
+  const account = await prisma.dtAccount.findUnique({
+    where: { id: accountId },
+    select: {
+      id: true,
+      nickname: true,
+      email: true,
+      phone: true,
+      dtUserId: true,
+      telegramNotify: true,
+      appVariant: true,
+      loginType: true
+    }
+  });
+  if (!account) return;
+  const canVerificationRelogin = account.loginType === "email_code" || account.loginType === "phone_code";
+  await sendAccountStatusTelegramNotification(
+    { account, status, reason, canVerificationRelogin },
+    accountRecoveryKeyboard({
+      accountId,
+      canVerificationRelogin: status === "expired" && canVerificationRelogin,
+      canRestoreMonitor: status === "offline"
+    })
+  ).catch((error) => {
+    logger.warn("Failed to send account recovery Telegram notification", {
+      accountId,
+      error: error instanceof Error ? error.name : typeof error
+    });
+  });
+}
+
 function sanitizeMonitorDiagnosticError(error: unknown) {
   return (error instanceof Error ? error.message : String(error))
     .replace(
@@ -1259,6 +1395,20 @@ function classifyMonitorError(message: string) {
     return "expired";
   }
   return "transient";
+}
+
+function shouldSurfaceMonitorError(
+  message: string,
+  classification: ReturnType<typeof classifyMonitorError>,
+  consecutiveFailures: number,
+  maxRetryCount: number
+) {
+  if (classification !== "transient") return true;
+  return !isRetryableMonitorTransportError(message);
+}
+
+export function shouldSurfaceMonitorErrorForTest(message: string, consecutiveFailures: number, maxRetryCount: number) {
+  return shouldSurfaceMonitorError(message, classifyMonitorError(message), consecutiveFailures, maxRetryCount);
 }
 
 function parsePositiveIntSetting(value: string | undefined, fallback: number) {

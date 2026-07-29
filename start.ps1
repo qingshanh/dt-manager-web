@@ -298,6 +298,75 @@ function Stop-RuntimeManifestServices {
   }
 }
 
+function Test-StaleRuntimeManifest {
+  param($Manifest)
+
+  foreach ($service in @($Manifest.services)) {
+    $isLegacy = $null -ne $service.PSObject.Properties["legacy"] -and [bool]$service.legacy
+    $rootRecord = Get-RuntimeProcessRecord -ProcessId ([int]$service.rootPid)
+    $isOwned = if ($isLegacy) {
+      $null -ne $rootRecord -and (Test-RuntimeCreationTimeEqual -Expected ([string]$service.creationTime) -Actual $rootRecord.CreationDate)
+    } else {
+      Test-OwnedRuntimeProcess -ProcessId ([int]$service.rootPid) -CreationTime ([string]$service.creationTime) -InstanceId ([string]$Manifest.instanceId)
+    }
+    if ($isOwned) {
+      return $false
+    }
+  }
+  return $true
+}
+
+function Recover-StaleRuntimeManifestServices {
+  param($Manifest)
+
+  $verifiedLegacyServices = @()
+  foreach ($service in @($Manifest.services)) {
+    $candidate = Find-LegacyRuntimeService -Name ([string]$service.name) -Port ([int]$service.port) -ProjectRoot $root
+    if ($null -eq $candidate) {
+      continue
+    }
+    if ($candidate.status -ne "owned") {
+      throw "Stale runtime manifest cannot recover $($service.name) port $($service.port): $($candidate.reason)."
+    }
+    $descendantSnapshots = @(Get-DescendantProcessSnapshot -RootPid ([int]$candidate.rootPid))
+    Set-RuntimeServiceDescendantSnapshots -Service $candidate -Snapshots $descendantSnapshots | Out-Null
+    $verifiedLegacyServices += $candidate
+  }
+
+  foreach ($service in @($verifiedLegacyServices | Sort-Object { $_.name -eq "backend" } -Descending)) {
+    Write-Host ("[cleanup] stopping verified legacy {0} process tree at PID {1}..." -f $service.name, $service.rootPid)
+    if (-not (Stop-LegacyRuntimeService -Service $service)) {
+      throw "Verified legacy service '$($service.name)' did not fully stop."
+    }
+  }
+
+  foreach ($service in @($Manifest.services)) {
+    $ownerPid = Get-PortOwnerProcessId -Port ([int]$service.port)
+    if ($null -ne $ownerPid) {
+      throw "Stale runtime manifest recovery left $($service.name) port $($service.port) owned by PID $ownerPid."
+    }
+  }
+}
+
+function Recover-UntrackedLegacyRuntimeService {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet("backend", "frontend", "helper")][string]$Name,
+    [Parameter(Mandatory = $true)][int]$Port
+  )
+
+  $candidate = Find-LegacyRuntimeService -Name $Name -Port $Port -ProjectRoot $root
+  if ($null -eq $candidate -or $candidate.status -ne "owned") {
+    return
+  }
+
+  $descendantSnapshots = @(Get-DescendantProcessSnapshot -RootPid ([int]$candidate.rootPid))
+  Set-RuntimeServiceDescendantSnapshots -Service $candidate -Snapshots $descendantSnapshots | Out-Null
+  Write-Host ("[cleanup] stopping verified untracked {0} process tree at PID {1}..." -f $Name, $candidate.rootPid)
+  if (-not (Stop-LegacyRuntimeService -Service $candidate)) {
+    throw "Verified untracked service '$Name' did not fully stop."
+  }
+}
+
 function Assert-PortAvailable {
   param([int]$Port, [string]$Name)
 
@@ -467,9 +536,20 @@ $instanceId = [guid]::NewGuid().ToString("D")
 $manifest = New-RuntimeManifest -ProjectRoot $root -InstanceId $instanceId
 $previousManifest = Read-RuntimeManifest -Path $manifestPath -ExpectedProjectRoot $root
 if ($null -ne $previousManifest) {
-  Write-Host "[cleanup] stopping services owned by the previous runtime manifest..."
-  Stop-RuntimeManifestServices -Manifest $previousManifest
+  if (Test-StaleRuntimeManifest -Manifest $previousManifest) {
+    Write-Host "[cleanup] previous runtime manifest is stale; recovering only verified legacy project services..."
+    Recover-StaleRuntimeManifestServices -Manifest $previousManifest
+  } else {
+    Write-Host "[cleanup] stopping services owned by the previous runtime manifest..."
+    Stop-RuntimeManifestServices -Manifest $previousManifest
+  }
   Remove-RuntimeManifest -Path $manifestPath
+}
+
+Recover-UntrackedLegacyRuntimeService -Name "backend" -Port $BackendPort
+Recover-UntrackedLegacyRuntimeService -Name "frontend" -Port $FrontendPort
+if ($WithHelper) {
+  Recover-UntrackedLegacyRuntimeService -Name "helper" -Port $HelperPort
 }
 
 Assert-PortAvailable -Port $BackendPort -Name "Backend"

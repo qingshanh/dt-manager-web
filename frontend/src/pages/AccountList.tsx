@@ -11,6 +11,7 @@ import {
   EyeOutlined,
   NotificationOutlined,
   InfoCircleOutlined,
+  LoginOutlined,
   MoreOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
@@ -42,14 +43,25 @@ import {
 } from '../services/endpoints';
 import type { BulkAccountAction, DtAccountListItem, PagedData } from '../types';
 import { notifyMessageReadStateChanged } from '../services/ui-events';
+import VerificationReloginModal from '../components/accounts/VerificationReloginModal';
 
 const statusMap: Record<string, { color: string; label: string }> = {
   pending: { color: 'processing', label: '待验证' },
   online: { color: 'green', label: '在线' },
   offline: { color: 'default', label: '离线' },
   error: { color: 'red', label: '异常' },
-  expired: { color: 'orange', label: '过期' },
+  expired: { color: 'orange', label: '授权失效' },
 };
+
+function monitorStateLabel(state: DtAccountListItem['monitor_state'], enabled: boolean) {
+  if (state === 'retrying') return '监听重试中';
+  return enabled ? '监听中' : '未监听';
+}
+
+function canVerificationRelogin(account: DtAccountListItem) {
+  const usesCode = account.login_type === 'email_code' || account.login_type === 'phone_code';
+  return usesCode && (account.requires_relogin || account.status !== 'online' || !account.monitor_enabled);
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -119,6 +131,7 @@ export default function AccountList() {
   const [selectedAccountIds, setSelectedAccountIds] = useState<number[]>([]);
   const [validateImportedSessions, setValidateImportedSessions] = useState(false);
   const [copiedCell, setCopiedCell] = useState<string | null>(null);
+  const [verificationAccount, setVerificationAccount] = useState<DtAccountListItem | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const navigate = useNavigate();
   const { message, modal } = App.useApp();
@@ -425,7 +438,7 @@ export default function AccountList() {
         const tags = (
           <Space direction="vertical" size={2}>
             <Tag color={item.color} style={{ marginInlineEnd: 0 }}>{item.label}</Tag>
-            <Typography.Text type="secondary" style={{ fontSize: 11 }}>{record.monitor_enabled ? '监听中' : '未监听'}</Typography.Text>
+            <Typography.Text type="secondary" style={{ fontSize: 11 }}>{monitorStateLabel(record.monitor_state, record.monitor_enabled)}</Typography.Text>
           </Space>
         );
         return record.last_error ? <Tooltip title={record.last_error}>{tags}</Tooltip> : tags;
@@ -478,9 +491,14 @@ export default function AccountList() {
     },
     {
       title: '操作',
-      width: 92,
+      width: 124,
       render: (_, record) => (
         <Space size={2}>
+          {canVerificationRelogin(record) ? (
+            <Tooltip title="验证码重新登录">
+              <Button type="text" size="small" icon={<LoginOutlined />} onClick={() => setVerificationAccount(record)} />
+            </Tooltip>
+          ) : null}
           <Tooltip title={record.monitor_enabled ? '停止监听' : '启动监听'}>
             <Button
               size="small"
@@ -605,7 +623,7 @@ export default function AccountList() {
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: '8px 16px', margin: '10px 0', alignItems: 'center' }}>
                     <CopyableCell value={record.email} copied={copiedCell === `email:${record.id}`} onCopy={(value) => void copyCellValue(`email:${record.id}`, value)} maxWidth={360} />
-                    <Typography.Text type="secondary">{record.monitor_enabled ? '监听中' : '未监听'} · 未读 {record.unread_count}</Typography.Text>
+                    <Typography.Text type="secondary">{monitorStateLabel(record.monitor_state, record.monitor_enabled)} · 未读 {record.unread_count}</Typography.Text>
                     <CopyableCell value={record.dt_user_id} copied={copiedCell === `user:${record.id}`} onCopy={(value) => void copyCellValue(`user:${record.id}`, value)} maxWidth={240} />
                     <Typography.Text type="secondary">{record.last_login_at ? dayjs(record.last_login_at).format('MM-DD HH:mm') : '未登录'}</Typography.Text>
                   </div>
@@ -629,6 +647,9 @@ export default function AccountList() {
                       >
                         <Tooltip title="调整排序"><Button type="text" size="small" icon={<MoreOutlined />} /></Tooltip>
                       </Dropdown>
+                      {canVerificationRelogin(record) ? (
+                        <Tooltip title="验证码重新登录"><Button type="text" size="small" icon={<LoginOutlined />} onClick={() => setVerificationAccount(record)} /></Tooltip>
+                      ) : null}
                       <Tooltip title={record.monitor_enabled ? '停止监听' : '启动监听'}><Button type="text" size="small" icon={record.monitor_enabled ? <PauseCircleOutlined /> : <PlayCircleOutlined />} disabled={record.status === 'pending'} onClick={() => void handleToggleMonitor(record.id, record.monitor_enabled)} /></Tooltip>
                       <Tooltip title="账户详情"><Button type="text" size="small" icon={<InfoCircleOutlined />} onClick={() => navigate(`/accounts/${record.id}`)} /></Tooltip>
                       <Popconfirm title="确认删除此账户？相关消息和号码都会一起删除。" onConfirm={() => void handleDelete(record.id)} okText="确认删除" cancelText="取消">
@@ -661,6 +682,12 @@ export default function AccountList() {
           />
         </Card>
       )}
+      <VerificationReloginModal
+        open={verificationAccount !== null}
+        account={verificationAccount}
+        onCancel={() => setVerificationAccount(null)}
+        onSuccess={() => fetch(page, keyword, { force: true })}
+      />
     </div>
   );
 }

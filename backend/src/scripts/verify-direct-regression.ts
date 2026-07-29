@@ -66,26 +66,32 @@ type ResolvedAccount = {
 };
 
 const expectedCountryKeys = [
-  "US",
-  "CA",
-  "GB",
-  "BE",
-  "NL",
-  "RU",
-  "ES",
-  "CN",
-  "AU",
   "AT",
-  "FR",
-  "SE",
-  "MU",
-  "PL",
-  "ID",
+  "AU",
+  "BR",
+  "BE",
   "PR",
-  "CZ",
-  "MY",
+  "PL",
   "DK",
-  "RO"
+  "FR",
+  "FI",
+  "CO",
+  "NL",
+  "CA",
+  "CZ",
+  "LT",
+  "RO",
+  "US",
+  "MX",
+  "NO",
+  "SE",
+  "CH",
+  "ES",
+  "HU",
+  "IL",
+  "IT",
+  "GB",
+  "CL"
 ];
 
 async function main() {
@@ -142,7 +148,7 @@ async function main() {
   checks.push(checkDuplicateSessionMergeWithinVariant());
   checks.push(checkSessionImportTokenReuseGuard());
   checks.push(checkDirectMonitorHostDiagnostics());
-  checks.push(checkPreviewAreaCodeBackfill());
+  checks.push(checkPreviewNativeCommonRestRequestShape());
   checks.push(checkPhoneTelegramNotifications());
 
   if (options.staticOnly) {
@@ -187,7 +193,7 @@ async function main() {
   if (phone) {
     const actions = await gateway.buildPhoneActionDryRuns(account, {
       phoneNumber: phone.phoneNumber,
-      phone
+      phone: buildPhoneActionDryRunFixture(phone)
     });
     checks.push(checkPhoneActionDryRuns(actions, phone.status));
   } else {
@@ -516,6 +522,9 @@ function checkPhoneCountrySelection() {
   const validCanada = doesNotThrow(() =>
     assertPhoneCountrySelection({ country_code: 1, iso_country_code: "CA", country_key: "CA" })
   );
+  const validBrazil = doesNotThrow(() =>
+    assertPhoneCountrySelection({ country_code: 55, iso_country_code: "BR", country_key: "BR" })
+  );
   const rejectsBadCountryCode = throwsMessage(
     () => assertPhoneCountrySelection({ country_code: 33, iso_country_code: "CA", country_key: "CA" }),
     "does not match country_key CA"
@@ -531,10 +540,11 @@ function checkPhoneCountrySelection() {
 
   return {
     name: "phone_country_selection_guard",
-    ok: validFrance && validCanada && rejectsBadCountryCode && rejectsBadIso && rejectsUnknownKey,
+    ok: validFrance && validCanada && validBrazil && rejectsBadCountryCode && rejectsBadIso && rejectsUnknownKey,
     detail: {
       validFrance,
       validCanada,
+      validBrazil,
       rejectsBadCountryCode,
       rejectsBadIso,
       rejectsUnknownKey
@@ -544,20 +554,47 @@ function checkPhoneCountrySelection() {
 
 function checkPhoneVerificationFlags() {
   const routeText = readSourceFile("src/routes/accounts.ts");
+  const purchaseRoute = routeText.slice(
+    routeText.indexOf('accountsRouter.post("/:id/phone-numbers/purchase"'),
+    routeText.indexOf('accountsRouter.post("/:id/phone-numbers/:phoneId/renew"')
+  );
+  const purchaseConfirmation = routeText.slice(
+    routeText.indexOf("async function confirmPurchasedPhone"),
+    routeText.indexOf("async function importSessionAccount")
+  );
+  const actionRoutes = routeText.slice(
+    routeText.indexOf('accountsRouter.post("/:id/phone-numbers/:phoneId/renew"'),
+    routeText.indexOf('accountsRouter.delete("/:id/phone-numbers/:phoneId"')
+  );
   const purchaseUsesModeFlag =
-    routeText.includes("type PurchaseConfirmationSource = \"remote_phone_list\" | \"adb_phone_db\" | \"helper_purchase_response\"") &&
+    routeText.includes('type PurchaseConfirmationSource = "remote_phone_list"') &&
     routeText.includes("verificationSource: confirmation.source") &&
     routeText.includes("confirmed: confirmation.confirmed") &&
     routeText.includes("Direct purchase was not confirmed; local phone data was not changed");
-  const actionUsesModeFlag = routeText.includes("source: useDirect ? \"remote_phone_list\" : \"helper_action_response\"") &&
-    Boolean(routeText.match(/confirmed: useDirect/g)?.length);
+  const purchaseIsDirectOnly =
+    purchaseRoute.includes("directRefreshGateway.purchasePhoneNumber") &&
+    purchaseRoute.includes("activePhonePurchases.has(accountId)") &&
+    !purchaseRoute.includes("executeHelperAction") &&
+    !purchaseRoute.includes("assertPhoneFallbackSessionMatchesAccount") &&
+    !purchaseConfirmation.includes("listPhoneNumbersFromAdb");
+  const actionsUseDurableDirectOnly =
+    actionRoutes.includes("phoneActionCoordinator.execute") &&
+    actionRoutes.includes("renewPhoneNumberMutation") &&
+    actionRoutes.includes("updatePhoneNumberLabelMutation") &&
+    actionRoutes.includes("cancelPhoneNumberMutation") &&
+    actionRoutes.includes("pausePhoneNumberMutation") &&
+    actionRoutes.includes("resumePhoneNumberMutation") &&
+    !actionRoutes.includes("executeHelperAction") &&
+    !actionRoutes.includes("verifyDirectPhoneAction") &&
+    !actionRoutes.includes("schedulePhoneRenewalReconciliation");
 
   return {
     name: "phone_verification_flags",
-    ok: Boolean(purchaseUsesModeFlag && actionUsesModeFlag),
+    ok: Boolean(purchaseUsesModeFlag && purchaseIsDirectOnly && actionsUseDurableDirectOnly),
     detail: {
       purchaseUsesModeFlag,
-      actionUsesModeFlag
+      purchaseIsDirectOnly,
+      actionsUseDurableDirectOnly
     }
   };
 }
@@ -2070,28 +2107,38 @@ function checkDirectMonitorHostDiagnostics() {
   };
 }
 
-function checkPreviewAreaCodeBackfill() {
+function checkPreviewNativeCommonRestRequestShape() {
   const gatewayText = readSourceFile("src/services/dingtone/direct-gateway.ts");
-  const appliesBackfill = gatewayText.includes("applyPreviewAttemptAreaCode(normalizePhonePurchasePreview(preview), query)");
+  const appliesBackfill = gatewayText.includes("applyPreviewAttemptAreaCode(normalizePhonePurchasePreview(preview), query!)");
   const parsesQuery = gatewayText.includes("function parsePositiveQueryNumber") && gatewayText.includes('new URLSearchParams(query.replace(/^&+/, ""))');
   const preservesExplicitCandidateArea =
     gatewayText.includes("function applyPreviewAttemptAreaCode") &&
     gatewayText.includes("areaCode: candidate.areaCode ?? areaCode");
-  const randomAttempts = gatewayText.includes("return [...shuffleAreaCodes(requestConfig.randomAreaCodes), 0]");
-  const appRequestShape =
-    gatewayText.includes("includeAppRequestFields") &&
-    gatewayText.includes('queryPair("npanxx", -1)') &&
-    gatewayText.includes('queryPair("nearByareaCodeList", buildNearbyAreaCodeList') &&
-    gatewayText.includes('{ apiVersion: 1, providerKey: "providerList", includeAppContext: true, includeZeroAreaCode: true, includeAppRequestFields: true }');
+  const singleNativeCommonRestAttempt =
+    gatewayText.includes("const [query] = buildRequestPrivateNumberQueryAttempts(") &&
+    gatewayText.includes("buildAuthenticatedCommonRestQuery(account, runtime, trackCode, apiParams)") &&
+    !gatewayText.includes("for (let index = 0; index < 200");
+  const nativeCommonRestQueryShape =
+    gatewayText.includes("function buildAuthenticatedCommonRestQuery(") &&
+    gatewayText.includes('apiVersion: 5') &&
+    gatewayText.includes('providerKey: "providerList"') &&
+    gatewayText.includes('includeAppContext: false') &&
+    gatewayText.includes('leadingAmpersand: true') &&
+    gatewayText.includes('queryPair("deviceId", accountDeviceId(account))') &&
+    gatewayText.includes('queryPair("TrackCode", trackCode)') &&
+    gatewayText.includes('queryPair("userId", account.dtUserId)') &&
+    gatewayText.includes('queryPair("token", account.token)') &&
+    gatewayText.includes('queryPair("forceCheckNearByType", 0)') &&
+    gatewayText.includes('queryPair("needToPay", true)');
   return {
-    name: "phone_preview_area_code_backfill",
-    ok: appliesBackfill && parsesQuery && preservesExplicitCandidateArea && randomAttempts && appRequestShape,
+    name: "phone_preview_native_common_rest_request_shape",
+    ok: appliesBackfill && parsesQuery && preservesExplicitCandidateArea && singleNativeCommonRestAttempt && nativeCommonRestQueryShape,
     detail: {
       appliesBackfill,
       parsesQuery,
       preservesExplicitCandidateArea,
-      randomAttempts,
-      appRequestShape
+      singleNativeCommonRestAttempt,
+      nativeCommonRestQueryShape
     }
   };
 }
@@ -2325,9 +2372,21 @@ async function checkCountryKeyPurchaseDryRun(account: ResolvedAccount) {
       canada.params.countryCode === "1" &&
       canada.params.providerId === "2000" &&
       canada.params.packageServiceId === "DT02002" &&
+      canada.params.coupon === "" &&
+      canada.params.callplanId === "0" &&
+      canada.params.simCC === "" &&
+      canada.params.extraChargeMonthsCount === "0" &&
+      canada.params.apiVersion === "4" &&
+      canada.params.productId === undefined &&
       us?.label === "purchasePhone" &&
       us.params.countryCode === "1" &&
-      us.params.packageServiceId === "DT01001",
+      us.params.packageServiceId === "DT01001" &&
+      us.params.coupon === "" &&
+      us.params.callplanId === "0" &&
+      us.params.simCC === "" &&
+      us.params.extraChargeMonthsCount === "0" &&
+      us.params.apiVersion === "4" &&
+      us.params.productId === undefined,
     detail: {
       canada: canada?.params,
       us: us?.params
@@ -2447,6 +2506,11 @@ function checkPhoneActionDryRuns(actions: DirectPhoneActionDryRun[], phoneStatus
       renew.params.type === "0" &&
       renew.params.specialNumber === "0" &&
       renew.params.payYears === "1" &&
+      renew.params.coupon !== undefined &&
+      renew.params.callplanId !== undefined &&
+      renew.params.simCC !== undefined &&
+      (renew.params.oldPhoneNum !== undefined || renew.params.extraChargeMonthsCount !== undefined) &&
+      renew.params.productId === undefined &&
       Boolean(renew.params.providerId) &&
       Boolean(renew.params.packageServiceId) &&
       cancel?.apiName === "/pstn/share/deletePhoneNumber" &&
@@ -2573,6 +2637,45 @@ async function resolvePhone(accountId: number): Promise<DingtonePhoneNumber | nu
     isGoodNumber: phone.isGoodNumber,
     portoutInfo: phone.portoutInfo ?? undefined,
     rawJson: phone.rawJson ?? undefined
+  };
+}
+
+function buildPhoneActionDryRunFixture(phone: DingtonePhoneNumber): DingtonePhoneNumber {
+  let raw: Record<string, unknown> = {};
+  if (phone.rawJson) {
+    try {
+      const parsed = JSON.parse(phone.rawJson) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        raw = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // The regression fixture below is intentionally self-contained.
+    }
+  }
+
+  return {
+    ...phone,
+    allowReceiveSms: true,
+    rawJson: JSON.stringify({
+      ...raw,
+      phoneNumber: phone.phoneNumber,
+      displayName: phone.displayName ?? "",
+      primaryFlag: phone.isPrimary ? 1 : 0,
+      faxEnabled: 0,
+      slientFlag: 0,
+      suspendFlag: phone.status === "paused" ? 1 : 0,
+      callForwardFlag: 0,
+      forwardNumber: "",
+      forwardCountryCode: 0,
+      forwardDestCode: 0,
+      autoSMSReply: 0,
+      useVoicemail: 0,
+      voicemailId: "",
+      autoSMSContent: "",
+      defaultGreetings: 0,
+      autoRenew: phone.autoRenew ? 1 : 0,
+      filterSetting: { allowReceiveSMS: true }
+    })
   };
 }
 

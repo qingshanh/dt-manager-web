@@ -77,7 +77,7 @@ export const dingtoneGateway: DingtoneGateway = {
     return (await resolveGateway()).purchasePhoneNumber(account, payload);
   },
   async renewPhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
     phoneNumber: string,
     phone?: Partial<DingtonePhoneNumber>
   ): Promise<Partial<DingtonePhoneNumber>> {

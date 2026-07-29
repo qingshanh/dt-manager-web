@@ -158,7 +158,7 @@ export default function AppLayout() {
           content: data.content,
           raw_info: null,
           raw_k3: null,
-          k5_flag: null,
+          k5_flag: data.k5Flag ?? null,
           is_read: false,
           telegram_sent: false,
           telegram_msg_id: null,

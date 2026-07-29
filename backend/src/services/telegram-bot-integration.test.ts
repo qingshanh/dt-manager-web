@@ -172,7 +172,7 @@ test("telegram phone pages and recent messages use deterministic safe queries", 
   });
 });
 
-test("telegram integration edits callbacks, rejects invalid data, and preserves command-only danger", () => {
+test("telegram integration edits callbacks and keeps renew/cancel behind two-stage confirmation", () => {
   assert.match(source, /parseTelegramCallback\(callback\.data\)/);
   assert.match(source, /replyToCallback/);
   assert.match(source, /editMessageText/);
@@ -186,7 +186,12 @@ test("telegram integration edits callbacks, rejects invalid data, and preserves 
   ]) {
     assert.match(source, new RegExp(command.replace("/", "\\/")));
   }
-  assert.doesNotMatch(source, /callback_data:[^\n]*(buy|renew|pause|resume|cancel)/i);
+  assert.match(source, /renew_request/);
+  assert.match(source, /cancel_request/);
+  assert.match(source, /renew_confirm/);
+  assert.match(source, /cancel_confirm/);
+  assert.match(source, /buildPhoneActionVersion/);
+  assert.match(source, /activeTelegramPhoneActions/);
 });
 
 test("telegram error text redacts credentials before rendering", () => {
@@ -335,6 +340,24 @@ test("phone note callback returns a copyable set-phone-note command template", a
   );
   assert.match(reply.text, /<code>\/set_phone_note 433 91 新备注<\/code>/);
   assert.doesNotMatch(reply.text, /号码详情/);
+});
+
+test("phone action versions change when status, expiry or update time changes", () => {
+  const buildVersion = bot.buildPhoneActionVersion;
+  assert.equal(typeof buildVersion, "function");
+  if (typeof buildVersion !== "function") return;
+  const base = {
+    id: 91,
+    accountId: 433,
+    status: "active",
+    expiredTime: "1790000000000",
+    updatedAt: new Date("2026-07-23T00:00:00.000Z")
+  };
+  const first = (buildVersion as (phone: typeof base) => string)(base);
+  assert.match(first, /^[a-z0-9]{10}$/);
+  assert.notEqual((buildVersion as (phone: typeof base) => string)({ ...base, status: "cancelled" }), first);
+  assert.notEqual((buildVersion as (phone: typeof base) => string)({ ...base, expiredTime: "1800000000000" }), first);
+  assert.notEqual((buildVersion as (phone: typeof base) => string)({ ...base, updatedAt: new Date("2026-07-24T00:00:00.000Z") }), first);
 });
 
 test("telegram bot removes obsolete panel status and button truncation helpers", () => {

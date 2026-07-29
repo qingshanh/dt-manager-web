@@ -1,5 +1,6 @@
 import type { AccountSnapshot, Message, PhoneNumber, Setting } from "@prisma/client";
 import iconv from "iconv-lite";
+import { derivePhoneSmsReceptionState } from "./phone-sms-reception.js";
 
 const DEFAULT_CREDIT_EXCHANGE_RATIO = 0.02;
 
@@ -123,52 +124,12 @@ export function serializePhoneNumber(phone: PhoneNumber) {
     auto_renew: phone.autoRenew,
     is_primary: phone.isPrimary,
     is_good_number: phone.isGoodNumber,
-    allow_receive_sms: derivePhoneAllowReceiveSms(raw),
+    allow_receive_sms: derivePhoneSmsReceptionState(raw) ?? null,
     portout_info: repairUtf8Mojibake(phone.portoutInfo),
     raw_json: phone.rawJson,
     created_at: phone.createdAt,
     updated_at: phone.updatedAt
   };
-}
-
-function derivePhoneAllowReceiveSms(raw: Record<string, unknown> | null) {
-  if (!raw) {
-    return null;
-  }
-  const keys = ["allowReceiveSMS", "allowReceiveSms", "allow_receive_sms"];
-  const direct = pickBooleanValue(raw, keys);
-  if (direct !== null) {
-    return direct;
-  }
-  const filterSetting = raw.filterSetting ?? raw.filter_setting;
-  if (isRecord(filterSetting)) {
-    return pickBooleanValue(filterSetting, keys);
-  }
-  if (typeof filterSetting !== "string" || !filterSetting.trim()) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(filterSetting) as unknown;
-    return isRecord(parsed) ? pickBooleanValue(parsed, keys) : null;
-  } catch {
-    return null;
-  }
-}
-
-function pickBooleanValue(record: Record<string, unknown>, keys: string[]) {
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === "boolean") {
-      return value;
-    }
-    if (value === 1 || value === "1" || value === "true") {
-      return true;
-    }
-    if (value === 0 || value === -1 || value === "0" || value === "-1" || value === "false") {
-      return false;
-    }
-  }
-  return null;
 }
 
 function derivePhoneValidPeriodDays(gainTime: string | null, expiredTime: string | null, fallback: number | null) {

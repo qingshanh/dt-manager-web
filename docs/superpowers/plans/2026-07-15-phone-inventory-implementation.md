@@ -97,7 +97,7 @@ test("phone synchronization upserts remote rows and never deletes omitted local 
 Run:
 
 ```powershell
-Set-Location -LiteralPath 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web\backend'
+Set-Location -LiteralPath 'D:\work\dt-manager-web\backend'
 node --import tsx --test src/services/phone-number-store.test.ts
 ```
 
@@ -236,8 +236,8 @@ Expected: PASS，0 failed。
 Run:
 
 ```powershell
-git -C 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web' diff --stat
-git -C 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web' diff --check
+git -C 'D:\work\dt-manager-web' diff --stat
+git -C 'D:\work\dt-manager-web' diff --check
 ```
 
 Expected: 仅出现上述服务、测试和复用改动；`diff --check` 无输出。
@@ -844,9 +844,9 @@ invalidateCachedData('phone-inventory:');
 Run:
 
 ```powershell
-Set-Location -LiteralPath 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web\backend'
+Set-Location -LiteralPath 'D:\work\dt-manager-web\backend'
 node --import tsx --test src/routes/phone-inventory-ui.test.ts
-npm --prefix 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web\frontend' run build
+npm --prefix 'D:\work\dt-manager-web\frontend' run build
 ```
 
 Expected: 结构测试 PASS；前端构建 exit 0。
@@ -1243,9 +1243,9 @@ function formatDate(value: string | null) {
 Run:
 
 ```powershell
-Set-Location -LiteralPath 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web\backend'
+Set-Location -LiteralPath 'D:\work\dt-manager-web\backend'
 node --import tsx --test src/routes/phone-inventory-ui.test.ts
-npm --prefix 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web\frontend' run build
+npm --prefix 'D:\work\dt-manager-web\frontend' run build
 ```
 
 Expected: PASS；Vite 构建 exit 0。
@@ -1258,7 +1258,7 @@ Expected: PASS；Vite 构建 exit 0。
 - [ ] **Step 1: 运行手机号相关测试**
 
 ```powershell
-Set-Location -LiteralPath 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web\backend'
+Set-Location -LiteralPath 'D:\work\dt-manager-web\backend'
 node --import tsx --test src/services/phone-number-store.test.ts src/services/phone-inventory.test.ts src/routes/phone-inventory-ui.test.ts src/utils/serializers.test.ts src/routes/management-upgrades.test.ts
 ```
 
@@ -1275,7 +1275,7 @@ Expected: `tsc -p tsconfig.json` exit 0。
 - [ ] **Step 3: 运行前端生产构建**
 
 ```powershell
-npm --prefix 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web\frontend' run build
+npm --prefix 'D:\work\dt-manager-web\frontend' run build
 ```
 
 Expected: `tsc -b && vite build` exit 0。
@@ -1304,8 +1304,8 @@ http://127.0.0.1:5173/phone-numbers
 - [ ] **Step 5: 检查工作树但不提交**
 
 ```powershell
-git -C 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web' status --short
-git -C 'D:\Lance\hh\code\逆向学习\dingtalk\dt-manager-web' diff --check
+git -C 'D:\work\dt-manager-web' status --short
+git -C 'D:\work\dt-manager-web' diff --check
 ```
 
 Expected: 只包含设计文档、计划文档和手机号子系统改动；`diff --check` 无输出。

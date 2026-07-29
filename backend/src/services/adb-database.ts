@@ -5,6 +5,7 @@ import { rm } from "node:fs/promises";
 import type { DingtonePhoneNumber } from "./dingtone/types.js";
 import type { HelperSmsMessageRecord } from "./message-runtime.js";
 import { ADB_PATH, execAdb, resolveAdbApp, resolveAdbSerial, type AdbAppVariant } from "./adb-app.js";
+import { assertAdbAppSessionMatchesExpectedUser } from "./adb-session.js";
 
 
 const execFileAsync = promisify(execFile);
@@ -36,7 +37,11 @@ export async function dumpSmsMessagesFromAdb(limit: number, variant: AdbAppVaria
     .slice(0, Math.max(1, Math.min(100, limit)));
 }
 
-export async function listPhoneNumbersFromAdb(variant: AdbAppVariant = "dingtone"): Promise<DingtonePhoneNumber[]> {
+export async function listPhoneNumbersFromAdb(
+  variant: AdbAppVariant,
+  expectedDtUserId: string
+): Promise<DingtonePhoneNumber[]> {
+  await assertAdbAppSessionMatchesExpectedUser(variant, expectedDtUserId);
   const sql =
     "select _id,countryCode,areaCode,phoneNumber,payType,gainTime,payTime,expireTime,displayName,primaryFlag," +
     "silentFlag,suspendFlag,callForwardFlag,forwardNumber,forwardCountryCode,forwardDestCode,provision,isExpire," +

@@ -65,7 +65,7 @@ test("only the current route owner can run paired-link catch-up and web-offline 
   const listenLoopText = listenLoopStart >= 0 ? workerText.slice(listenLoopStart) : "";
   assert.match(listenLoopText, /linkOwnsRoute = await ensureRouteRegistration\(currentLinkSession\)/);
   assert.match(listenLoopText, /if \(Date\.now\(\) >= nextOfflineCatchupAt && currentLinkSession && linkOwnsRoute\)/);
-  assert.match(listenLoopText, /if \(Date\.now\(\) >= nextWebOfflinePollAt && currentLinkSession && linkOwnsRoute\)/);
+  assert.doesNotMatch(listenLoopText, /nextWebOfflinePollAt/);
 });
 
 test("push and link transports share a preemptible governor and clear only after stable route ownership", () => {
@@ -195,7 +195,8 @@ test("direct message listener keeps two paired workers active and rotates failed
   assert.match(source, /pushSession\.waitForPushes/);
   assert.match(source, /currentLinkSession\.waitForPushes/);
   assert.match(source, /while \(!listener\.preempted && hasRemainingListenWindow\(\) && diagnostics\.totalPushes\(\) < maxPushFrames\)/);
-  assert.match(source, /const waitUntil = Math\.min\([\s\S]*nextOfflineCatchupAt[\s\S]*nextWebOfflinePollAt/);
+  assert.match(source, /const waitUntil = Math\.min\([\s\S]*nextOfflineCatchupAt/);
+  assert.doesNotMatch(source, /nextWebOfflinePollAt/);
   assert.doesNotMatch(source, /discoverDirectPushHostsOnSession/);
   assert.doesNotMatch(source, /Direct account RTC host discovery completed/);
   assert.doesNotMatch(source, /DIRECT_RTC_DISCOVERY_TIMEOUT_MS/);
@@ -574,8 +575,10 @@ test("direct message listener immediately requests offline catch-up only for not
   assert.match(source, /requestOfflineCatchup\(currentLinkSession, host, "notify-only"\)/);
 });
 test("direct offline catch-up interval is conservative during long background listens", () => {
-  assert.match(source, /const DIRECT_OFFLINE_CATCHUP_INTERVAL_MS = 30_000/);
+  assert.match(source, /const DIRECT_OFFLINE_CATCHUP_INTERVAL_MS = 10 \* 60_000/);
   assert.match(source, /const DIRECT_NOTIFY_ONLY_CATCHUP_THROTTLE_MS = 60_000/);
+  assert.match(source, /const DIRECT_OFFLINE_CATCHUP_MAX_CONCURRENCY = 3/);
+  assert.match(source, /withDirectOfflineCatchupPermit/);
 });
 test("direct message listener reports offline catch-up attempts to monitor diagnostics", () => {
   assert.match(source, /onOfflineCatchup\?:/);
@@ -585,10 +588,10 @@ test("direct message listener reports offline catch-up attempts to monitor diagn
 
 test("direct offline catch-up retries soon after a failed template send", () => {
   assert.match(source, /DIRECT_OFFLINE_CATCHUP_RETRY_MS/);
-  assert.match(source, /offlineTemplateError \? Date\.now\(\) \+ DIRECT_OFFLINE_CATCHUP_RETRY_MS : deadline/);
+  assert.match(source, /responseReceived\s*\? Date\.now\(\) \+ directOfflineCatchupDelayMs\(input\.account\)\s*:\s*Date\.now\(\) \+ DIRECT_OFFLINE_CATCHUP_RETRY_MS/);
 });
 
-test("direct message listener polls team messages on the paired authenticated link", () => {
+test("direct message listener pulls all offline messages on the paired authenticated link", () => {
   assert.match(source, /onWebOfflineMessages\?:/);
   assert.match(source, /function pollWebOfflineMessagesOnGatewayHosts/);
   assert.match(source, /uniqueHosts\(\[runtime\.primaryHost, runtime\.backupHost\]\)/);
@@ -599,9 +602,19 @@ test("direct message listener polls team messages on the paired authenticated li
   assert.match(source, /normalizeDirectWebOfflineMessages\(payload, account\.appVariant\)/);
   assert.match(source, /await deliverDirectWebOfflineMessages\(messages, host, onMessages, deliveryTracker\)/);
   assert.match(source, /getDirectWebOfflineDeliveryTracker\(input\.account\)/);
-  assert.match(source, /requestWebOfflineMessages\(currentLinkSession, host\)/);
-  assert.match(source, /nextWebOfflinePollAt/);
+  assert.match(source, /requestWebOfflineMessages\(session, host\)/);
+  assert.doesNotMatch(source, /nextWebOfflinePollAt/);
   assert.doesNotMatch(source, /const webOfflinePollTimer = setInterval/);
+});
+test("direct native catch-up completes request receive normalize and delivery on the same authenticated link", () => {
+  const start = source.indexOf("  const requestOfflineCatchup = async");
+  const end = source.indexOf("\n  try {", start);
+  const text = start >= 0 && end > start ? source.slice(start, end) : "";
+  assert.match(text, /session\.sendConfiguredTemplate\("dt_direct_template_offline_messages"/);
+  assert.match(text, /requestWebOfflineMessages\(session, host\)/);
+  assert.match(text, /normalizeDirectWebOfflineMessages/);
+  assert.match(text, /deliverDirectWebOfflineMessages/);
+  assert.doesNotMatch(text, /new DirectSession/);
 });
 test("direct message listener leaves unknown non-SMS frames unconfirmed", () => {
   assert.match(source, /const smsPush = parsed\.type === 0x8107 && parsed\.status === 0x0103 \? tryParseSmsPush\(parsed\.raw\) \?\? tryParseSmsPush\(parsed\.body\) : null/);
@@ -854,7 +867,8 @@ test("direct listener avoids expensive decoders when no JSON or SMS payload is n
   assert.match(source, /const jsonPayload = shouldExtractJsonPayload \? extractJsonPayload\(parsed\.raw\) : null/);
   assert.match(source, /const smsPush = parsed\.type === 0x8107 && parsed\.status === 0x0103 \? tryParseSmsPush\(parsed\.raw\) \?\? tryParseSmsPush\(parsed\.body\) : null/);
   assert.match(source, /const candidatePush = frameToDirectPush\(frame\)/);
-  assert.match(source, /sms: tryParseSmsPush\(frame\.raw\) \?\? tryParseSmsPush\(frame\.body\)/);
+  assert.match(source, /const sms = tryParseSmsPush\(frame\.raw\) \?\? tryParseSmsPush\(frame\.body\)/);
+  assert.match(source, /jsonPayload: sms \? null : extractJsonPayload\(frame\.raw\)/);
 });
 test("active direct push readers parse SMS payloads before classifying 8107 response statuses", () => {
   const start = source.indexOf("  async waitForPushes(");
@@ -939,7 +953,7 @@ test("direct listener reconnects after a closed socket instead of treating it as
   assert.match(waitForPushes, /if \(isSocketClosedError\(error\)\) \{\s*throw error;\s*\}/);
   assert.match(source, /if \(!socket \|\| this\.closed \|\| socket\.destroyed \|\| !socket\.writable\) \{/);
 });
-test("direct listener keeps the authenticated socket alive with an in-session keepalive frame", () => {
+test("direct common sessions start the keepalive only after authenticated bootstrap", () => {
   assert.match(source, /const DIRECT_SESSION_KEEPALIVE_INTERVAL_MS = 5_000/);
   assert.match(source, /const DINGDONG_SESSION_KEEPALIVE_INTERVAL_MS = 5_000/);
   assert.match(source, /function directSessionKeepaliveIntervalMs\(account/);
@@ -957,7 +971,7 @@ test("direct listener keeps the authenticated socket alive with an in-session ke
   assert.match(source, /directSessionKeepaliveIntervalMs\(this\.account\)/);
   assert.match(source, /this\.keepaliveWriteCount \+= 1/);
   assert.match(source, /keepaliveWrites=\$\{this\.keepaliveWriteCount\}/);
-  assert.match(source, /async open\(account: DirectSessionAccount\) \{\s*await this\.openPrelogin\(account\);\s*await this\.startSocketKeepalive\(\);\s*await this\.bootstrapAuthenticatedSession\(account\)/);
+  assert.match(source, /async open\(account: DirectSessionAccount\) \{\s*await this\.openPrelogin\(account\);\s*await this\.bootstrapAuthenticatedSession\(account\);\s*await this\.startSocketKeepalive\(\)/);
   assert.match(source, /this\.route = Buffer\.from\(preloginResp\.body\.subarray\(8, 16\)\)/);
   assert.match(source, /this\.stopSocketKeepalive\(\)/);
   assert.match(source, /while \(this\.buffer\[0\] === 0xff\)/);

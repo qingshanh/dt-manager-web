@@ -160,7 +160,7 @@ export function formatCommandHelp() {
     "<code>/panel</code> <code>/accounts</code> <code>/account</code> <code>/phones</code> <code>/messages</code> <code>/status</code> <code>/countries</code> <code>/preview_number</code>",
     "",
     "<b>安全操作</b>",
-    "<code>/start_monitor</code> <code>/stop_monitor</code> <code>/notify</code> <code>/set_note</code> <code>/clear_note</code> <code>/set_phone_note</code> <code>/clear_phone_note</code> <code>/refresh_account</code> <code>/refresh_phones</code> <code>/code</code>",
+    "<code>/start_monitor</code> <code>/stop_monitor</code> <code>/notify</code> <code>/login_code</code> <code>/set_note</code> <code>/clear_note</code> <code>/set_phone_note</code> <code>/clear_phone_note</code> <code>/refresh_account</code> <code>/refresh_phones</code> <code>/code</code>",
     "",
     "<b>高级危险操作</b>",
     "<code>/buy_number</code> <code>/renew_phone</code> <code>/pause_phone</code> <code>/resume_phone</code> <code>/cancel_phone</code> <code>/trace_access_code</code>",
@@ -290,6 +290,34 @@ export function accountActionKeyboard(account: {
   };
 }
 
+export function accountRecoveryKeyboard(input: {
+  accountId: number;
+  canVerificationRelogin: boolean;
+  canRestoreMonitor: boolean;
+}): TelegramInlineKeyboardMarkup {
+  const recoveryRow: TelegramInlineKeyboardButton[] = [];
+  if (input.canVerificationRelogin) {
+    recoveryRow.push(callbackButton("发送登录验证码", {
+      scope: "account",
+      action: "relogin_send_code",
+      accountId: input.accountId
+    }));
+  }
+  if (input.canRestoreMonitor) {
+    recoveryRow.push(callbackButton("恢复监听", {
+      scope: "account",
+      action: "monitor_on",
+      accountId: input.accountId
+    }));
+  }
+  return {
+    inline_keyboard: [
+      ...(recoveryRow.length > 0 ? [recoveryRow] : []),
+      [callbackButton("查看账户", { scope: "account", action: "detail", accountId: input.accountId })]
+    ]
+  };
+}
+
 export function phoneListKeyboard(
   accountId: number,
   phones: Array<{ id: number; phoneNumber: string }>,
@@ -315,6 +343,35 @@ export function phoneDetailKeyboard(accountId: number, phoneId: number): Telegra
     inline_keyboard: [
       [callbackButton("✏️ 修改备注命令", { scope: "phone", action: "note", accountId, phoneId })],
       [callbackButton("⬅️ 返回号码列表", { scope: "account", action: "phones", accountId, page: 1 })]
+    ]
+  };
+}
+
+export function phoneExpiryActionKeyboard(accountId: number, phoneId: number): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[
+      callbackButton("续期号码", { scope: "phone", action: "renew_request", accountId, phoneId }),
+      callbackButton("取消号码", { scope: "phone", action: "cancel_request", accountId, phoneId })
+    ]]
+  };
+}
+
+export function phoneActionConfirmationKeyboard(
+  action: "renew" | "cancel",
+  accountId: number,
+  phoneId: number,
+  version: string
+): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [callbackButton(action === "renew" ? "确认续期" : "确认取消", {
+        scope: "phone",
+        action: action === "renew" ? "renew_confirm" : "cancel_confirm",
+        accountId,
+        phoneId,
+        version
+      })],
+      [callbackButton("返回号码详情", { scope: "phone", action: "detail", accountId, phoneId })]
     ]
   };
 }

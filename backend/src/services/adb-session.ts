@@ -38,6 +38,26 @@ export async function exportSessionFromAdbConfig(variant: AdbAppVariant): Promis
   );
 }
 
+export function assertAdbSessionMatchesExpectedUser(
+  session: Pick<DingtoneSessionExport, "dtUserId">,
+  expectedDtUserId: string,
+  variant: AdbAppVariant
+) {
+  if (session.dtUserId !== expectedDtUserId) {
+    throw new AppError(
+      `The active ${variant} App session does not match the requested account. Switch the emulator to the target account before using App/ADB fallback.`,
+      409,
+      409
+    );
+  }
+}
+
+export async function assertAdbAppSessionMatchesExpectedUser(variant: AdbAppVariant, expectedDtUserId: string) {
+  const session = await exportSessionFromAdbConfig(variant);
+  assertAdbSessionMatchesExpectedUser(session, expectedDtUserId, variant);
+  return session;
+}
+
 async function pullAppFile(serial: string, remotePath: string, localPath: string) {
   await execAdb(["-s", serial, "root"]).catch(() => undefined);
   try {

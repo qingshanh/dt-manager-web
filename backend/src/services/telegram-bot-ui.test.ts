@@ -16,7 +16,9 @@ import {
   limitTelegramMessage,
   mainPanelKeyboard,
   phoneAccountKeyboard,
+  phoneActionConfirmationKeyboard,
   phoneDetailKeyboard,
+  phoneExpiryActionKeyboard,
   phoneListKeyboard,
   type TelegramInlineKeyboardMarkup
 } from "./telegram-bot-ui.js";
@@ -144,13 +146,21 @@ test("telegram keyboards encode all navigation and safe account actions", () => 
   const inverseAccountActions = accountActionKeyboard({ id: 433, monitorEnabled: false, telegramNotify: true });
   const phones = phoneListKeyboard(433, [{ id: 91, phoneNumber: "3197005" }], 2, 3);
   const phoneDetail = phoneDetailKeyboard(433, 91);
+  const expiryActions = phoneExpiryActionKeyboard(433, 91);
+  const renewConfirmation = phoneActionConfirmationKeyboard("renew", 433, 91, "a1b2c3d4");
+  const cancelConfirmation = phoneActionConfirmationKeyboard("cancel", 433, 91, "f5e6d7c8");
   const singlePage = accountListKeyboard([], 1, 1);
-  const keyboards = [main, accounts, phoneAccounts, accountActions, inverseAccountActions, phones, phoneDetail, singlePage];
+  const navigationKeyboards = [main, accounts, phoneAccounts, accountActions, inverseAccountActions, phones, phoneDetail, singlePage];
+  const keyboards = [...navigationKeyboards, expiryActions, renewConfirmation, cancelConfirmation];
 
   const serialized = JSON.stringify(keyboards);
   assert.match(serialized, /账户管理/);
   assert.match(serialized, /手机号管理/);
-  assert.doesNotMatch(serialized, /购号|续费|暂停|恢复|取消|buy|renew|pause|resume|cancel/i);
+  assert.doesNotMatch(JSON.stringify(navigationKeyboards), /购号|续费|暂停|恢复|取消|buy|renew|pause|resume|cancel/i);
+  assert.match(serialized, /续期号码/);
+  assert.match(serialized, /取消号码/);
+  assert.match(serialized, /确认续期/);
+  assert.match(serialized, /确认取消/);
   for (const keyboard of keyboards) {
     for (const button of buttons(keyboard)) {
       assert.ok(Buffer.byteLength(button.callback_data, "utf8") <= 64);
@@ -197,6 +207,18 @@ test("telegram keyboards encode all navigation and safe account actions", () => 
   assertCallbacks(phoneDetail, [
     { scope: "phone", action: "note", accountId: 433, phoneId: 91 },
     { scope: "account", action: "phones", accountId: 433, page: 1 }
+  ]);
+  assertCallbacks(expiryActions, [
+    { scope: "phone", action: "renew_request", accountId: 433, phoneId: 91 },
+    { scope: "phone", action: "cancel_request", accountId: 433, phoneId: 91 }
+  ]);
+  assertCallbacks(renewConfirmation, [
+    { scope: "phone", action: "renew_confirm", accountId: 433, phoneId: 91, version: "a1b2c3d4" },
+    { scope: "phone", action: "detail", accountId: 433, phoneId: 91 }
+  ]);
+  assertCallbacks(cancelConfirmation, [
+    { scope: "phone", action: "cancel_confirm", accountId: 433, phoneId: 91, version: "f5e6d7c8" },
+    { scope: "phone", action: "detail", accountId: 433, phoneId: 91 }
   ]);
   assertCallbacks(singlePage, [{ scope: "panel", action: "root" }]);
   for (const keyboard of keyboards) {

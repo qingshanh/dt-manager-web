@@ -18,6 +18,8 @@ import type {
   PhoneInventoryResponse,
   PhoneStatus,
   PhoneActionResult,
+  PhoneActionOperation,
+  PhoneActionOperationEnvelope,
   PhoneSmsReceptionRepairResult,
   PhoneCountryOption,
   PhonePurchasePreview,
@@ -81,6 +83,7 @@ export const cacheKeys = {
       pageSize?: number;
       keyword?: string;
       msg_type?: Message['msg_type'];
+      credit_only?: boolean;
       exclude_system?: boolean;
       is_read?: boolean;
     },
@@ -236,7 +239,7 @@ export async function sendVerificationCode(id: number, options?: { fresh_device?
 }
 
 export async function verifyCode(id: number, code: string) {
-  const res = await api.post<ApiResponse<{ dt_user_id: string; dt_token: string; status: string; snapshot?: DtAccountDetail['snapshot']; refresh_error?: string | null }>>(
+  const res = await api.post<ApiResponse<{ dt_user_id: string; dt_token: string; status: string; monitor_started: boolean; monitor_error: string | null; snapshot?: DtAccountDetail['snapshot']; refresh_error?: string | null }>>(
     `/accounts/${id}/verify-code`,
     { code },
     { timeout: 120_000 },
@@ -277,10 +280,16 @@ export async function reLogin(id: number) {
 }
 
 export async function refreshAccount(id: number) {
-  const res = await api.post<ApiResponse<{ snapshot: DtAccountDetail['snapshot']; refresh_error: string | null; cached: boolean }>>(
+  const res = await api.post<ApiResponse<{
+    snapshot: DtAccountDetail['snapshot'];
+    refresh_error: string | null;
+    cached: boolean;
+    freshness: 'fresh' | 'partial' | 'cached';
+    refreshed_at: string;
+  }>>(
     `/accounts/${id}/refresh`,
     undefined,
-    { timeout: 12_000 },
+    { timeout: 20_000 },
   );
   invalidateAccountCaches(id);
   return res.data.data;
@@ -307,6 +316,7 @@ export async function getAccountMessages(
     pageSize?: number;
     keyword?: string;
     msg_type?: Message['msg_type'];
+    credit_only?: boolean;
     exclude_system?: boolean;
     is_read?: boolean;
   },
@@ -315,8 +325,9 @@ export async function getAccountMessages(
   return fetchCachedData(cacheKeys.accountMessages(accountId, params), CACHE_TTL_MS.accountMessages, async () => {
     const isReadParam = params?.is_read === undefined ? undefined : String(params.is_read);
     const excludeSystemParam = params?.exclude_system === undefined ? undefined : String(params.exclude_system);
+    const creditOnlyParam = params?.credit_only === undefined ? undefined : String(params.credit_only);
     const res = await api.get<ApiResponse<PagedData<Message>>>(`/accounts/${accountId}/messages`, {
-      params: { ...params, is_read: isReadParam, exclude_system: excludeSystemParam },
+      params: { ...params, is_read: isReadParam, exclude_system: excludeSystemParam, credit_only: creditOnlyParam },
       timeout: PAGE_NAVIGATION_TIMEOUT_MS,
     });
     return res.data.data;
@@ -483,10 +494,15 @@ export async function refreshAllPhoneNumbers() {
 }
 
 export async function syncPhoneNumbers(accountId: number) {
-  const res = await api.post<ApiResponse<{ phone_numbers: PhoneNumber[]; refresh_error: string | null; cached: boolean }>>(
+  const res = await api.post<ApiResponse<{
+    phone_numbers: PhoneNumber[];
+    refresh_error: string | null;
+    cached: boolean;
+    refresh_pending: boolean;
+  }>>(
     `/accounts/${accountId}/phone-numbers/sync`,
     undefined,
-    { timeout: 120_000 },
+    { timeout: 20_000 },
   );
   invalidateAccountCaches(accountId);
   return res.data.data;
@@ -549,16 +565,20 @@ export async function refreshPointStoreOrder(accountId: number, orderId: number)
   return res.data.data;
 }
 
-export async function renewPhoneNumber(accountId: number, phoneId: number) {
+export async function renewPhoneNumber(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/renew`, {
     confirm: true,
-  });
+    request_id: requestId,
+  }, { timeout: 20_000 });
   invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
 export async function updatePhoneNumberLabel(accountId: number, phoneId: number, data: UpdatePhoneLabelBody) {
-  const res = await api.put<ApiResponse<PhoneNumber>>(`/accounts/${accountId}/phone-numbers/${phoneId}/label`, data);
+  const res = await api.put<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/label`, {
+    ...data,
+    request_id: data.request_id ?? crypto.randomUUID(),
+  }, { timeout: 20_000 });
   invalidateAccountCaches(accountId);
   return res.data.data;
 }
@@ -566,35 +586,52 @@ export async function updatePhoneNumberLabel(accountId: number, phoneId: number,
 export async function enablePhoneSmsReception(accountId: number) {
   const res = await api.post<ApiResponse<PhoneSmsReceptionRepairResult>>(
     `/accounts/${accountId}/phone-numbers/enable-sms-reception`,
-    { confirm: true },
-    { timeout: 120_000 },
+    { confirm: true, request_id: crypto.randomUUID() },
+    { timeout: 20_000 },
   );
   invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
-export async function cancelPhoneNumber(accountId: number, phoneId: number) {
+export async function cancelPhoneNumber(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/cancel`, {
     confirm: true,
-  });
+    request_id: requestId,
+  }, { timeout: 20_000 });
   invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
-export async function pausePhoneNumber(accountId: number, phoneId: number) {
+export async function pausePhoneNumber(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/pause`, {
     confirm: true,
-  });
+    request_id: requestId,
+  }, { timeout: 20_000 });
   invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
-export async function resumePhoneNumber(accountId: number, phoneId: number) {
+export async function resumePhoneNumber(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/resume`, {
     confirm: true,
-  });
+    request_id: requestId,
+  }, { timeout: 20_000 });
   invalidateAccountCaches(accountId);
   return res.data.data;
+}
+
+export async function getPhoneActionOperation(accountId: number, operationId: number) {
+  const res = await api.get<ApiResponse<PhoneActionOperationEnvelope>>(
+    `/accounts/${accountId}/phone-actions/${operationId}`,
+  );
+  return res.data.data.operation;
+}
+
+export async function getActivePhoneActionOperation(accountId: number, phoneId: number) {
+  const res = await api.get<ApiResponse<{ operation: PhoneActionOperation | null }>>(
+    `/accounts/${accountId}/phone-numbers/${phoneId}/operations/active`,
+  );
+  return res.data.data.operation;
 }
 
 export async function deletePhoneNumber(accountId: number, phoneId: number) {

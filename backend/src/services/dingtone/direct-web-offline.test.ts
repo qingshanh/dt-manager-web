@@ -5,8 +5,10 @@ import {
   buildGetWebOfflineMessageQuery,
   createDirectWebOfflineDeliveryTrackerForTest,
   deliverDirectWebOfflineMessagesForTest,
+  directOfflineCatchupDelayMsForTest,
   isSocketClosedError,
-  normalizeDirectWebOfflineMessages
+  normalizeDirectWebOfflineMessages,
+  withDirectOfflineCatchupPermitForTest
 } from "./direct-gateway.js";
 import { parseTeamMessageMeta, renderTeamMessageContent } from "../team-message-normalizer.js";
 import zlib from "node:zlib";
@@ -189,6 +191,102 @@ test("promotes common-event credit metadata to its inner secretary type", () => 
   assert.doesNotThrow(() => JSON.parse(rows[0]!.content));
 });
 
+test("keeps ordinary inbound SMS records outside the team conversation", () => {
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [
+      {
+        conversationType: 1,
+        conversationId: "+12065550111|+120655507371",
+        msgContent: "Your verification code is 246810",
+        msgId: "offline-sms-1001",
+        msgReceiverID: "+120655507371",
+        msgSenderID: "+12065550111",
+        msgTimeStamp: 1_800_000_003,
+        msgType: 25
+      }
+    ]
+  }, "dingdong");
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.conversationType, 1);
+  assert.equal(rows[0]?.conversationId, "+12065550111|+120655507371");
+  assert.equal(rows[0]?.senderId, "+12065550111");
+  assert.equal(rows[0]?.msgId, "offline-sms-1001");
+  assert.equal(rows[0]?.content, "Your verification code is 246810");
+  assert.equal(rows[0]?.type, 25);
+  assert.equal(rows[0]?.data1, "+12065550111");
+  assert.equal(rows[0]?.data3, "direct-web-offline");
+});
+
+test("extracts the usable text from non-team JSON and MMS-like envelopes", () => {
+  const rows = normalizeDirectWebOfflineMessages({
+    data: {
+      offlineMessages: [
+        {
+          content: JSON.stringify({ content: "Photo received", mediaUrl: "https://invalid.example/image.jpg" }),
+          from: "+447700900123",
+          id: "offline-mms-1002",
+          timestamp: 1_800_000_004,
+          type: 26
+        }
+      ]
+    }
+  });
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.conversationType, 1);
+  assert.equal(rows[0]?.senderId, "+447700900123");
+  assert.equal(rows[0]?.msgId, "offline-mms-1002");
+  assert.equal(rows[0]?.content, "Photo received");
+  assert.equal(rows[0]?.type, 26);
+});
+
+test("renders TalkU secretary boss-push envelopes as readable team messages", () => {
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [
+      {
+        content: JSON.stringify({
+          schemaType: 4,
+          pushContent: "Please verify your identity",
+          body: { showStyle: 1 }
+        }),
+        from: "2684354560",
+        msgId: "boss-push-schema-4",
+        msgType: 3300,
+        msgTimeStamp: 1_800_000_005
+      }
+    ]
+  }, "dingtone");
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.conversationType, 4);
+  assert.equal(rows[0]?.conversationId, "10000");
+  assert.equal(rows[0]?.senderId, "说道团队");
+  assert.equal(rows[0]?.content, "Please verify your identity");
+  assert.equal(rows[0]?.type, 3300);
+});
+
+test("keeps purchased-number credit deductions inside the TalkU team conversation", () => {
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [{
+      msgContent: "+61 4800000123:1500",
+      msgSenderID: "2684354560",
+      msgId: "purchase-secretary-au",
+      msgType: 1048578,
+      msgTimeStamp: 1_800_000_006
+    }]
+  }, "dingtone");
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]?.conversationId, "10000");
+  assert.equal(rows[0]?.senderId, "说道团队");
+  assert.equal(rows[0]?.content, "+61 4800000123:1500");
+  assert.equal(rows[0]?.type, 1048578);
+});
+
 test("does not mix non-secretary web offer messages into the team conversation", () => {
   const rows = normalizeDirectWebOfflineMessages({
     Result: 1,
@@ -363,6 +461,41 @@ test("bounds the web-offline delivery cache and falls back to a stable signature
   );
 
   assert.deepEqual(delivered, [["First", "Second"], ["Third"], ["First"]]);
+});
+
+test("delivers large offline responses in bounded batches", async () => {
+  const tracker = createDirectWebOfflineDeliveryTrackerForTest(500);
+  const batchSizes: number[] = [];
+  const messages = Array.from({ length: 205 }, (_, index) => ({
+    msgId: `offline-${index}`,
+    content: `Message ${index}`,
+    timestamp: index + 1
+  }));
+
+  await deliverDirectWebOfflineMessagesForTest(messages, "host-a", async (batch) => {
+    batchSizes.push(batch.length);
+  }, tracker);
+
+  assert.deepEqual(batchSizes, [100, 100, 5]);
+});
+
+test("bounds concurrent account catch-up work and deterministically staggers safety sweeps", async () => {
+  let active = 0;
+  let maximum = 0;
+  await Promise.all(Array.from({ length: 9 }, async () => {
+    await withDirectOfflineCatchupPermitForTest(async () => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active -= 1;
+    });
+  }));
+
+  assert.equal(maximum, 3);
+  const first = directOfflineCatchupDelayMsForTest("100000000000002");
+  assert.equal(first, directOfflineCatchupDelayMsForTest("100000000000002"));
+  assert.ok(first >= 10 * 60_000);
+  assert.ok(first < 11 * 60_000);
 });
 
 test("treats closed direct sockets as reconnectable failures instead of empty listens", () => {

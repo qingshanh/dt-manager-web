@@ -98,6 +98,39 @@ test("serializePhoneNumber exposes the per-number SMS receive switch", () => {
   assert.equal(serialized.allow_receive_sms, false);
 });
 
+test("serializePhoneNumber treats an inactive filter default as an unknown SMS state", () => {
+  const serialized = serializePhoneNumber({
+    id: 2,
+    accountId: 2,
+    phoneNumber: "525500000002",
+    countryCode: 52,
+    providerId: 1,
+    displayName: "Mexico",
+    status: PhoneStatus.active,
+    purchaseType: null,
+    payType: null,
+    validPeriodDays: null,
+    gainTime: null,
+    expiredTime: null,
+    autoRenew: true,
+    isPrimary: false,
+    isGoodNumber: false,
+    portoutInfo: null,
+    rawJson: JSON.stringify({
+      filterSetting: JSON.stringify({
+        useBlock: 0,
+        callBlockSetting: 0,
+        callBlockHandle: 0,
+        allowReceiveSMS: false
+      })
+    }),
+    createdAt: new Date("2026-07-12T00:00:00.000Z"),
+    updatedAt: new Date("2026-07-12T00:00:00.000Z")
+  });
+
+  assert.equal(serialized.allow_receive_sms, null);
+});
+
 function snapshot(overrides: Partial<AccountSnapshot> = {}): AccountSnapshot {
   return {
     id: 1,

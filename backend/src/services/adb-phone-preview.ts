@@ -4,15 +4,18 @@ import { join } from "node:path";
 import { readFile, rm } from "node:fs/promises";
 import type { DingtonePhonePurchasePreview } from "./dingtone/types.js";
 import { execAdb, resolveAdbApp, resolveAdbSerial, type AdbAppVariant } from "./adb-app.js";
+import { assertAdbAppSessionMatchesExpectedUser } from "./adb-session.js";
 
 const execFileAsync = promisify(execFile);
 const SEARCH_ACTIVITY = "me.dingtone.app.im.activity.PrivatePhoneSearchActivity";
 
 export async function previewPhoneNumbersFromAdb(
   countryCode: number,
-  isoCountryCode?: string | null,
-  variant: AdbAppVariant = "dingtone"
+  isoCountryCode: string | null | undefined,
+  variant: AdbAppVariant,
+  expectedDtUserId: string
 ): Promise<DingtonePhonePurchasePreview> {
+  await assertAdbAppSessionMatchesExpectedUser(variant, expectedDtUserId);
   const serial = await resolveAdbSerial();
   const app = resolveAdbApp(variant);
   const applyPhoneType = resolveApplyPhoneType(countryCode, isoCountryCode);

@@ -14,6 +14,7 @@ export type AppEvent =
         toNumber: string | null;
         content: string;
         msgType?: string;
+        k5Flag?: number | null;
         receivedAt: string;
       };
     };

@@ -36,6 +36,26 @@ enum PhoneStatus {
   pending
 }
 
+enum PhoneActionType {
+  renew
+  cancel
+  pause
+  resume
+  update_label
+  enable_sms
+  reactivate
+}
+
+enum PhoneActionState {
+  prepared
+  writing
+  awaiting_confirmation
+  confirmed
+  confirmed_no_effect
+  failed_before_write
+  manual_review
+}
+
 enum MessageDirection {
   incoming
   outgoing
@@ -93,6 +113,7 @@ model DtAccount {
   messages        Message[]
   monitorSessions MonitorSession[]
   pointStoreOrders PointStoreOrder[]
+  phoneActionOperations PhoneActionOperation[]
 
   @@index([adminId])
   @@index([status])
@@ -153,10 +174,47 @@ model PhoneNumber {
   createdAt       DateTime    @default(now()) @map("created_at")
   updatedAt       DateTime    @updatedAt @map("updated_at")
   account         DtAccount   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  phoneActionOperations PhoneActionOperation[]
 
   @@unique([accountId, phoneNumber])
   @@index([accountId, status])
   @@map("phone_numbers")
+}
+
+model PhoneActionOperation {
+  id                 Int              @id @default(autoincrement())
+  accountId          Int              @map("account_id")
+  phoneId            Int              @map("phone_id")
+  action             PhoneActionType
+  state              PhoneActionState @default(prepared)
+  appVariant         AppVariant       @map("app_variant")
+  idempotencyKey     String           @unique @map("idempotency_key")
+  activeLockKey      String?          @unique @map("active_lock_key")
+  baselineStatus     PhoneStatus?     @map("baseline_status")
+  baselineExpiry     String?          @map("baseline_expiry")
+  balanceBefore      Float?           @map("balance_before")
+  balanceAfter       Float?           @map("balance_after")
+  quotedPrice        Float?           @map("quoted_price")
+  confirmedExpiry    String?          @map("confirmed_expiry")
+  extensionMonths    Int?             @map("extension_months")
+  evidenceAt         DateTime?        @map("evidence_at")
+  requestFingerprint String?          @map("request_fingerprint")
+  requestPayloadJson String?          @map("request_payload_json")
+  responseClass      String?          @map("response_class")
+  errorSummary       String?          @map("error_summary")
+  confirmationSource String?          @map("confirmation_source")
+  reconcileAttempts  Int              @default(0) @map("reconcile_attempts")
+  writeStartedAt     DateTime?        @map("write_started_at")
+  writeCompletedAt   DateTime?        @map("write_completed_at")
+  confirmedAt        DateTime?        @map("confirmed_at")
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+  account            DtAccount        @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  phone              PhoneNumber      @relation(fields: [phoneId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, state, updatedAt])
+  @@index([phoneId, createdAt(sort: Desc)])
+  @@map("phone_action_operations")
 }
 
 model Message {

@@ -12,6 +12,7 @@ import {
   Modal,
   Popconfirm,
   Row,
+  Segmented,
   Select,
   Space,
   Statistic,
@@ -25,6 +26,7 @@ import {
   ArrowLeftOutlined,
   CopyOutlined,
   DeleteOutlined,
+  LoginOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
   PlusOutlined,
@@ -46,6 +48,7 @@ import {
   getAccountMessages,
   getAccountPointStore,
   getPhoneNumberCountries,
+  getPhoneActionOperation,
   getPhoneNumbers,
   isCachedDataFresh,
   readCachedData,
@@ -79,7 +82,9 @@ import type {
   PhoneCountryOption,
   PhoneNumber,
   PhoneActionResult,
+  PhoneActionOperation,
   PhoneActionVerification,
+  PhoneSmsReceptionDiagnostic,
   PhonePurchaseCandidate,
   PhonePurchasePreview,
   PhoneStatus,
@@ -88,10 +93,12 @@ import type {
   SSENewMessageEvent,
   ValidateSessionResult,
 } from '../types';
+import { getOrCreateAccountRequest, isCurrentAccountRequest } from '../utils/account-request';
 import { notifyMessageReadStateChanged } from '../services/ui-events';
 import DirectSessionImportModal, {
   type DirectSessionImportValues,
 } from '../components/accounts/DirectSessionImportModal';
+import VerificationReloginModal from '../components/accounts/VerificationReloginModal';
 
 type SnapshotExtras = {
   dtDingtoneId: string | null;
@@ -117,6 +124,15 @@ type AccessCodeProbeFormValues = {
 };
 
 const LOCAL_MESSAGE_POLL_MS = 30_000;
+const PHONE_AUTO_SYNC_MAX_AGE_MS = 15 * 60 * 1000;
+
+function shouldAutoSyncPhoneNumbers(items: PhoneNumber[], now = Date.now()) {
+  if (items.length === 0) {
+    return true;
+  }
+  const latestUpdatedAt = Math.max(...items.map((item) => Date.parse(item.updated_at)).filter(Number.isFinite));
+  return !Number.isFinite(latestUpdatedAt) || now - latestUpdatedAt >= PHONE_AUTO_SYNC_MAX_AGE_MS;
+}
 
 const loginTypeLabelMap: Record<string, string> = {
   email_code: '邮箱验证码',
@@ -654,6 +670,12 @@ function formatPhoneVerificationSuffix(verification?: PhoneActionVerification | 
   if (!verification) {
     return '';
   }
+  if (verification.source === 'renewal_pending') {
+    return '，续费已提交并在后台确认，请勿重复续费';
+  }
+  if (verification.source === 'renew_response') {
+    return '，并已通过续费回包中的新到期时间确认';
+  }
   if (verification.confirmed) {
     return '，并已通过远端号码列表确认';
   }
@@ -661,6 +683,63 @@ function formatPhoneVerificationSuffix(verification?: PhoneActionVerification | 
     return '，helper 回包已写入，本次未做远端号码列表确认';
   }
   return '，未通过远端号码列表确认';
+}
+
+function phoneOperationActionLabel(action: PhoneActionOperation['action']) {
+  return {
+    renew: '续费',
+    cancel: '取消',
+    pause: '暂停',
+    resume: '恢复',
+    update_label: '更新备注',
+    enable_sms: '开启短信接收',
+    reactivate: '重新激活',
+  }[action];
+}
+
+function phoneOperationStateTag(operation?: PhoneActionOperation | null) {
+  if (!operation) return null;
+  const states = {
+    prepared: { color: 'processing', label: '准备中' },
+    writing: { color: 'processing', label: '正在提交' },
+    awaiting_confirmation: { color: 'warning', label: '等待远端确认' },
+    confirmed: { color: 'success', label: '已确认' },
+    failed_before_write: { color: 'error', label: '提交前失败' },
+    manual_review: { color: 'error', label: '需要人工复核' },
+  } as const;
+  const item = states[operation.state];
+  return <Tag color={item.color}>{phoneOperationActionLabel(operation.action)}：{item.label}</Tag>;
+}
+
+function isPhoneOperationBlocking(operation?: PhoneActionOperation | null) {
+  return Boolean(operation && !['confirmed', 'failed_before_write'].includes(operation.state));
+}
+
+function phoneSmsDeliveryTag(diagnostic?: PhoneSmsReceptionDiagnostic) {
+  if (!diagnostic) {
+    return null;
+  }
+  const labels: Record<PhoneSmsReceptionDiagnostic['delivery_status'], string> = {
+    received: '历史已收信',
+    filter_blocked: '过滤设置拦截',
+    phone_inactive: '号码不可收信',
+    routing_incomplete: '路由资料缺失',
+    listener_disabled: '面板监听未开启',
+    listener_unhealthy: '面板监听异常',
+    listener_starting: '面板监听连接中',
+    unverified: '尚未验证到站',
+  };
+  const colors = {
+    success: 'success',
+    warning: 'warning',
+    error: 'error',
+    default: 'default',
+  } as const;
+  return (
+    <Tooltip title={diagnostic.summary}>
+      <Tag color={colors[diagnostic.severity]}>{labels[diagnostic.delivery_status]}</Tag>
+    </Tooltip>
+  );
 }
 
 function inferAccessCodeCountryCode(target: string) {
@@ -1044,6 +1123,7 @@ export default function AccountDetail() {
   const [teamMessages, setTeamMessages] = useState<Message[]>([]);
   const [teamMsgTotal, setTeamMsgTotal] = useState(0);
   const [teamMsgPage, setTeamMsgPage] = useState(1);
+  const [teamMessageFilter, setTeamMessageFilter] = useState<'credit' | 'all'>('all');
   const [teamMessageModalOpen, setTeamMessageModalOpen] = useState(false);
   const [msgTotal, setMsgTotal] = useState(0);
   const [msgPage, setMsgPage] = useState(1);
@@ -1051,6 +1131,25 @@ export default function AccountDetail() {
   const [teamMsgLoading, setTeamMsgLoading] = useState(false);
   const messageRequestIdRef = useRef(0);
   const teamMessageRequestIdRef = useRef(0);
+  const accountRequestIdRef = useRef(0);
+  const accountScopeRef = useRef({ accountId, generation: 0 });
+  const phoneRequestIdRef = useRef(0);
+  const phoneAccountScopeRef = useRef({ accountId, generation: 0 });
+  const phoneSyncRequestsRef = useRef(new Map<number, ReturnType<typeof syncPhoneNumbers>>());
+  if (accountScopeRef.current.accountId !== accountId) {
+    accountScopeRef.current = {
+      accountId,
+      generation: accountScopeRef.current.generation + 1,
+    };
+    accountRequestIdRef.current += 1;
+  }
+  if (phoneAccountScopeRef.current.accountId !== accountId) {
+    phoneAccountScopeRef.current = {
+      accountId,
+      generation: phoneAccountScopeRef.current.generation + 1,
+    };
+    phoneRequestIdRef.current += 1;
+  }
   const [activeTab, setActiveTab] = useState(() => searchParams.get('tab') === 'messages' ? 'messages' : 'info');
   const focusedMessageId = useMemo(() => {
     const value = Number(searchParams.get('messageId'));
@@ -1072,9 +1171,14 @@ export default function AccountDetail() {
     }> | null
   >(null);
   const [phones, setPhones] = useState<PhoneNumber[]>([]);
+  const [phoneOperations, setPhoneOperations] = useState<Record<number, PhoneActionOperation>>({});
+  const phoneOperationPollsRef = useRef<Set<number>>(new Set());
+  const [phoneSmsDiagnostics, setPhoneSmsDiagnostics] = useState<Record<string, PhoneSmsReceptionDiagnostic>>({});
   const [phoneCountries, setPhoneCountries] = useState<PhoneCountryOption[]>([]);
   const [phoneLoading, setPhoneLoading] = useState(false);
+  const [phoneActionLoadingKey, setPhoneActionLoadingKey] = useState<string | null>(null);
   const [directSessionImportOpen, setDirectSessionImportOpen] = useState(false);
+  const [verificationReloginOpen, setVerificationReloginOpen] = useState(false);
   const [directSessionImportLoading, setDirectSessionImportLoading] = useState(false);
   const [editNickname, setEditNickname] = useState(false);
   const [nickname, setNickname] = useState('');
@@ -1114,27 +1218,46 @@ export default function AccountDetail() {
   }));
 
   const fetchAccount = useCallback(async (options?: { force?: boolean }) => {
+    const requestScope = accountScopeRef.current;
+    const requestId = ++accountRequestIdRef.current;
+    const isCurrentRequest = () => isCurrentAccountRequest(
+      accountScopeRef.current,
+      requestScope,
+      accountRequestIdRef.current,
+      requestId,
+    );
+    const commitAccount = (data: DtAccountDetail) => {
+      if (!isCurrentRequest()) {
+        return;
+      }
+      setAccount(data);
+      setNickname(data.nickname);
+    };
     const cacheKey = cacheKeys.account(accountId);
     const cached = !options?.force ? readCachedData<DtAccountDetail>(cacheKey) : null;
     if (cached) {
-      setAccount(cached);
-      setNickname(cached.nickname);
-      setLoading(false);
+      commitAccount(cached);
+      if (isCurrentRequest()) {
+        setLoading(false);
+      }
       if (isCachedDataFresh(cacheKey, CACHE_TTL_MS.accountDetail)) {
         return;
       }
-    } else {
+    } else if (isCurrentRequest()) {
       setLoading(true);
     }
 
     try {
       const data = await getAccount(accountId, { force: options?.force });
-      setAccount(data);
-      setNickname(data.nickname);
+      commitAccount(data);
     } catch (err) {
-      message.error(err instanceof Error ? err.message : '获取账户详情失败');
+      if (isCurrentRequest()) {
+        message.error(err instanceof Error ? err.message : '获取账户详情失败');
+      }
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) {
+        setLoading(false);
+      }
     }
   }, [accountId, message]);
 
@@ -1216,7 +1339,12 @@ export default function AccountDetail() {
   const fetchTeamMessages = useCallback(
     async (page = 1, options?: { silent?: boolean; force?: boolean }) => {
       const requestId = ++teamMessageRequestIdRef.current;
-      const params = { page, pageSize: 20, msg_type: 'system' as const };
+      const params = {
+        page,
+        pageSize: 20,
+        msg_type: 'system' as const,
+        credit_only: teamMessageFilter === 'credit',
+      };
       const cacheKey = cacheKeys.accountMessages(accountId, params);
       const cached = !options?.force ? readCachedData<PagedData<Message>>(cacheKey) : null;
 
@@ -1240,16 +1368,16 @@ export default function AccountDetail() {
         setTeamMsgTotal(data.total);
         setTeamMsgPage(data.page);
       } catch (err) {
-        if (requestId === teamMessageRequestIdRef.current && !options?.silent) {
+        if (!options?.silent && requestId === teamMessageRequestIdRef.current) {
           message.error(err instanceof Error ? err.message : '获取团队消息失败');
         }
       } finally {
-        if (requestId === teamMessageRequestIdRef.current && !options?.silent) {
+        if (requestId === teamMessageRequestIdRef.current) {
           setTeamMsgLoading(false);
         }
       }
     },
-    [accountId, message],
+    [accountId, message, teamMessageFilter],
   );
 
   useEffect(() => {
@@ -1270,7 +1398,7 @@ export default function AccountDetail() {
         content: detail.content,
         raw_info: null,
         raw_k3: null,
-        k5_flag: null,
+        k5_flag: detail.k5Flag ?? null,
         is_read: messageType === 'system',
         telegram_sent: false,
         telegram_msg_id: null,
@@ -1278,6 +1406,9 @@ export default function AccountDetail() {
         created_at: receivedAt,
       };
       if (detail.msgType === 'system') {
+        if (teamMessageFilter === 'credit' && detail.k5Flag !== 531 && detail.k5Flag !== 532) {
+          return;
+        }
         teamMessageRequestIdRef.current += 1;
         setTeamMsgLoading(false);
         setTeamMessages((current) => [nextMessage, ...current.filter((item) => item.id !== nextMessage.id)].slice(0, 100));
@@ -1305,7 +1436,7 @@ export default function AccountDetail() {
 
     window.addEventListener('dt:new-message', handleNewMessage);
     return () => window.removeEventListener('dt:new-message', handleNewMessage);
-  }, [accountId, msgPage]);
+  }, [accountId, msgPage, teamMessageFilter]);
 
   useEffect(() => {
     if (activeTab !== 'messages') {
@@ -1401,27 +1532,112 @@ export default function AccountDetail() {
   }, [fetchMessages, fetchTeamMessages, msgPage, teamMessageModalOpen, teamMsgPage]);
 
   const fetchPhones = useCallback(async (options?: { force?: boolean }) => {
-    const cacheKey = cacheKeys.phoneNumbers(accountId);
+    const requestAccountId = accountId;
+    const requestScope = phoneAccountScopeRef.current;
+    const requestId = ++phoneRequestIdRef.current;
+    const isCurrentRequest = () => isCurrentAccountRequest(
+      phoneAccountScopeRef.current,
+      requestScope,
+      phoneRequestIdRef.current,
+      requestId,
+    );
+    const commitPhones = (data: PhoneNumber[]) => {
+      if (isCurrentRequest()) {
+        setPhones(data);
+        setPhoneOperations((current) => {
+          const next = { ...current };
+          for (const phone of data) {
+            if (phone.active_operation) {
+              next[phone.id] = phone.active_operation;
+            } else if (next[phone.id]?.state === 'confirmed' || next[phone.id]?.state === 'failed_before_write') {
+              delete next[phone.id];
+            }
+          }
+          return next;
+        });
+      }
+    };
+    const reconcileIfStale = (data: PhoneNumber[]) => {
+      commitPhones(data);
+      if (shouldAutoSyncPhoneNumbers(data)) {
+        void getOrCreateAccountRequest(
+            phoneSyncRequestsRef.current,
+            requestAccountId,
+            () => syncPhoneNumbers(requestAccountId),
+          )
+          .then((refreshed) => commitPhones(refreshed.phone_numbers))
+          .catch(() => {
+            // Keep the already loaded local inventory; the manual refresh remains available.
+          });
+      }
+    };
+    const cacheKey = cacheKeys.phoneNumbers(requestAccountId);
     const cached = !options?.force ? readCachedData<PhoneNumber[]>(cacheKey) : null;
     if (cached) {
-      setPhones(cached);
-      setPhoneLoading(false);
+      commitPhones(cached);
+      if (isCurrentRequest()) {
+        setPhoneLoading(false);
+      }
       if (isCachedDataFresh(cacheKey, CACHE_TTL_MS.phoneNumbers)) {
+        reconcileIfStale(cached);
         return;
       }
-    } else {
+    } else if (isCurrentRequest()) {
       setPhoneLoading(true);
     }
 
     try {
-      const data = await getPhoneNumbers(accountId, { force: options?.force });
-      setPhones(data);
+      const data = await getPhoneNumbers(requestAccountId, { force: options?.force });
+      reconcileIfStale(data);
     } catch (err) {
-      message.error(err instanceof Error ? err.message : 'Failed to load phone numbers');
+      if (isCurrentRequest()) {
+        message.error(err instanceof Error ? err.message : 'Failed to load phone numbers');
+      }
     } finally {
-      setPhoneLoading(false);
+      if (isCurrentRequest()) {
+        setPhoneLoading(false);
+      }
     }
   }, [accountId, message]);
+
+  const pollPhoneOperation = useCallback((initial: PhoneActionOperation) => {
+    if (phoneOperationPollsRef.current.has(initial.id)) return;
+    phoneOperationPollsRef.current.add(initial.id);
+    setPhoneOperations((current) => ({ ...current, [initial.phone_id]: initial }));
+
+    void (async () => {
+      let operation = initial;
+      try {
+        for (const delayMs of [2_000, 5_000, 10_000, 20_000, 30_000]) {
+          if (operation.state === 'confirmed' || operation.state === 'failed_before_write' || operation.state === 'manual_review') break;
+          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+          operation = await getPhoneActionOperation(accountId, operation.id);
+          setPhoneOperations((current) => ({ ...current, [operation.phone_id]: operation }));
+        }
+
+        if (operation.state === 'confirmed') {
+          await fetchPhones({ force: true });
+          message.success(`${phoneOperationActionLabel(operation.action)}已通过远端状态确认`);
+        } else if (operation.state === 'failed_before_write') {
+          message.error(operation.error_summary || `${phoneOperationActionLabel(operation.action)}未提交`);
+        } else if (operation.state === 'manual_review') {
+          message.warning(`${phoneOperationActionLabel(operation.action)}结果仍不明确，请勿重复操作`);
+        }
+      } catch (err) {
+        message.warning(err instanceof Error ? err.message : '暂时无法刷新操作状态');
+      } finally {
+        phoneOperationPollsRef.current.delete(initial.id);
+      }
+    })();
+  }, [accountId, fetchPhones, message]);
+
+  useEffect(() => {
+    for (const phone of phones) {
+      if (phone.active_operation && isPhoneOperationBlocking(phone.active_operation)) {
+        pollPhoneOperation(phone.active_operation);
+      }
+    }
+  }, [phones, pollPhoneOperation]);
 
   const fetchPhoneCountries = useCallback(async () => {
     if (phoneCountries.length > 0) {
@@ -1431,19 +1647,30 @@ export default function AccountDetail() {
       const data = await getPhoneNumberCountries(accountId);
       setPhoneCountries(data);
       return data;
-    } catch {
+    } catch (err) {
       setPhoneCountries([]);
+      message.error(err instanceof Error ? err.message : '加载可选号国家失败');
       return [];
     }
-  }, [accountId, phoneCountries]);
+  }, [accountId, message, phoneCountries]);
 
   const syncOwnedPhones = useCallback(async () => {
     setPhoneLoading(true);
     try {
-      const data = await syncPhoneNumbers(accountId);
+      const data = await getOrCreateAccountRequest(
+        phoneSyncRequestsRef.current,
+        accountId,
+        () => syncPhoneNumbers(accountId),
+      );
       setPhones(data.phone_numbers);
-      await fetchAccount();
-      message.success('已刷新已购手机号');
+      void fetchAccount({ force: true });
+      if (data.refresh_pending) {
+        message.info(data.refresh_error || '远端号码仍在后台同步，当前先显示本地记录');
+      } else if (data.refresh_error || data.cached) {
+        message.warning(data.refresh_error || '当前显示本地缓存号码');
+      } else {
+        message.success('已从远端刷新已购号码');
+      }
     } catch (err) {
       message.error(err instanceof Error ? err.message : '刷新手机号失败');
     } finally {
@@ -1456,20 +1683,32 @@ export default function AccountDetail() {
     try {
       const result = await enablePhoneSmsReception(accountId);
       setPhones(result.phone_numbers);
+      setPhoneSmsDiagnostics(
+        Object.fromEntries(result.diagnostics.map((item) => [item.phone_number.replace(/\D/g, ''), item])),
+      );
+      for (const operation of result.operations) {
+        pollPhoneOperation(operation);
+      }
       await fetchAccount();
+      const listenerIssues = result.diagnostics.filter((item) =>
+        ['listener_disabled', 'listener_unhealthy'].includes(item.delivery_status),
+      ).length;
+      const unverified = result.diagnostics.filter((item) => item.delivery_status === 'unverified').length;
       if (result.failed.length > 0) {
-        message.warning(`已修复 ${result.repaired} 个号码，${result.failed.length} 个号码未确认成功`);
-      } else if (result.repaired > 0) {
-        message.success(`已开启 ${result.repaired} 个号码的短信接收`);
+        message.warning(`已提交 ${result.queued} 个修复操作，${result.failed.length} 个号码未能提交`);
+      } else if (result.queued > 0) {
+        message.warning(`已提交 ${result.queued} 个短信接收修复操作，正在等待远端确认`);
+      } else if (listenerIssues > 0 || unverified > 0) {
+        message.warning(`过滤设置未发现关闭；监听异常 ${listenerIssues} 个，尚未验证到站 ${unverified} 个`);
       } else {
-        message.success('没有发现短信接收已关闭的号码');
+        message.success('短信过滤、监听和历史收信记录均正常');
       }
     } catch (err) {
       message.error(err instanceof Error ? err.message : '修复短信接收失败');
     } finally {
       setPhoneLoading(false);
     }
-  }, [accountId, fetchAccount, message]);
+  }, [accountId, fetchAccount, message, pollPhoneOperation]);
 
   useEffect(() => {
     if (!Number.isFinite(accountId) || accountId <= 0) {
@@ -1509,10 +1748,15 @@ export default function AccountDetail() {
   const handleRefresh = async () => {
     setRefreshingAccountData(true);
     try {
-      await refreshAccount(accountId);
-      setMsgPage(1);
-      await Promise.all([fetchAccount(), fetchPhones(), fetchMessages(1), fetchPointStore({ silent: true })]);
-      message.success('资料和本地消息已刷新');
+      setPointStore(null);
+      const result = await refreshAccount(accountId);
+      setAccount((current) => (current ? { ...current, snapshot: result.snapshot } : current));
+      void fetchAccount({ force: true });
+      if (result.refresh_error || result.cached) {
+        message.warning(result.refresh_error || '本次未确认远端更新，当前显示缓存资料');
+      } else {
+        message.success('基本资料已从远端刷新');
+      }
     } catch (err) {
       message.error(err instanceof Error ? err.message : '刷新失败');
     } finally {
@@ -1809,7 +2053,7 @@ export default function AccountDetail() {
             min={0}
             precision={0}
             style={{ width: '100%' }}
-            placeholder="区号（留空自动随机，美国会自动尝试 213、646 等）"
+            placeholder="区号（留空自动随机，美国、加拿大等地区无需手填）"
             onChange={(value) => {
               selectedAreaCode = typeof value === 'number' && value > 0 ? value : undefined;
             }}
@@ -1866,25 +2110,44 @@ export default function AccountDetail() {
   };
 
   const phoneAction = async (phoneId: number, action: 'renew' | 'cancel' | 'pause' | 'resume') => {
+    const loadingKey = `${phoneId}:${action}`;
+    const requestId = crypto.randomUUID();
+    setPhoneActionLoadingKey(loadingKey);
     try {
       let result: PhoneActionResult | null = null;
       if (action === 'renew') {
-        result = await renewPhoneNumber(accountId, phoneId);
+        result = await renewPhoneNumber(accountId, phoneId, requestId);
       }
       if (action === 'cancel') {
-        result = await cancelPhoneNumber(accountId, phoneId);
+        result = await cancelPhoneNumber(accountId, phoneId, requestId);
       }
       if (action === 'pause') {
-        result = await pausePhoneNumber(accountId, phoneId);
+        result = await pausePhoneNumber(accountId, phoneId, requestId);
       }
       if (action === 'resume') {
-        result = await resumePhoneNumber(accountId, phoneId);
+        result = await resumePhoneNumber(accountId, phoneId, requestId);
       }
-      await Promise.all([fetchPhones(), fetchAccount()]);
+      if (result?.phone) {
+        setPhones((current) => current.map((phone) => (
+          phone.id === phoneId ? { ...result!.phone, active_operation: result!.operation } : phone
+        )));
+        setPhoneOperations((current) => ({ ...current, [phoneId]: result!.operation }));
+      }
+      void fetchAccount({ force: true });
       const actionText = phoneActionLabel(action);
-      message.success(`${actionText}成功${formatPhoneVerificationSuffix(result?.verification)}`);
+      if (result?.operation.state === 'confirmed') {
+        message.success(`${actionText}已确认`);
+        void fetchPhones({ force: true });
+      } else if (result?.operation.state === 'failed_before_write') {
+        message.error(result.operation.error_summary || `${actionText}未提交`);
+      } else {
+        message.warning(`${actionText}已提交，正在等待远端确认，请勿重复操作`);
+        if (result?.operation) pollPhoneOperation(result.operation);
+      }
     } catch (err) {
       message.error(err instanceof Error ? err.message : '操作失败');
+    } finally {
+      setPhoneActionLoadingKey((current) => (current === loadingKey ? null : current));
     }
   };
 
@@ -1915,16 +2178,27 @@ export default function AccountDetail() {
         />
       ),
       onOk: async () => {
-        await updatePhoneNumberLabel(accountId, phone.id, { display_name: nextLabel.trim() });
-        await syncOwnedPhones();
-        message.success('备注已更新并同步到 app');
+        const result = await updatePhoneNumberLabel(accountId, phone.id, {
+          display_name: nextLabel.trim(),
+          request_id: crypto.randomUUID(),
+        });
+        setPhoneOperations((current) => ({ ...current, [phone.id]: result.operation }));
+        setPhones((current) => current.map((item) => (
+          item.id === phone.id ? { ...item, active_operation: result.operation } : item
+        )));
+        if (result.operation.state === 'confirmed') {
+          await fetchPhones({ force: true });
+          message.success('备注已通过远端确认');
+        } else {
+          message.warning('备注更新已提交，正在等待远端确认');
+          pollPhoneOperation(result.operation);
+        }
       },
     });
   };
 
   const openTeamMessageHistory = () => {
     setTeamMessageModalOpen(true);
-    void fetchTeamMessages(1, { force: true });
   };
 
   const teamMsgColumns: ColumnsType<Message> = [
@@ -2008,6 +2282,7 @@ export default function AccountDetail() {
       render: (value, record) => {
         const displayPhone = formatPhoneWithCountryCode(value, record.country_code);
         const copyPhone = formatPhoneForClipboard(value, record.country_code);
+        const smsDiagnostic = phoneSmsDiagnostics[record.phone_number.replace(/\D/g, '')];
         return (
           <Space direction="vertical" size={2}>
             <Tooltip title={`点击复制 ${copyPhone || displayPhone}`}>
@@ -2019,8 +2294,16 @@ export default function AccountDetail() {
                 {displayPhone}
               </Tag>
             </Tooltip>
-            {record.allow_receive_sms === false && <Tag color="red">短信接收关闭</Tag>}
-            {record.allow_receive_sms === true && <Tag color="success">短信接收开启</Tag>}
+            <Tooltip title="这是 App 的来信拦截/语音信箱过滤字段，不等同于服务商短信通道状态。">
+              {record.allow_receive_sms === false ? (
+                <Tag color="red">短信过滤拦截</Tag>
+              ) : record.allow_receive_sms === true ? (
+                <Tag color="success">短信过滤允许</Tag>
+              ) : (
+                <Tag>短信过滤项未返回</Tag>
+              )}
+            </Tooltip>
+            {phoneSmsDeliveryTag(smsDiagnostic)}
           </Space>
         );
       },
@@ -2102,6 +2385,12 @@ export default function AccountDetail() {
       render: (value) => formatEpochTime(value),
     },
     {
+      title: '本地记录更新时间',
+      dataIndex: 'updated_at',
+      width: 170,
+      render: (value) => value ? dayjs(value).format('YYYY-MM-DD HH:mm:ss') : '-',
+    },
+    {
       title: '自动续费',
       dataIndex: 'auto_renew',
       width: 100,
@@ -2118,42 +2407,45 @@ export default function AccountDetail() {
       width: 360,
       render: (_, record) => {
         const status = record.status as PhoneStatus;
+        const operation = phoneOperations[record.id] ?? record.active_operation;
+        const actionBlocked = isPhoneOperationBlocking(operation);
         return (
           <Space size="small" wrap>
-            <Button size="small" onClick={() => handleEditPhoneLabel(record)}>
+            {phoneOperationStateTag(operation)}
+            <Button size="small" disabled={actionBlocked} onClick={() => handleEditPhoneLabel(record)}>
               备注
             </Button>
             {(status === 'active' || status === 'expired') && (
               <Popconfirm title="确认续费这个号码？续费会扣除账户余额。" onConfirm={() => phoneAction(record.id, 'renew')}>
-                <Button size="small" type="primary">
+                <Button size="small" type="primary" disabled={actionBlocked} loading={phoneActionLoadingKey === `${record.id}:renew`}>
                   续费
                 </Button>
               </Popconfirm>
             )}
             {status === 'active' && (
               <Popconfirm title="确认暂停这个号码？暂停后号码将暂时不可用。" onConfirm={() => phoneAction(record.id, 'pause')}>
-                <Button size="small">
+                <Button size="small" disabled={actionBlocked} loading={phoneActionLoadingKey === `${record.id}:pause`}>
                   暂停
                 </Button>
               </Popconfirm>
             )}
             {status === 'paused' && (
               <Popconfirm title="确认恢复这个号码？" onConfirm={() => phoneAction(record.id, 'resume')}>
-                <Button size="small">
+                <Button size="small" disabled={actionBlocked} loading={phoneActionLoadingKey === `${record.id}:resume`}>
                   恢复
                 </Button>
               </Popconfirm>
             )}
             {(status === 'active' || status === 'paused') && (
               <Popconfirm title="确认取消这个号码？" onConfirm={() => phoneAction(record.id, 'cancel')}>
-                <Button size="small" danger>
+                <Button size="small" danger disabled={actionBlocked} loading={phoneActionLoadingKey === `${record.id}:cancel`}>
                   取消
                 </Button>
               </Popconfirm>
             )}
             {(status === 'cancelled' || status === 'expired') && (
               <Popconfirm title="确认删除这个号码？删除后不可恢复。" onConfirm={() => handleDeletePhone(record.id)}>
-                <Button size="small" danger icon={<DeleteOutlined />}>
+                <Button size="small" danger disabled={actionBlocked} icon={<DeleteOutlined />}>
                   删除
                 </Button>
               </Popconfirm>
@@ -2169,9 +2461,10 @@ export default function AccountDetail() {
     online: { color: 'green', label: '在线' },
     offline: { color: 'default', label: '离线' },
     error: { color: 'red', label: '异常' },
-    expired: { color: 'orange', label: '已过期' },
+    expired: { color: 'orange', label: '授权失效' },
   };
   const accountStatus = accountStatusMap[account?.status ?? 'offline'] || accountStatusMap.offline;
+  const usesVerificationLogin = account?.login_type === 'email_code' || account?.login_type === 'phone_code';
 
   return (
     <div>
@@ -2223,17 +2516,15 @@ export default function AccountDetail() {
           >
             刷新数据
           </Button>
-          <Button
-            onClick={handleReLogin}
-            disabled={
-              account?.status === 'pending' ||
-              account?.login_type === 'email_code' ||
-              account?.login_type === 'phone_code' ||
-              account?.login_type === 'manual_session'
-            }
-          >
-            重新登录
-          </Button>
+          {usesVerificationLogin ? (
+            <Button icon={<LoginOutlined />} onClick={() => setVerificationReloginOpen(true)}>
+              验证码重新登录
+            </Button>
+          ) : (
+            <Button onClick={handleReLogin} disabled={account?.status === 'pending' || account?.login_type === 'manual_session'}>
+              重新登录
+            </Button>
+          )}
         </Space>
       </div>
 
@@ -2323,6 +2614,9 @@ export default function AccountDetail() {
                   <Descriptions.Item label="关于我">{snapshot?.about_me || '-'}</Descriptions.Item>
                   <Descriptions.Item label="心情">{snapshot?.feeling || '-'}</Descriptions.Item>
                   <Descriptions.Item label="资料版本">{snapshot?.profile_ver_code || '-'}</Descriptions.Item>
+                  <Descriptions.Item label="本地记录更新时间">
+                    {snapshot?.updated_at ? dayjs(snapshot.updated_at).format('YYYY-MM-DD HH:mm:ss') : '-'}
+                  </Descriptions.Item>
                   <Descriptions.Item label="设备 ID">{account?.dt_device_id || '-'}</Descriptions.Item>
                 </Descriptions>
 
@@ -2418,30 +2712,28 @@ export default function AccountDetail() {
                     </div>
                   </Card>
                 ) : null}
-                {teamMsgTotal > 0 ? (
-                  <Card
-                    size="small"
-                    hoverable
-                    role="button"
-                    tabIndex={0}
-                    style={{ marginBottom: 12, cursor: 'pointer' }}
-                    loading={teamMsgLoading}
-                    onClick={openTeamMessageHistory}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault();
-                        openTeamMessageHistory();
-                      }
-                    }}
-                  >
-                    <Space>
-                      <Tag color="default">系统</Tag>
-                      <strong>{account?.app_variant === 'dingdong' ? '叮咚团队' : '说道团队'}</strong>
-                      <span style={{ color: '#666' }}>共 {teamMsgTotal} 条，点击查看历史</span>
-                    </Space>
-                    <div style={{ marginTop: 8, color: '#666' }}>{teamMessages[0]?.content}</div>
-                  </Card>
-                ) : null}
+                <Card
+                  size="small"
+                  hoverable
+                  role="button"
+                  tabIndex={0}
+                  style={{ marginBottom: 12, cursor: 'pointer' }}
+                  loading={teamMsgLoading}
+                  onClick={openTeamMessageHistory}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      openTeamMessageHistory();
+                    }
+                  }}
+                >
+                  <Space>
+                    <Tag color="blue">团队消息</Tag>
+                    <strong>{account?.app_variant === 'dingdong' ? '叮咚团队' : '说道团队'}</strong>
+                    <span style={{ color: '#666' }}>共 {teamMsgTotal} 条，点击查看历史</span>
+                  </Space>
+                  <div style={{ marginTop: 8, color: '#666' }}>{teamMessages[0]?.content || '暂无团队消息'}</div>
+                </Card>
                 <Table
                   columns={msgColumns}
                   dataSource={messages}
@@ -2473,11 +2765,13 @@ export default function AccountDetail() {
                       刷新已购号码
                     </Button>
                     <Popconfirm
-                      title="确认修复当前账户中短信接收已关闭的号码？"
-                      description="只会修改服务端明确标记为关闭的号码，并保留号码现有设置。"
+                      title="诊断并修复当前账户的短信接收链路？"
+                      description="会修复明确关闭的过滤项，并恢复已配置但未运行的面板监听；不会修改未返回的 App 字段。"
                       onConfirm={repairSmsReception}
                     >
-                      <Button icon={<SafetyCertificateOutlined />}>修复短信接收</Button>
+                      <Button icon={<SafetyCertificateOutlined />}>
+                        短信接收诊断/修复
+                      </Button>
                     </Popconfirm>
                     <Button type="primary" icon={<PlusOutlined />} onClick={handleRequestNumber}>
                       获取新号码
@@ -2513,6 +2807,12 @@ export default function AccountDetail() {
         onCancel={() => setDirectSessionImportOpen(false)}
         onSubmit={handleSubmitDirectSession}
       />
+      <VerificationReloginModal
+        open={verificationReloginOpen}
+        account={account}
+        onCancel={() => setVerificationReloginOpen(false)}
+        onSuccess={() => Promise.all([fetchAccount({ force: true }), fetchPhones({ force: true })]).then(() => undefined)}
+      />
       <Modal
         title={`${account?.app_variant === 'dingdong' ? '叮咚团队' : '说道团队'}消息历史`}
         open={teamMessageModalOpen}
@@ -2521,6 +2821,18 @@ export default function AccountDetail() {
         width={900}
         destroyOnHidden
       >
+        <Segmented
+          value={teamMessageFilter}
+          options={[
+            { label: '到账奖励', value: 'credit' },
+            { label: '全部团队消息', value: 'all' },
+          ]}
+          onChange={(value) => {
+            setTeamMessageFilter(value as 'credit' | 'all');
+            setTeamMsgPage(1);
+          }}
+          style={{ marginBottom: 12 }}
+        />
         <Table
           columns={teamMsgColumns}
           dataSource={teamMessages}

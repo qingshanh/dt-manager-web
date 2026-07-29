@@ -1,18 +1,21 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { AccountStatus, AppVariant, LoginType, MessageDirection, MessageType, PhoneStatus, Prisma, type PhoneNumber as StoredPhoneNumber } from "@prisma/client";
+import { AccountStatus, AppVariant, LoginType, MessageDirection, MessageType, PhoneActionType, PhoneStatus, Prisma, type PhoneNumber as StoredPhoneNumber } from "@prisma/client";
 import { Router } from "express";
 import { MonitorStatus } from "@prisma/client";
 import { z } from "zod";
 import { config } from "../config.js";
 import { prisma } from "../lib/prisma.js";
 import { accountMonitorService } from "../services/account-monitor.js";
+import { resolveAccountListMonitorState } from "../services/account-list-monitor-state.js";
 import {
   buildDirectAccessCodeDryRun,
   DirectDingtoneGateway,
   listenDirectSessionPushes,
   runDirectAccessCodeProbe,
   runDirectSessionProbe,
+  staticPhoneCountryOptions,
   type DirectAccessCodeProbeResult,
   type DirectProbeResult,
   type DirectProbePushResult
@@ -34,6 +37,18 @@ import {
   mapPhoneNumberPatch,
   syncPhoneNumbers
 } from "../services/phone-number-store.js";
+import { buildDirectPhoneInventoryIdentity } from "../services/phone-inventory-refresh.js";
+import { buildPhoneSmsReceptionDiagnostic } from "../services/phone-sms-diagnostics.js";
+import { extractPhoneInventoryMetadata } from "../services/phone-inventory.js";
+import { phoneActionCoordinator } from "../services/phone-action-coordinator.js";
+import { updatePhoneActionAuditEvidence } from "../services/phone-action-operation.js";
+import {
+  hasAdvancedPhoneExpiry,
+  parsePhoneExpiry,
+  resolvePhoneRenewalConfirmation,
+  resolvePhoneRenewalMonths,
+  type PhoneRenewalConfirmation
+} from "../services/phone-renewal-confirmation.js";
 import { getAccountPoint } from "../services/point.js";
 import {
   getAccountPointStore,
@@ -43,8 +58,11 @@ import {
   serializeStoredPointStoreOrder,
   syncAndListAccountPointStoreOrders
 } from "../services/point-store.js";
-import { dumpSmsMessagesFromAdb, listPhoneNumbersFromAdb } from "../services/adb-database.js";
-import { exportSessionFromAdbConfig } from "../services/adb-session.js";
+import { dumpSmsMessagesFromAdb } from "../services/adb-database.js";
+import {
+  assertAdbSessionMatchesExpectedUser,
+  exportSessionFromAdbConfig
+} from "../services/adb-session.js";
 import { previewPhoneNumbersFromAdb } from "../services/adb-phone-preview.js";
 import { dumpSmsMessagesFromUi, openMessagesInbox } from "../services/adb-message-ui.js";
 import { dumpSmsMessagesFromNotifications } from "../services/adb-notification-ui.js";
@@ -62,11 +80,16 @@ import type {
 import { eventBus } from "../services/event-bus.js";
 import { getGatewayMode, getSettingsMap } from "../services/settings.service.js";
 import { logger } from "../utils/logger.js";
-import { sendPhoneTelegramNotification, sendSmsTelegramNotification } from "../services/telegram-notifier.js";
+import {
+  formatPhoneRenewalPeriod,
+  sendPhoneTelegramNotification,
+  sendSmsTelegramNotification
+} from "../services/telegram-notifier.js";
 import { AppError, assertFound } from "../utils/errors.js";
 import { createActivationTrackCode, createDeviceId, createTrackCode, decryptText, encryptText, isActivationTrackCode } from "../utils/crypto.js";
 import { ok, paged } from "../utils/response.js";
 import { serializeMessage, serializePhoneNumber, serializeSnapshot } from "../utils/serializers.js";
+import { resolveAccountDisplayName, resolveRefreshedAccountNickname } from "../utils/account-name.js";
 
 const createAccountSchema = z
   .object({
@@ -120,7 +143,8 @@ const accessCodeProbeSchema = z.object({
 });
 
 const phoneActionConfirmSchema = z.object({
-  confirm: z.boolean().optional().default(false)
+  confirm: z.boolean().optional().default(false),
+  request_id: z.string().trim().min(8).max(128).optional()
 });
 
 const pointStoreOrderSchema = z.object({
@@ -180,7 +204,8 @@ const purchasePhoneCandidateSchema = z.object({
   good_number_level: optionalNullableInt(),
   use_history: optionalNullableInt(),
   price: optionalNullableNonNegativeNumber(),
-  product_id: optionalNullableString()
+  product_id: optionalNullableString(),
+  raw_json: optionalNullableString()
 });
 
 const purchasePhoneSchema = z.object({
@@ -196,6 +221,10 @@ const messagesQuerySchema = z.object({
   pageSize: z.coerce.number().int().positive().max(100).default(20),
   keyword: z.string().optional(),
   msg_type: z.nativeEnum(MessageType).optional(),
+  credit_only: z
+    .union([z.literal("true"), z.literal("false"), z.boolean()])
+    .optional()
+    .transform((value) => (value === undefined ? undefined : value === true || value === "true")),
   exclude_system: z
     .union([z.literal("true"), z.literal("false"), z.boolean()])
     .optional()
@@ -221,6 +250,7 @@ function buildMessagesWhere(accountId: number, query: MessagesQuery): Prisma.Mes
   return {
     accountId,
     ...messageTypeWhere,
+    ...(query.credit_only ? { k5Flag: { in: [531, 532] } } : {}),
     ...(query.keyword
       ? {
           OR: [
@@ -244,10 +274,12 @@ const syncHelperMessagesSchema = z.object({
 });
 
 const activeMessageRefreshes = new Set<number>();
+const activePhonePurchases = new Set<number>();
 const accountReorderQueues = new Map<number, Promise<unknown>>();
 
 const updatePhoneLabelSchema = z.object({
-  display_name: z.string().trim().max(100)
+  display_name: z.string().trim().max(100),
+  request_id: z.string().trim().min(8).max(128).optional()
 });
 
 const sessionImportAccountSchema = z.object({
@@ -304,6 +336,9 @@ accountsRouter.param("id", async (req, _res, next, value) => {
 const directRefreshGateway = new DirectDingtoneGateway();
 const helperRefreshGateway = new RealDingtoneGateway();
 const SAFE_ACCOUNT_REFRESH_ERROR = "账号数据刷新失败，请稍后重试。";
+const PARTIAL_ACCOUNT_REFRESH_ERROR = "远端资料已返回，但余额等部分字段未确认更新。";
+const INTERACTIVE_PHONE_SYNC_WAIT_MS = 12_000;
+const activePhoneInventorySyncs = new Map<number, Promise<StoredPhoneNumber[]>>();
 const SESSION_EXPORT_SETTING_KEYS = [
   "DT_GATEWAY_MODE",
   "dt_server_ip",
@@ -329,27 +364,20 @@ const SESSION_EXPORT_SETTING_KEYS = [
   "direct_monitor_max_concurrent"
 ] as const;
 
-const PHONE_COUNTRY_SELECTIONS: Record<string, { countryCode: number; isoCountryCode: string }> = {
-  US: { countryCode: 1, isoCountryCode: "US" },
-  CA: { countryCode: 1, isoCountryCode: "CA" },
-  GB: { countryCode: 44, isoCountryCode: "GB" },
-  BE: { countryCode: 32, isoCountryCode: "BE" },
-  NL: { countryCode: 31, isoCountryCode: "NL" },
+const LEGACY_PHONE_COUNTRY_SELECTIONS: Record<string, { countryCode: number; isoCountryCode: string }> = {
   RU: { countryCode: 7, isoCountryCode: "RU" },
-  ES: { countryCode: 34, isoCountryCode: "ES" },
   CN: { countryCode: 86, isoCountryCode: "CN" },
-  AU: { countryCode: 61, isoCountryCode: "AU" },
-  AT: { countryCode: 43, isoCountryCode: "AT" },
-  FR: { countryCode: 33, isoCountryCode: "FR" },
-  SE: { countryCode: 46, isoCountryCode: "SE" },
   MU: { countryCode: 230, isoCountryCode: "MU" },
-  PL: { countryCode: 48, isoCountryCode: "PL" },
   ID: { countryCode: 62, isoCountryCode: "ID" },
-  PR: { countryCode: 1787, isoCountryCode: "PR" },
-  CZ: { countryCode: 420, isoCountryCode: "CZ" },
-  MY: { countryCode: 60, isoCountryCode: "MY" },
-  DK: { countryCode: 45, isoCountryCode: "DK" },
-  RO: { countryCode: 40, isoCountryCode: "RO" }
+  MY: { countryCode: 60, isoCountryCode: "MY" }
+};
+
+const PHONE_COUNTRY_SELECTIONS: Record<string, { countryCode: number; isoCountryCode: string }> = {
+  ...Object.fromEntries(staticPhoneCountryOptions().map((item) => [
+    item.countryKey,
+    { countryCode: item.countryCode, isoCountryCode: item.isoCountryCode }
+  ])),
+  ...LEGACY_PHONE_COUNTRY_SELECTIONS
 };
 
 type RefreshMessagesDiagnostics = {
@@ -372,7 +400,7 @@ type DirectMessageOfflineTemplateStatus = {
 };
 const helperSessionGateway = new RealDingtoneGateway();
 
-type PurchaseConfirmationSource = "remote_phone_list" | "adb_phone_db" | "helper_purchase_response";
+type PurchaseConfirmationSource = "remote_phone_list";
 type PurchaseConfirmation = {
   phone: DingtonePhoneNumber;
   source: PurchaseConfirmationSource;
@@ -445,22 +473,33 @@ accountsRouter.get("/", async (req, res, next) => {
     const unreadCountByAccountId = new Map(unreadRows.map((row) => [row.accountId, row._count._all]));
     const activePhoneCountByAccountId = new Map(activePhoneRows.map((row) => [row.accountId, row._count._all]));
 
-    const list = accounts.map((item) => ({
-      id: item.id,
-      nickname: resolveAccountName(item),
-      app_variant: item.appVariant,
-      email: item.email,
-      phone: resolveAccountBoundPhone(item),
-      dt_user_id: item.dtUserId,
-      status: item.status,
-      monitor_enabled: item.monitorEnabled,
-      telegram_notify: item.telegramNotify,
-      unread_count: unreadCountByAccountId.get(item.id) ?? 0,
-      active_phone_count: activePhoneCountByAccountId.get(item.id) ?? 0,
-      sort_order: item.sortOrder,
-      last_login_at: item.lastLoginAt,
-      created_at: item.createdAt
-    }));
+    const list = accounts.map((item) => {
+      const monitorState = resolveAccountListMonitorState({
+        status: item.status,
+        monitorEnabled: item.monitorEnabled,
+        lastError: item.lastError
+      });
+      return {
+        id: item.id,
+        nickname: resolveAccountName(item),
+        app_variant: item.appVariant,
+        login_type: item.loginType,
+        email: item.email,
+        phone: resolveAccountBoundPhone(item),
+        dt_user_id: item.dtUserId,
+        status: monitorState.status,
+        monitor_enabled: item.monitorEnabled,
+        monitor_state: monitorState.monitorState,
+        requires_relogin: monitorState.requiresRelogin,
+        telegram_notify: item.telegramNotify,
+        last_error: item.lastError,
+        unread_count: unreadCountByAccountId.get(item.id) ?? 0,
+        active_phone_count: activePhoneCountByAccountId.get(item.id) ?? 0,
+        sort_order: item.sortOrder,
+        last_login_at: item.lastLoginAt,
+        created_at: item.createdAt
+      };
+    });
 
     paged(res, { list, total, page, pageSize });
   } catch (error) {
@@ -968,6 +1007,12 @@ accountsRouter.get("/:id", async (req, res, next) => {
       })
     ]);
 
+    const monitorState = resolveAccountListMonitorState({
+      status: found.status,
+      monitorEnabled: found.monitorEnabled,
+      lastError: found.lastError
+    });
+
     ok(res, {
       id: found.id,
       nickname: resolveAccountName(found),
@@ -977,8 +1022,10 @@ accountsRouter.get("/:id", async (req, res, next) => {
       phone: found.phone,
       dt_user_id: found.dtUserId,
       dt_device_id: found.dtDeviceId,
-      status: found.status,
+      status: monitorState.status,
       monitor_enabled: found.monitorEnabled,
+      monitor_state: monitorState.monitorState,
+      requires_relogin: monitorState.requiresRelogin,
       telegram_notify: found.telegramNotify,
       proxy_enabled: found.proxyEnabled,
       last_login_at: found.lastLoginAt,
@@ -1076,7 +1123,14 @@ accountsRouter.post("/:id/send-verification-code", async (req, res, next) => {
           deviceId: normalizeVerificationDeviceId(deviceId, account.appVariant, account.loginType),
           trackCode
         },
-        statusOnSuccess: account.dtUserId ? account.status : AccountStatus.pending
+        statusOnSuccess: account.dtUserId ? account.status : AccountStatus.pending,
+        rollbackSession: account.dtUserId
+          ? {
+              appVariant: account.appVariant,
+              deviceId: account.dtDeviceId,
+              trackCode: account.dtTrackCode
+            }
+          : null
       });
     } catch (error) {
       if (!account.dtUserId) {
@@ -1129,10 +1183,14 @@ accountsRouter.post("/:id/verify-code", async (req, res, next) => {
       loginResult: result
     });
 
+    const monitor = await startMonitorAfterVerification(account.id);
+
     ok(res, {
       dt_user_id: result.dtUserId,
       dt_token: result.token,
-      status: "offline"
+      status: monitor.started ? "online" : "offline",
+      monitor_started: monitor.started,
+      monitor_error: monitor.error
     });
   } catch (error) {
     next(error);
@@ -1313,24 +1371,38 @@ accountsRouter.post("/:id/refresh", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);
     const account = await assertAccount(accountId);
-    const gateway = (await shouldUseDirectAccountFlow(account)) ? directRefreshGateway : dingtoneGateway;
-    const { snapshot } = await refreshAccountRuntimeData(accountId, gateway);
-    ok(res, { snapshot, refresh_error: null, cached: false });
+    const useDirect = await shouldUseDirectAccountFlow(account);
+    const gateway = useDirect ? directRefreshGateway : dingtoneGateway;
+    const refresh = () => refreshAccountRuntimeData(accountId, gateway, {
+      includePhoneNumbers: false,
+      allowHelperSnapshot: false,
+      allowAdbPoint: false,
+      includePublicEnrichment: false,
+      persistCachedSnapshot: false,
+      gatewaySnapshotWaitMs: 8_000
+    });
+    const result = useDirect
+      ? await accountMonitorService.withMaintenance(accountId, refresh)
+      : await refresh();
+    const freshness = !result.assetSignals.gatewaySnapshotResolved
+      ? "cached"
+      : result.assetSignals.balanceResolved
+        ? "fresh"
+        : "partial";
+    ok(res, {
+      snapshot: result.snapshot,
+      refresh_error: freshness === "fresh"
+        ? null
+        : freshness === "partial"
+          ? PARTIAL_ACCOUNT_REFRESH_ERROR
+          : SAFE_ACCOUNT_REFRESH_ERROR,
+      cached: freshness === "cached",
+      freshness,
+      refreshed_at: result.snapshot?.updated_at ?? new Date().toISOString()
+    });
   } catch (error) {
     try {
       const accountId = Number(req.params.id);
-      const helperRefreshed = await refreshAccountRuntimeData(accountId, helperRefreshGateway).catch(() => null);
-      if (helperRefreshed?.snapshot) {
-        logger.warn("Direct refresh failed, returning helper-backed snapshot", {
-          accountId,
-          errorType: error instanceof Error ? error.name : typeof error
-        });
-        return ok(res, {
-          snapshot: helperRefreshed.snapshot,
-          refresh_error: SAFE_ACCOUNT_REFRESH_ERROR,
-          cached: false
-        });
-      }
       const cached = await prisma.accountSnapshot.findUnique({ where: { accountId } });
       if (cached) {
         logger.warn("Refresh failed, returning cached snapshot", {
@@ -1340,7 +1412,9 @@ accountsRouter.post("/:id/refresh", async (req, res, next) => {
         return ok(res, {
           snapshot: serializeSnapshot(cached),
           refresh_error: SAFE_ACCOUNT_REFRESH_ERROR,
-          cached: true
+          cached: true,
+          freshness: "cached",
+          refreshed_at: cached.updatedAt.toISOString()
         });
       }
     } catch {
@@ -1561,12 +1635,50 @@ accountsRouter.delete("/:id/messages/:messageId", async (req, res, next) => {
 accountsRouter.get("/:id/phone-numbers", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);
-    await assertAccount(accountId);
+    await assertAdminAccount(accountId, req.auth!.userId);
     const list = await prisma.phoneNumber.findMany({
       where: { accountId },
+      include: {
+        phoneActionOperations: {
+          where: { activeLockKey: { not: null } },
+          orderBy: { createdAt: "desc" },
+          take: 1
+        }
+      },
       orderBy: [{ isPrimary: "desc" }, { createdAt: "desc" }]
     });
-    ok(res, list.map(serializePhoneNumber));
+    ok(res, list.map((phone) => ({
+      ...serializePhoneNumber(phone),
+      active_operation: phone.phoneActionOperations[0]
+        ? serializePhoneActionOperation(phone.phoneActionOperations[0])
+        : null
+    })));
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.get("/:id/phone-actions/:operationId", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const operationId = Number(req.params.operationId);
+    await assertAdminAccount(accountId, req.auth!.userId);
+    const operation = await phoneActionCoordinator.getOperation(accountId, operationId);
+    if (!operation) throw new AppError("Phone action operation not found", 404, 404);
+    ok(res, { operation: serializePhoneActionOperation(operation) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.get("/:id/phone-numbers/:phoneId/operations/active", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const phoneId = Number(req.params.phoneId);
+    await assertAdminAccount(accountId, req.auth!.userId);
+    await assertAccountPhoneNumber(accountId, phoneId);
+    const operation = await phoneActionCoordinator.getActiveOperation(accountId, phoneId);
+    ok(res, { operation: operation ? serializePhoneActionOperation(operation) : null });
   } catch (error) {
     next(error);
   }
@@ -1574,11 +1686,12 @@ accountsRouter.get("/:id/phone-numbers", async (req, res, next) => {
 
 accountsRouter.get("/:id/phone-numbers/countries", async (req, res, next) => {
   try {
-    const account = await assertAccount(Number(req.params.id));
+    const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
     const directAccount = {
       dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
       token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-      deviceId: account.dtDeviceId
+      deviceId: account.dtDeviceId,
+      appVariant: account.appVariant
     };
     const list = await directRefreshGateway.listPhoneNumberCountries(directAccount);
     ok(res, list.map((item) => ({
@@ -1598,12 +1711,28 @@ accountsRouter.get("/:id/phone-numbers/countries", async (req, res, next) => {
 accountsRouter.post("/:id/phone-numbers/sync", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);
-    const phoneNumbers = await syncPhoneNumbersFromRemote(accountId);
-    ok(res, {
-      phone_numbers: phoneNumbers.map(serializePhoneNumber),
-      refresh_error: null,
-      cached: false
-    });
+    await assertAccount(accountId);
+    try {
+      const result = await waitForPhoneInventorySync(accountId);
+      ok(res, {
+        phone_numbers: result.phoneNumbers.map(serializePhoneNumber),
+        refresh_error: result.refreshPending ? "远端号码仍在后台同步，当前先显示本地记录。" : null,
+        cached: result.refreshPending,
+        refresh_pending: result.refreshPending
+      });
+    } catch (error) {
+      logger.warn("Direct phone inventory refresh failed; returning cached inventory", {
+        accountId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      const phoneNumbers = await loadCachedPhoneNumbers(accountId);
+      ok(res, {
+        phone_numbers: phoneNumbers.map(serializePhoneNumber),
+        refresh_error: formatPhoneInventoryRefreshError(error),
+        cached: true,
+        refresh_pending: false
+      });
+    }
   } catch (error) {
     next(error);
   }
@@ -1615,55 +1744,116 @@ accountsRouter.post("/:id/phone-numbers/enable-sms-reception", async (req, res, 
     if (!body.confirm) {
       throw new AppError("Enabling SMS reception requires confirm=true", 400, 400);
     }
-    const account = await assertAccount(Number(req.params.id));
+    const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
     if (!(await shouldUseDirectAccountFlow(account))) {
       throw new AppError("SMS reception repair currently requires a direct account session.", 501, 501);
     }
     const directAccount = {
       dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
       token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-      deviceId: account.dtDeviceId
+      deviceId: account.dtDeviceId,
+      appVariant: account.appVariant
     };
     const before = await directRefreshGateway.listPhoneNumbers(directAccount);
-    const targets = before.filter((phone) => phone.allowReceiveSms !== true && phone.status !== "cancelled" && phone.status !== "expired");
-    const requestErrors = new Map<string, string>();
+    await syncPhoneNumbers(account.id, before);
+    const stored = await prisma.phoneNumber.findMany({ where: { accountId: account.id } });
+    const targets = before.filter((phone) => phone.allowReceiveSms === false && phone.status !== "cancelled" && phone.status !== "expired");
+    const operations = [];
+    const failed: Array<{ phone_number: string; error: string }> = [];
+    const requestId = body.request_id ?? randomUUID();
 
     for (const phone of targets) {
+      const phoneItem = stored.find((item) => normalizePhoneDigits(item.phoneNumber) === normalizePhoneDigits(phone.phoneNumber));
+      if (!phoneItem) {
+        failed.push({ phone_number: phone.phoneNumber, error: "Phone inventory row is unavailable after refresh." });
+        continue;
+      }
       try {
-        await directRefreshGateway.enablePhoneNumberSmsReception(directAccount, phone.phoneNumber, phone);
+        const envelope = await phoneActionCoordinator.execute({
+          operation: {
+            accountId: account.id,
+            phoneId: phoneItem.id,
+            action: PhoneActionType.enable_sms,
+            appVariant: account.appVariant,
+            idempotencyKey: `${requestId}:${phoneItem.id}`,
+            baselineStatus: phoneItem.status,
+            baselineExpiry: phoneItem.expiredTime,
+            requestFingerprint: `enable-sms:${phoneItem.id}`,
+            requestPayload: { allowReceiveSms: true }
+          },
+          mutate: () => directRefreshGateway.enablePhoneNumberSmsReceptionMutation(
+            directAccount,
+            phone.phoneNumber,
+            phone
+          )
+        });
+        operations.push(serializePhoneActionOperation(envelope.operation));
       } catch (error) {
-        requestErrors.set(phone.phoneNumber, error instanceof Error ? error.message : String(error));
+        failed.push({ phone_number: phone.phoneNumber, error: error instanceof Error ? error.message : String(error) });
       }
     }
 
-    const after = await refreshDirectPhoneSmsSettings(
-      directAccount,
-      new Set(targets.map((phone) => normalizePhoneDigits(phone.phoneNumber))),
-      before
-    );
-    await syncPhoneNumbers(account.id, after);
-    const repaired = targets.filter((target) => {
-      const digits = normalizePhoneDigits(target.phoneNumber);
-      return after.some((phone) => normalizePhoneDigits(phone.phoneNumber) === digits && phone.allowReceiveSms === true);
-    });
-    const failed = targets
-      .filter((target) => !repaired.some((phone) => normalizePhoneDigits(phone.phoneNumber) === normalizePhoneDigits(target.phoneNumber)))
-      .map((target) => ({
-        phone_number: target.phoneNumber,
-        error: requestErrors.get(target.phoneNumber) ?? "服务端未确认短信接收开关已开启"
-      }));
-    const stored = await prisma.phoneNumber.findMany({
+    const latestStored = await prisma.phoneNumber.findMany({
       where: { accountId: account.id },
       orderBy: [{ isPrimary: "desc" }, { createdAt: "desc" }]
     });
+    const diagnostics = await buildAccountPhoneSmsDiagnostics(account, latestStored);
 
     ok(res, {
       checked: before.length,
-      repaired: repaired.length,
+      queued: operations.length,
       already_enabled: before.filter((phone) => phone.allowReceiveSms === true).length,
       unknown: before.filter((phone) => phone.allowReceiveSms === undefined).length,
       failed,
-      phone_numbers: stored.map(serializePhoneNumber)
+      operations,
+      diagnostics,
+      phone_numbers: latestStored.map(serializePhoneNumber)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.post("/:id/phone-numbers/:phoneId/force-enable-sms", async (req, res, next) => {
+  try {
+    const body = phoneActionConfirmSchema.parse(req.body ?? {});
+    if (!body.confirm) throw new AppError("Force enabling SMS reception requires confirm=true", 400, 400);
+    const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
+    const phoneItem = await assertAccountPhoneNumber(account.id, Number(req.params.phoneId));
+    if (!(await shouldUseDirectAccountFlow(account))) {
+      throw new AppError("SMS reception repair requires a Direct account session.", 409, 409);
+    }
+    const directAccount = {
+      dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+      token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+      deviceId: account.dtDeviceId,
+      appVariant: account.appVariant
+    };
+    const remotePhones = await directRefreshGateway.listPhoneNumbers(directAccount);
+    const remote = remotePhones.find((phone) => normalizePhoneDigits(phone.phoneNumber) === normalizePhoneDigits(phoneItem.phoneNumber));
+    if (!remote) throw new AppError("Phone number is unavailable in the remote inventory.", 404, 404);
+    const envelope = await phoneActionCoordinator.execute({
+      operation: {
+        accountId: account.id,
+        phoneId: phoneItem.id,
+        action: PhoneActionType.enable_sms,
+        appVariant: account.appVariant,
+        idempotencyKey: body.request_id ?? randomUUID(),
+        baselineStatus: phoneItem.status,
+        baselineExpiry: phoneItem.expiredTime,
+        requestFingerprint: `force-enable-sms:${phoneItem.id}`,
+        requestPayload: { allowReceiveSms: true, forced: true }
+      },
+      mutate: () => directRefreshGateway.enablePhoneNumberSmsReceptionMutation(
+        directAccount,
+        remote.phoneNumber,
+        remote
+      )
+    });
+    ok(res, {
+      operation: serializePhoneActionOperation(envelope.operation),
+      phone: serializePhoneNumber(phoneItem),
+      reused: envelope.reused
     });
   } catch (error) {
     next(error);
@@ -1689,96 +1879,47 @@ accountsRouter.post("/:id/phone-numbers/preview", async (req, res, next) => {
 });
 
 accountsRouter.post("/:id/phone-numbers/purchase", async (req, res, next) => {
+  const accountId = Number(req.params.id);
+  if (activePhonePurchases.has(accountId)) {
+    next(new AppError("A phone purchase is already in progress for this account.", 409, 409));
+    return;
+  }
+  activePhonePurchases.add(accountId);
   try {
-    const account = await assertAccount(Number(req.params.id));
+    const account = await assertAccount(accountId);
     const body = purchasePhoneSchema.parse(req.body ?? {});
     assertPhoneCountrySelection(body);
     if (requiresPhonePurchaseConfirm(body)) {
       throw new AppError("Purchasing a phone number requires confirm=true", 400, 400);
     }
-    const useDirect = await shouldUseDirectAccountFlow(account);
-    const helperPurchaseTimeoutMs = Math.max(45_000, config.DT_HELPER_PURCHASE_TIMEOUT_MS);
-    let usedHelperPurchaseFallback = false;
-    const directAccount = useDirect
-      ? {
-          dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
-          token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-          deviceId: account.dtDeviceId
-        }
-      : null;
-    const purchaseCandidate = mapPurchaseCandidate(body.candidate);
-    let remote: DingtonePhoneNumber;
-    if (useDirect) {
-      try {
-        remote = await directRefreshGateway.purchasePhoneNumber(
-            {
-              dtUserId: directAccount!.dtUserId,
-              token: directAccount!.token,
-              deviceId: directAccount!.deviceId
-            },
-            {
-              countryCode: body.country_code,
-              isoCountryCode: body.iso_country_code ?? body.candidate.iso_country_code,
-              countryKey: body.country_key,
-              candidate: purchaseCandidate
-            }
-          );
-      } catch (error) {
-        logger.warn("Direct phone purchase failed; trying helper/native fallback", {
-          accountId: account.id,
-          appVariant: account.appVariant,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        remote = normalizeHelperPhoneNumber(
-          await executeHelperAction(
-            "purchase_phone_number",
-            {
-              appVariant: account.appVariant,
-              countryCode: body.country_code,
-              isoCountryCode: body.iso_country_code ?? body.candidate.iso_country_code,
-              countryKey: body.country_key,
-              candidate: purchaseCandidate
-            },
-            helperPurchaseTimeoutMs
-          )
-        );
-        usedHelperPurchaseFallback = true;
-      }
-    } else {
-      remote = normalizeHelperPhoneNumber(
-        await executeHelperAction(
-          "purchase_phone_number",
-          {
-            appVariant: account.appVariant,
-            countryCode: body.country_code,
-            isoCountryCode: body.iso_country_code ?? body.candidate.iso_country_code,
-            countryKey: body.country_key,
-            candidate: purchaseCandidate
-          },
-          helperPurchaseTimeoutMs
-        )
-      );
+    if (!(await shouldUseDirectAccountFlow(account))) {
+      throw new AppError("Phone purchases require a valid direct account session.", 503, 503);
     }
-    const confirmation: PurchaseConfirmation = useDirect && !usedHelperPurchaseFallback
-      ? await confirmPurchasedPhone(
-          directAccount!,
-          remote,
-          account.appVariant
-        ).catch((error) => {
-          logger.warn("Direct purchase was not confirmed; local phone data was not changed", {
-            accountId: account.id,
-            appVariant: account.appVariant,
-            phoneNumber: redactPhoneForLog(remote.phoneNumber),
-            error: error instanceof Error ? error.message : String(error)
-          });
-          throw error;
-        })
-      : {
-          phone: remote,
-          source: "helper_purchase_response",
-          confirmed: false,
-          note: "Helper native app purchase fallback returned the purchased phone record."
-        };
+    const directAccount = {
+      dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+      token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+      deviceId: account.dtDeviceId,
+      appVariant: account.appVariant
+    };
+    const purchaseCandidate = mapPurchaseCandidate(body.candidate);
+    const remote = await directRefreshGateway.purchasePhoneNumber(
+      directAccount,
+      {
+        countryCode: body.country_code,
+        isoCountryCode: body.iso_country_code ?? body.candidate.iso_country_code,
+        countryKey: body.country_key,
+        candidate: purchaseCandidate
+      }
+    );
+    const confirmation: PurchaseConfirmation = await confirmPurchasedPhone(directAccount, remote).catch((error) => {
+      logger.warn("Direct purchase was not confirmed; local phone data was not changed", {
+        accountId: account.id,
+        appVariant: account.appVariant,
+        phoneNumber: redactPhoneForLog(remote.phoneNumber),
+        error: error instanceof Error ? error.message : String(error)
+      });
+      throw error;
+    });
     const confirmedRemote = confirmation.phone;
 
     await prisma.phoneNumber.upsert({
@@ -1836,6 +1977,8 @@ accountsRouter.post("/:id/phone-numbers/purchase", async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    activePhonePurchases.delete(accountId);
   }
 });
 
@@ -1845,33 +1988,95 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
     if (requiresPhoneRenewConfirm(body)) {
       throw new AppError("Renewing a phone number requires confirm=true", 400, 400);
     }
-    const account = await assertAccount(Number(req.params.id));
+    const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
     const phoneItem = await assertAccountPhoneNumber(account.id, Number(req.params.phoneId));
     const useDirect = await shouldUseDirectAccountFlow(account);
-    const renewalBaseline = useDirect ? await getDirectPhoneBaseline(account, phoneItem) : phoneItem;
-    const remote = useDirect
-      ? await directRefreshGateway.renewPhoneNumber(
+    if (!useDirect) {
+      throw new AppError("Phone renewal requires a Direct account session and does not use ADB/helper fallback.", 409, 409);
+    }
+    const renewalBaseline = parsePhoneExpiry(phoneItem.expiredTime) !== null
+      ? phoneItem
+      : await getDirectPhoneBaseline(account, phoneItem);
+    const balanceBefore = await resolvePhoneActionBalance(account, true);
+    if (balanceBefore === null) {
+      throw new AppError("Could not establish the account balance before renewal.", 409, 409);
+    }
+    const quotedPrice = resolveStoredRenewalQuote(phoneItem);
+    const extensionMonths = resolvePhoneRenewalMonths(phoneItem);
+    if (balanceBefore < quotedPrice) {
+      throw new AppError("The account balance is lower than the exact stored renewal quote.", 409, 409);
+    }
+
+    let responsePatch: Partial<DingtonePhoneNumber> | null = null;
+    let responseConfirmation: PhoneRenewalConfirmation<Partial<DingtonePhoneNumber>> | null = null;
+    const envelope = await phoneActionCoordinator.execute({
+      operation: {
+        accountId: account.id,
+        phoneId: phoneItem.id,
+        action: PhoneActionType.renew,
+        appVariant: account.appVariant,
+        idempotencyKey: body.request_id ?? randomUUID(),
+        baselineStatus: phoneItem.status,
+        baselineExpiry: renewalBaseline.expiredTime,
+        balanceBefore,
+        quotedPrice,
+        extensionMonths,
+        requestFingerprint: `renew:${phoneItem.id}:${extensionMonths}:${quotedPrice}`,
+        requestPayload: { extensionMonths }
+      },
+      mutate: async () => {
+        const mutation = await directRefreshGateway.renewPhoneNumberMutation(
           {
             dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
             token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-            deviceId: account.dtDeviceId
+            deviceId: account.dtDeviceId,
+            appVariant: account.appVariant
           },
           phoneItem.phoneNumber,
           mapStoredPhoneContext(phoneItem)
-        )
-      : normalizeHelperPhoneNumberPatch(
-          await executeHelperAction("renew_phone_number", { appVariant: account.appVariant, phoneNumber: phoneItem.phoneNumber }, 45_000)
         );
-    const verified = useDirect ? await verifyDirectPhoneAction(account, renewalBaseline, null, true) : {};
-
-    const updated = await prisma.phoneNumber.update({
-      where: { id: phoneItem.id },
-      data: mapPhoneNumberPatch({ ...remote, ...verified })
+        if (mutation.outcome === "response") {
+          responsePatch = mutation.payload as Partial<DingtonePhoneNumber>;
+        }
+        return mutation;
+      },
+      classifyResponse: (payload) => {
+        responseConfirmation = resolvePhoneRenewalConfirmation({
+          previous: renewalBaseline,
+          action: payload as Partial<DingtonePhoneNumber>
+        });
+        if (!responseConfirmation.confirmed) return null;
+        return {
+          confirmationSource: responseConfirmation.source,
+          responseClass: "response_confirmed",
+          confirmedExpiry: responseConfirmation.phone.expiredTime,
+          extensionMonths,
+          evidenceAt: new Date()
+        };
+      }
     });
 
-    const response = phoneActionResponse(updated, "renew", useDirect, verified);
-    await sendPhoneActionTelegramNotification(account, updated, "renew", response.verification);
-    ok(res, response);
+    let updated = phoneItem;
+    if (envelope.operation.state === "confirmed" && responsePatch) {
+      updated = await prisma.phoneNumber.update({
+        where: { id: phoneItem.id },
+        data: mapPhoneNumberPatch(responsePatch)
+      });
+      void completeConfirmedRenewalAudit({
+        operationId: envelope.operation.id,
+        account,
+        phone: updated,
+        baseline: renewalBaseline,
+        balanceBefore,
+        extensionMonths
+      });
+    }
+
+    ok(res, {
+      operation: serializePhoneActionOperation(envelope.operation),
+      phone: serializePhoneNumber(updated),
+      reused: envelope.reused
+    });
   } catch (error) {
     next(error);
   }
@@ -1879,33 +2084,42 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
 
 accountsRouter.put("/:id/phone-numbers/:phoneId/label", async (req, res, next) => {
   try {
-    const account = await assertAccount(Number(req.params.id));
+    const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
     const phoneItem = await assertAccountPhoneNumber(account.id, Number(req.params.phoneId));
     const body = updatePhoneLabelSchema.parse(req.body ?? {});
     const useDirect = await shouldUseDirectAccountFlow(account);
-    const remote = useDirect
-      ? await directRefreshGateway.updatePhoneNumberLabel(
-          {
-            dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
-            token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-            deviceId: account.dtDeviceId
-          },
-          phoneItem.phoneNumber,
-          body.display_name,
-          mapStoredPhoneContext(phoneItem)
-        )
-      : normalizeHelperPhoneNumberPatch(
-          await executeHelperAction(
-            "update_phone_number_label",
-            { appVariant: account.appVariant, phoneNumber: phoneItem.phoneNumber, displayName: body.display_name },
-            35_000
-          )
-        );
-    const updated = await prisma.phoneNumber.update({
-      where: { id: phoneItem.id },
-      data: mapPhoneNumberPatch({ ...remote, displayName: body.display_name })
+    if (!useDirect) {
+      throw new AppError("Phone label updates require a Direct account session and do not use ADB/helper fallback.", 409, 409);
+    }
+    const envelope = await phoneActionCoordinator.execute({
+      operation: {
+        accountId: account.id,
+        phoneId: phoneItem.id,
+        action: PhoneActionType.update_label,
+        appVariant: account.appVariant,
+        idempotencyKey: body.request_id ?? randomUUID(),
+        baselineStatus: phoneItem.status,
+        baselineExpiry: phoneItem.expiredTime,
+        requestFingerprint: `label:${phoneItem.id}:${body.display_name}`,
+        requestPayload: { displayName: body.display_name }
+      },
+      mutate: () => directRefreshGateway.updatePhoneNumberLabelMutation(
+        {
+          dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+          token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+          deviceId: account.dtDeviceId,
+          appVariant: account.appVariant
+        },
+        phoneItem.phoneNumber,
+        body.display_name,
+        mapStoredPhoneContext(phoneItem)
+      )
     });
-    ok(res, serializePhoneNumber(updated));
+    ok(res, {
+      operation: serializePhoneActionOperation(envelope.operation),
+      phone: serializePhoneNumber(phoneItem),
+      reused: envelope.reused
+    });
   } catch (error) {
     next(error);
   }
@@ -1917,31 +2131,40 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/cancel", async (req, res, next)
     if (requiresPhoneCancelConfirm(body)) {
       throw new AppError("Cancelling a phone number requires confirm=true", 400, 400);
     }
-    const account = await assertAccount(Number(req.params.id));
+    const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
     const phoneItem = await assertAccountPhoneNumber(account.id, Number(req.params.phoneId));
     const useDirect = await shouldUseDirectAccountFlow(account);
-    if (useDirect) {
-      await directRefreshGateway.cancelPhoneNumber(
+    if (!useDirect) {
+      throw new AppError("Phone cancellation requires a Direct account session and does not use ADB/helper fallback.", 409, 409);
+    }
+    const envelope = await phoneActionCoordinator.execute({
+      operation: {
+        accountId: account.id,
+        phoneId: phoneItem.id,
+        action: PhoneActionType.cancel,
+        appVariant: account.appVariant,
+        idempotencyKey: body.request_id ?? randomUUID(),
+        baselineStatus: phoneItem.status,
+        baselineExpiry: phoneItem.expiredTime,
+        requestFingerprint: `cancel:${phoneItem.id}`,
+        requestPayload: { status: "cancelled" }
+      },
+      mutate: () => directRefreshGateway.cancelPhoneNumberMutation(
         {
           dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
           token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-          deviceId: account.dtDeviceId
+          deviceId: account.dtDeviceId,
+          appVariant: account.appVariant
         },
         phoneItem.phoneNumber,
         mapStoredPhoneContext(phoneItem)
-      );
-    } else {
-      await executeHelperAction("cancel_phone_number", { appVariant: account.appVariant, phoneNumber: phoneItem.phoneNumber }, 35_000);
-    }
-    const verified = useDirect ? await verifyDirectPhoneAction(account, phoneItem, PhoneStatus.cancelled) : { status: PhoneStatus.cancelled };
-
-    const updated = await prisma.phoneNumber.update({
-      where: { id: phoneItem.id },
-      data: mapPhoneNumberPatch(verified)
+      )
     });
-    const response = phoneActionResponse(updated, "cancel", useDirect, verified);
-    await sendPhoneActionTelegramNotification(account, updated, "cancel", response.verification);
-    ok(res, response);
+    ok(res, {
+      operation: serializePhoneActionOperation(envelope.operation),
+      phone: serializePhoneNumber(phoneItem),
+      reused: envelope.reused
+    });
   } catch (error) {
     next(error);
   }
@@ -1953,31 +2176,40 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/pause", async (req, res, next) 
     if (requiresPhonePauseConfirm(body)) {
       throw new AppError("Pausing a phone number requires confirm=true", 400, 400);
     }
-    const account = await assertAccount(Number(req.params.id));
+    const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
     const phoneItem = await assertAccountPhoneNumber(account.id, Number(req.params.phoneId));
     const useDirect = await shouldUseDirectAccountFlow(account);
-    if (useDirect) {
-      await directRefreshGateway.pausePhoneNumber(
+    if (!useDirect) {
+      throw new AppError("Pausing a phone number requires a Direct account session and does not use ADB/helper fallback.", 409, 409);
+    }
+    const envelope = await phoneActionCoordinator.execute({
+      operation: {
+        accountId: account.id,
+        phoneId: phoneItem.id,
+        action: PhoneActionType.pause,
+        appVariant: account.appVariant,
+        idempotencyKey: body.request_id ?? randomUUID(),
+        baselineStatus: phoneItem.status,
+        baselineExpiry: phoneItem.expiredTime,
+        requestFingerprint: `pause:${phoneItem.id}`,
+        requestPayload: { status: "paused" }
+      },
+      mutate: () => directRefreshGateway.pausePhoneNumberMutation(
         {
           dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
           token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-          deviceId: account.dtDeviceId
+          deviceId: account.dtDeviceId,
+          appVariant: account.appVariant
         },
         phoneItem.phoneNumber,
         mapStoredPhoneContext(phoneItem)
-      );
-    } else {
-      await executeHelperAction("pause_phone_number", { appVariant: account.appVariant, phoneNumber: phoneItem.phoneNumber }, 35_000);
-    }
-    const verified = useDirect ? await verifyDirectPhoneAction(account, phoneItem, PhoneStatus.paused) : { status: PhoneStatus.paused };
-
-    const updated = await prisma.phoneNumber.update({
-      where: { id: phoneItem.id },
-      data: mapPhoneNumberPatch(verified)
+      )
     });
-    const response = phoneActionResponse(updated, "pause", useDirect, verified);
-    await sendPhoneActionTelegramNotification(account, updated, "pause", response.verification);
-    ok(res, response);
+    ok(res, {
+      operation: serializePhoneActionOperation(envelope.operation),
+      phone: serializePhoneNumber(phoneItem),
+      reused: envelope.reused
+    });
   } catch (error) {
     next(error);
   }
@@ -1989,31 +2221,40 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/resume", async (req, res, next)
     if (requiresPhoneResumeConfirm(body)) {
       throw new AppError("Resuming a phone number requires confirm=true", 400, 400);
     }
-    const account = await assertAccount(Number(req.params.id));
+    const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
     const phoneItem = await assertAccountPhoneNumber(account.id, Number(req.params.phoneId));
     const useDirect = await shouldUseDirectAccountFlow(account);
-    if (useDirect) {
-      await directRefreshGateway.resumePhoneNumber(
+    if (!useDirect) {
+      throw new AppError("Resuming a phone number requires a Direct account session and does not use ADB/helper fallback.", 409, 409);
+    }
+    const envelope = await phoneActionCoordinator.execute({
+      operation: {
+        accountId: account.id,
+        phoneId: phoneItem.id,
+        action: PhoneActionType.resume,
+        appVariant: account.appVariant,
+        idempotencyKey: body.request_id ?? randomUUID(),
+        baselineStatus: phoneItem.status,
+        baselineExpiry: phoneItem.expiredTime,
+        requestFingerprint: `resume:${phoneItem.id}`,
+        requestPayload: { status: "active" }
+      },
+      mutate: () => directRefreshGateway.resumePhoneNumberMutation(
         {
           dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
           token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-          deviceId: account.dtDeviceId
+          deviceId: account.dtDeviceId,
+          appVariant: account.appVariant
         },
         phoneItem.phoneNumber,
         mapStoredPhoneContext(phoneItem)
-      );
-    } else {
-      await executeHelperAction("resume_phone_number", { appVariant: account.appVariant, phoneNumber: phoneItem.phoneNumber }, 35_000);
-    }
-    const verified = useDirect ? await verifyDirectPhoneAction(account, phoneItem, PhoneStatus.active) : { status: PhoneStatus.active };
-
-    const updated = await prisma.phoneNumber.update({
-      where: { id: phoneItem.id },
-      data: mapPhoneNumberPatch(verified)
+      )
     });
-    const response = phoneActionResponse(updated, "resume", useDirect, verified);
-    await sendPhoneActionTelegramNotification(account, updated, "resume", response.verification);
-    ok(res, response);
+    ok(res, {
+      operation: serializePhoneActionOperation(envelope.operation),
+      phone: serializePhoneNumber(phoneItem),
+      reused: envelope.reused
+    });
   } catch (error) {
     next(error);
   }
@@ -2072,9 +2313,8 @@ async function refreshAccountData(
   }
 
   const normalizedNickname = normalizeOptionalString(account.nickname);
-  const snapshotName = normalizeOptionalString(snapshot.fullName);
-  if (!normalizedNickname || shouldReplaceNickname(normalizedNickname, snapshotName)) {
-    const autoName = snapshotName || account.email || account.phone || account.dtUserId || "Unnamed account";
+  const autoName = resolveRefreshedAccountNickname(account.nickname, snapshot.fullName, account);
+  if (!normalizedNickname || autoName !== normalizedNickname) {
     await prisma.dtAccount.update({
       where: { id: accountId },
       data: {
@@ -2236,6 +2476,24 @@ async function validateCapturedSession(
 
   const message = lastError instanceof Error ? lastError.message : "unknown direct session validation error";
   throw new AppError(`Captured session validation failed: ${message}`, 409, 409);
+}
+
+async function startMonitorAfterVerification(accountId: number) {
+  try {
+    await accountMonitorService.start(accountId);
+    return { started: true, error: null };
+  } catch (error) {
+    const message = formatLastError(error);
+    await prisma.dtAccount.update({
+      where: { id: accountId },
+      data: {
+        status: AccountStatus.offline,
+        monitorEnabled: false,
+        lastError: message
+      }
+    }).catch(() => null);
+    return { started: false, error: message };
+  }
 }
 
 async function importAuthorizedSession(
@@ -2788,93 +3046,181 @@ async function findExistingAccount(adminId: number, appVariant: AppVariant, emai
   return null;
 }
 
+async function assertPhoneFallbackSessionMatchesAccount(account: {
+  id: number;
+  dtUserId: string | null;
+  appVariant: AppVariant;
+}) {
+  const expectedDtUserId = requireString(account.dtUserId, "Missing dt_user_id");
+  const session = await exportSessionFromAdbConfig(account.appVariant);
+  try {
+    assertAdbSessionMatchesExpectedUser(session, expectedDtUserId, account.appVariant);
+  } catch (error) {
+    logger.warn("Blocked App/ADB phone fallback for a mismatched local session", {
+      accountId: account.id,
+      appVariant: account.appVariant
+    });
+    throw error;
+  }
+}
+
 async function previewPhoneNumbers(accountId: number, payload: unknown) {
   const body = requestPhoneSchema.parse(payload ?? {});
   assertPhoneCountrySelection(body);
   const account = await assertAccount(accountId);
-  if (await shouldUseDirectAccountFlow(account)) {
-    return directRefreshGateway.requestPhoneNumber(
-      {
-        dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
-        token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-        deviceId: account.dtDeviceId
-      },
-      { countryCode: body.country_code, isoCountryCode: body.iso_country_code, countryKey: body.country_key, areaCode: body.area_code }
-    );
-  }
+  const pausedMonitor = await pauseMonitorForDirectMaintenance(account).catch(() => false);
   try {
-    const helperPreview = normalizeHelperPhonePreview(
-      await helperRefreshGateway.requestPhoneNumber(
-        {
-          dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
-          token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-          deviceId: normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType),
-          appVariant: account.appVariant
-        },
-        { countryCode: body.country_code, isoCountryCode: body.iso_country_code, countryKey: body.country_key, areaCode: body.area_code }
-      )
-    );
-    if (helperPreview.candidates.length > 0 || helperPreview.freeChance !== undefined) {
-      return helperPreview;
+    if (await shouldUseDirectAccountFlow(account)) {
+      try {
+        const directPreview = await directRefreshGateway.requestPhoneNumber(
+          {
+            dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+            token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+            deviceId: account.dtDeviceId,
+            appVariant: account.appVariant
+          },
+          { countryCode: body.country_code, isoCountryCode: body.iso_country_code, countryKey: body.country_key, areaCode: body.area_code }
+        );
+        if (directPreview.candidates.length > 0 || directPreview.freeChance !== undefined) {
+          return directPreview;
+        }
+        throw new Error("Direct preview returned no candidates");
+      } catch (directError) {
+        logger.warn("Direct phone preview failed; trying App helper fallback", {
+          accountId,
+          appVariant: account.appVariant,
+          error: directError instanceof Error ? directError.message : String(directError)
+        });
+      }
     }
-    throw new Error("Helper preview returned no candidates");
-  } catch (primaryError) {
-    let lastFallbackError: unknown = null;
+    await assertPhoneFallbackSessionMatchesAccount(account);
     try {
-      const adbPreview = await previewPhoneNumbersFromAdb(body.country_code ?? 1, body.iso_country_code ?? body.country_key, account.appVariant);
-      logger.warn("ADB preview fallback result", {
-        accountId,
-        countryCode: body.country_code ?? 1,
-        candidateCount: adbPreview.candidates.length
-      });
-      return adbPreview;
-    } catch (adbError) {
-      lastFallbackError = adbError;
-      logger.warn("ADB preview fallback failed", {
-        accountId,
-        countryCode: body.country_code ?? 1,
-        error: adbError instanceof Error ? adbError.message : String(adbError)
-      });
+      const helperPreview = normalizeHelperPhonePreview(
+        await helperRefreshGateway.requestPhoneNumber(
+          {
+            dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+            token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+            deviceId: normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType),
+            appVariant: account.appVariant
+          },
+          { countryCode: body.country_code, isoCountryCode: body.iso_country_code, countryKey: body.country_key, areaCode: body.area_code }
+        )
+      );
+      if (helperPreview.candidates.length > 0 || helperPreview.freeChance !== undefined) {
+        return helperPreview;
+      }
+      throw new Error("Helper preview returned no candidates");
+    } catch (primaryError) {
+      let lastFallbackError: unknown = null;
+      try {
+        const adbPreview = await previewPhoneNumbersFromAdb(
+          body.country_code ?? 1,
+          body.iso_country_code ?? body.country_key,
+          account.appVariant,
+          requireString(account.dtUserId, "Missing dt_user_id")
+        );
+        logger.warn("ADB preview fallback result", {
+          accountId,
+          countryCode: body.country_code ?? 1,
+          candidateCount: adbPreview.candidates.length
+        });
+        return adbPreview;
+      } catch (adbError) {
+        lastFallbackError = adbError;
+        logger.warn("ADB preview fallback failed", {
+          accountId,
+          countryCode: body.country_code ?? 1,
+          error: adbError instanceof Error ? adbError.message : String(adbError)
+        });
+      }
+      try {
+        const raw = await getCachedPrivateNumberEvent();
+        return normalizeHelperPhonePreview(raw);
+      } catch (cachedError) {
+        if (lastFallbackError instanceof Error) {
+          throw lastFallbackError;
+        }
+        if (cachedError instanceof Error) {
+          throw cachedError;
+        }
+        if (primaryError instanceof Error) {
+          throw primaryError;
+        }
+        throw new Error(String(cachedError));
+      }
     }
-    try {
-      const raw = await getCachedPrivateNumberEvent();
-      return normalizeHelperPhonePreview(raw);
-    } catch (cachedError) {
-      if (lastFallbackError instanceof Error) {
-        throw lastFallbackError;
-      }
-      if (cachedError instanceof Error) {
-        throw cachedError;
-      }
-      if (primaryError instanceof Error) {
-        throw primaryError;
-      }
-      throw new Error(String(cachedError));
+  } finally {
+    if (pausedMonitor) {
+      await accountMonitorService.start(accountId).catch((error) => {
+        logger.warn("Failed to restore account monitor after phone number preview", {
+          accountId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
     }
   }
 }
 
 export async function syncPhoneNumbersFromRemote(accountId: number) {
+  const existing = activePhoneInventorySyncs.get(accountId);
+  if (existing) {
+    return existing;
+  }
+
+  const task = performPhoneNumberSyncFromRemote(accountId).finally(() => {
+    if (activePhoneInventorySyncs.get(accountId) === task) {
+      activePhoneInventorySyncs.delete(accountId);
+    }
+  });
+  activePhoneInventorySyncs.set(accountId, task);
+  return task;
+}
+
+async function waitForPhoneInventorySync(accountId: number) {
+  const result = await Promise.race([
+    syncPhoneNumbersFromRemote(accountId).then((phoneNumbers) => ({
+      refreshPending: false as const,
+      phoneNumbers
+    })),
+    delayResult(INTERACTIVE_PHONE_SYNC_WAIT_MS, { refreshPending: true as const })
+  ]);
+  if (!result.refreshPending) {
+    return result;
+  }
+  return {
+    refreshPending: true as const,
+    phoneNumbers: await loadCachedPhoneNumbers(accountId)
+  };
+}
+
+async function performPhoneNumberSyncFromRemote(accountId: number) {
   const account = await assertAccount(accountId);
-  const directAccount = {
+  if (!(await shouldUseDirectAccountFlow(account))) {
+    throw new AppError("Phone inventory synchronization requires a valid direct account session.", 503, 503);
+  }
+  const directAccount = buildDirectPhoneInventoryIdentity({
     dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
     token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-    deviceId: account.dtDeviceId
-  };
-  const phoneNumbers = (await shouldUseDirectAccountFlow(account))
-    ? await directRefreshGateway.listPhoneNumbers(directAccount)
-    : await executeHelperAction("list_phone_numbers", { appVariant: account.appVariant }, 35_000)
-        .then((raw) => normalizeHelperPhoneNumbers(raw))
-        .catch(async () => {
-          return listPhoneNumbersFromAdb(account.appVariant).catch(async () => {
-            return dingtoneGateway.listPhoneNumbers(directAccount);
-          });
-        });
-  await syncPhoneNumbers(accountId, phoneNumbers);
+    deviceId: account.dtDeviceId,
+    appVariant: account.appVariant
+  });
+  return accountMonitorService.withMaintenance(accountId, async () => {
+    const phoneNumbers = await directRefreshGateway.listPhoneNumbers(directAccount);
+    await syncPhoneNumbers(accountId, phoneNumbers);
+    return loadCachedPhoneNumbers(accountId);
+  });
+}
+
+function loadCachedPhoneNumbers(accountId: number) {
   return prisma.phoneNumber.findMany({
     where: { accountId },
     orderBy: [{ isPrimary: "desc" }, { createdAt: "desc" }]
   });
+}
+
+function formatPhoneInventoryRefreshError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return `远端号码同步暂时失败，当前显示本地缓存：${message}`;
 }
 
 async function verifyDirectPhoneAction(
@@ -2899,7 +3245,7 @@ async function verifyDirectPhoneAction(
   const target = normalizePhoneDigits(phoneItem.phoneNumber);
   let lastError: unknown;
 
-  for (const waitMs of [0, 1_500, 3_000, 5_000]) {
+  for (const waitMs of [0, 1_200]) {
     if (waitMs > 0) {
       await delayResult(waitMs, null);
     }
@@ -2953,8 +3299,11 @@ async function refreshDirectPhoneSmsSettings(
   targetNumbers: Set<string>,
   fallback: DingtonePhoneNumber[]
 ) {
+  if (targetNumbers.size === 0) {
+    return fallback;
+  }
   let latest = fallback;
-  for (const waitMs of [0, 1_500, 3_000, 5_000]) {
+  for (const waitMs of [0, 1_200]) {
     if (waitMs > 0) {
       await delayResult(waitMs, null);
     }
@@ -2968,7 +3317,6 @@ async function refreshDirectPhoneSmsSettings(
       continue;
     }
     if (
-      targetNumbers.size === 0 ||
       [...targetNumbers].every((target) =>
         latest.some((phone) => normalizePhoneDigits(phone.phoneNumber) === target && phone.allowReceiveSms === true)
       )
@@ -2977,6 +3325,87 @@ async function refreshDirectPhoneSmsSettings(
     }
   }
   return latest;
+}
+
+async function buildAccountPhoneSmsDiagnostics(
+  account: { id: number; monitorEnabled: boolean },
+  phones: StoredPhoneNumber[]
+) {
+  const [messages, latestMonitor] = await Promise.all([
+    prisma.message.findMany({
+      where: { accountId: account.id, direction: MessageDirection.incoming, toNumber: { not: null } },
+      select: { toNumber: true, receivedAt: true }
+    }),
+    prisma.monitorSession.findFirst({
+      where: { accountId: account.id },
+      orderBy: { id: "desc" },
+      select: { status: true, routeAddress: true }
+    })
+  ]);
+  const messageStats = new Map<string, { count: number; lastReceivedAt: Date | null }>();
+  for (const item of messages) {
+    const digits = normalizePhoneDigits(item.toNumber ?? "");
+    if (!digits) {
+      continue;
+    }
+    const current = messageStats.get(digits) ?? { count: 0, lastReceivedAt: null };
+    current.count += 1;
+    if (!current.lastReceivedAt || item.receivedAt > current.lastReceivedAt) {
+      current.lastReceivedAt = item.receivedAt;
+    }
+    messageStats.set(digits, current);
+  }
+
+  const monitorRunning = accountMonitorService.isRunning(account.id);
+  const monitorListenActive = latestMonitor?.routeAddress?.includes("listen=active") ?? false;
+  return phones.map((phone) => {
+    const serialized = serializePhoneNumber(phone);
+    const digits = normalizePhoneDigits(phone.phoneNumber);
+    const messageStat = findPhoneMessageStat(messageStats, digits);
+    const raw = parseJsonRecord(phone.rawJson);
+    const diagnostic = buildPhoneSmsReceptionDiagnostic({
+      status: phone.status,
+      expiredTime: phone.expiredTime,
+      providerId: phone.providerId,
+      packageServiceId: pickString(raw, ["packageServiceId", "package_service_id"]),
+      allowReceiveSms: serialized.allow_receive_sms ?? undefined,
+      receivedCount: messageStat?.count ?? 0,
+      lastReceivedAt: messageStat?.lastReceivedAt?.toISOString() ?? null,
+      monitorEnabled: account.monitorEnabled,
+      monitorRunning,
+      monitorStatus: latestMonitor?.status ?? null,
+      monitorListenActive
+    });
+    return {
+      phone_number: serialized.phone_number,
+      filter_status: diagnostic.filterStatus,
+      routing_status: diagnostic.routingStatus,
+      listener_status: diagnostic.listenerStatus,
+      delivery_evidence: diagnostic.deliveryEvidence,
+      delivery_status: diagnostic.deliveryStatus,
+      repairable: diagnostic.repairable,
+      severity: diagnostic.severity,
+      summary: diagnostic.summary,
+      received_count: diagnostic.receivedCount,
+      last_received_at: diagnostic.lastReceivedAt
+    };
+  });
+}
+
+function findPhoneMessageStat(
+  stats: Map<string, { count: number; lastReceivedAt: Date | null }>,
+  phoneDigits: string
+) {
+  const exact = stats.get(phoneDigits);
+  if (exact) {
+    return exact;
+  }
+  const suffix = phoneDigits.slice(-8);
+  if (suffix.length < 8) {
+    return null;
+  }
+  const matches = [...stats.entries()].filter(([digits]) => digits.endsWith(suffix));
+  return matches.length === 1 ? matches[0]?.[1] ?? null : null;
 }
 
 async function getDirectPhoneBaseline(
@@ -3007,44 +3436,33 @@ function assertPhoneRenewalAdvanced(
   previous: { expiredTime?: string | null },
   current: Partial<DingtonePhoneNumber>
 ) {
-  const previousExpiry = parsePhoneExpiry(previous.expiredTime);
-  const currentExpiry = parsePhoneExpiry(current.expiredTime);
-  if (previousExpiry !== null && currentExpiry !== null && currentExpiry > previousExpiry) {
+  if (hasAdvancedPhoneExpiry(previous, current)) {
     return;
   }
   throw new AppError("Remote verification failed: renewed phone expiry did not advance.", 502, 502);
-}
-
-function parsePhoneExpiry(value: string | null | undefined) {
-  if (!value) {
-    return null;
-  }
-  const numeric = Number(value);
-  if (Number.isFinite(numeric) && numeric > 0) {
-    return numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
-  }
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function phoneActionResponse(
   phone: StoredPhoneNumber,
   action: "renew" | "cancel" | "pause" | "resume",
   useDirect: boolean,
-  verified: Partial<DingtonePhoneNumber>
+  verified: Partial<DingtonePhoneNumber>,
+  confirmation?: Pick<PhoneRenewalConfirmation, "source" | "confirmed" | "note">
 ) {
   const serialized = serializePhoneNumber(phone);
   return {
     phone: serialized,
     verification: {
-      source: useDirect ? "remote_phone_list" : "helper_action_response",
-      confirmed: useDirect,
+      source: confirmation?.source ?? (useDirect ? "remote_phone_list" : "helper_action_response"),
+      confirmed: confirmation?.confirmed ?? useDirect,
       action,
       phone_number: serialized.phone_number,
       status: serialized.status,
-      note: useDirect
-        ? phoneActionVerificationNote(action, verified)
-        : "Helper mode action result was written without direct remote-list confirmation."
+      note:
+        confirmation?.note ??
+        (useDirect
+          ? phoneActionVerificationNote(action, verified)
+          : "Helper mode action result was written without direct remote-list confirmation.")
     }
   };
 }
@@ -3057,17 +3475,36 @@ async function sendPhoneActionTelegramNotification(
     phone: string | null;
     dtUserId: string | null;
     telegramNotify: boolean;
+    appVariant: "dingtone" | "dingdong";
   },
   phone: StoredPhoneNumber,
   action: "renew" | "cancel" | "pause" | "resume",
-  verification: { source: string; note?: string | null }
+  verification: { source: string; note?: string | null },
+  renewal?: {
+    balanceBefore?: number | null;
+    balanceAfter?: number | null;
+    renewalDuration?: string | null;
+    renewedUntil?: string | null;
+  }
 ) {
+  const ownedPhoneNumbers = action === "renew"
+    ? (await prisma.phoneNumber.findMany({
+        where: { accountId: account.id, status: { not: PhoneStatus.cancelled } },
+        orderBy: { id: "asc" },
+        select: { phoneNumber: true }
+      })).map((item) => item.phoneNumber)
+    : undefined;
   await sendPhoneTelegramNotification({
     account,
     phone: mapStoredPhoneContext(phone),
     action,
     verificationSource: verification.source,
-    verificationNote: verification.note
+    verificationNote: verification.note,
+    balanceBefore: renewal?.balanceBefore,
+    balanceAfter: renewal?.balanceAfter,
+    renewalDuration: renewal?.renewalDuration,
+    renewedUntil: renewal?.renewedUntil,
+    ownedPhoneNumbers
   }).catch((error) => {
     logger.warn("Failed to send Telegram notification for phone action", {
       accountId: account.id,
@@ -3076,6 +3513,81 @@ async function sendPhoneActionTelegramNotification(
       error: error instanceof Error ? error.message : String(error)
     });
   });
+}
+
+async function sendRenewalPhoneActionTelegramNotification(
+  account: Parameters<typeof sendPhoneActionTelegramNotification>[0] & {
+    dtToken: string | null;
+    dtDeviceId: string;
+  },
+  phone: StoredPhoneNumber,
+  verification: { source: string; note?: string | null },
+  renewal: {
+    balanceBefore: number | null;
+    renewalDuration: string | null;
+    renewedUntil: string | null;
+    useDirect: boolean;
+  }
+) {
+  const balanceAfter = account.telegramNotify
+    ? await resolvePhoneActionBalance(account, renewal.useDirect)
+    : null;
+  await sendPhoneActionTelegramNotification(account, phone, "renew", verification, {
+    balanceBefore: renewal.balanceBefore,
+    balanceAfter,
+    renewalDuration: renewal.renewalDuration,
+    renewedUntil: renewal.renewedUntil
+  });
+}
+
+function resolveStoredRenewalQuote(phone: StoredPhoneNumber): number {
+  const metadata = extractPhoneInventoryMetadata(phone.rawJson);
+  if (metadata.price === null || !Number.isFinite(metadata.price) || metadata.price <= 0) {
+    throw new AppError(
+      "The latest remote phone record does not contain an exact renewal quote. Refresh the phone inventory before renewing.",
+      409,
+      409
+    );
+  }
+  return metadata.price;
+}
+
+async function completeConfirmedRenewalAudit(input: {
+  operationId: number;
+  account: Parameters<typeof sendRenewalPhoneActionTelegramNotification>[0];
+  phone: StoredPhoneNumber;
+  baseline: { expiredTime?: string | null };
+  balanceBefore: number;
+  extensionMonths: number;
+}) {
+  const balanceAfter = await resolvePhoneActionBalance(input.account, true);
+  await updatePhoneActionAuditEvidence(input.operationId, {
+    balanceAfter,
+    confirmedExpiry: input.phone.expiredTime,
+    extensionMonths: input.extensionMonths,
+    evidenceAt: new Date()
+  }).catch((error) => {
+    logger.warn("Failed to persist confirmed renewal audit evidence", {
+      operationId: input.operationId,
+      accountId: input.account.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+
+  await sendPhoneActionTelegramNotification(
+    input.account,
+    input.phone,
+    "renew",
+    { source: "renew_response", note: "Renewal expiry advanced in the native response." },
+    {
+      balanceBefore: input.balanceBefore,
+      balanceAfter,
+      renewalDuration:
+        formatPhoneRenewalExtension(input.baseline.expiredTime, input.phone.expiredTime) ??
+        formatPhoneRenewalPeriod(mapStoredPhoneContext(input.phone)),
+      renewedUntil: formatPhoneExpiryTime(input.phone.expiredTime)
+    }
+  );
 }
 
 function phoneActionVerificationNote(action: "renew" | "cancel" | "pause" | "resume", verified: Partial<DingtonePhoneNumber>) {
@@ -3093,9 +3605,8 @@ function normalizePhoneDigits(value: string) {
 }
 
 async function confirmPurchasedPhone(
-  account: { dtUserId: string; token: string; deviceId?: string | null },
-  phone: DingtonePhoneNumber,
-  appVariant: AppVariant
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  phone: DingtonePhoneNumber
 ): Promise<PurchaseConfirmation> {
   const target = normalizePhoneDigits(phone.phoneNumber);
   if (!target) {
@@ -3133,25 +3644,6 @@ async function confirmPurchasedPhone(
     } catch (error) {
       lastError = error;
     }
-  }
-
-  try {
-    const adbPhones = await listPhoneNumbersFromAdb(appVariant);
-    const matched = adbPhones.find((item) => normalizePhoneDigits(item.phoneNumber) === target);
-    if (matched) {
-      return {
-        phone: {
-          ...phone,
-          ...matched,
-          rawJson: matched.rawJson ?? phone.rawJson
-        },
-        source: "adb_phone_db",
-        confirmed: true,
-        note: `Purchase was not visible in the direct remote list during the confirmation window, but the matching ${describeAccountVariant(appVariant)} app database contains it.`
-      };
-    }
-  } catch (error) {
-    lastError = error;
   }
 
   const lastSeen = lastSeenRemotePhones.length
@@ -3987,7 +4479,7 @@ async function refreshMessagesFromRemote(accountId: number, limit: number, direc
     }
   }
 
-  const pausedMonitor = useDirectFlow && !directOnly ? await pauseMonitorForManualMessageRefresh(account).catch(() => false) : false;
+  const pausedMonitor = useDirectFlow && !directOnly ? await pauseMonitorForDirectMaintenance(account).catch(() => false) : false;
 
   try {
     if (useDirectFlow && account.dtUserId && account.dtToken) {
@@ -4144,7 +4636,7 @@ function pickDiagnosticNumber(note: string, key: string) {
   return match ? Number(match[1]) : null;
 }
 
-async function pauseMonitorForManualMessageRefresh(account: { id: number; monitorEnabled: boolean }) {
+async function pauseMonitorForDirectMaintenance(account: { id: number; monitorEnabled: boolean }) {
   if (!account.monitorEnabled) {
     return false;
   }
@@ -4154,6 +4646,36 @@ async function pauseMonitorForManualMessageRefresh(account: { id: number; monito
     emitStatus: false
   });
   return true;
+}
+
+async function withDirectMonitorMaintenance<T>(
+  account: { id: number; monitorEnabled: boolean },
+  useDirect: boolean,
+  operation: () => Promise<T>
+) {
+  if (!useDirect) {
+    return operation();
+  }
+
+  const pausedMonitor = await pauseMonitorForDirectMaintenance(account).catch((error) => {
+    logger.warn("Failed to pause account monitor for direct phone maintenance", {
+      accountId: account.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return false;
+  });
+  try {
+    return await operation();
+  } finally {
+    if (pausedMonitor) {
+      await accountMonitorService.start(account.id).catch((error) => {
+        logger.warn("Failed to restore account monitor after direct phone maintenance", {
+          accountId: account.id,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+    }
+  }
 }
 
 function buildRefreshDiagnostics(source: string, rows: HelperSmsMessageRecord[], imported: number): RefreshMessagesDiagnostics {
@@ -4437,6 +4959,11 @@ async function sendVerificationCodeWithFastAck(input: {
   adminId: number;
   sendInput: VerificationSendInput;
   statusOnSuccess: AccountStatus;
+  rollbackSession?: {
+    appVariant: AppVariant;
+    deviceId: string;
+    trackCode: string;
+  } | null;
   timeoutMs?: number;
 }): Promise<VerificationSendFastAckResult> {
   const sendTask = sendVerificationCodeWithVariantFallback(input.sendInput)
@@ -4456,7 +4983,16 @@ async function sendVerificationCodeWithFastAck(input: {
     .catch(async (error) => {
       await prisma.dtAccount.updateMany({
         where: { id: input.accountId, adminId: input.adminId },
-        data: { lastError: formatLastError(error) }
+        data: {
+          ...(input.rollbackSession
+            ? {
+                appVariant: input.rollbackSession.appVariant,
+                dtDeviceId: input.rollbackSession.deviceId,
+                dtTrackCode: input.rollbackSession.trackCode
+              }
+            : {}),
+          lastError: formatLastError(error)
+        }
       }).catch(() => null);
       throw error;
     });
@@ -4565,65 +5101,13 @@ async function shouldUseDirectAccountFlow(account: { loginType: string; dtUserId
   return mode === "direct" || account.loginType === "manual_session" || (mode !== "mock" && Boolean(account.dtUserId && account.dtToken));
 }
 
-function shouldReplaceNickname(currentNickname: string | null, snapshotName: string | null) {
-  if (!currentNickname || !snapshotName) {
-    return false;
-  }
-  const repairedNickname = repairUtf8Mojibake(currentNickname);
-  return repairedNickname !== currentNickname && repairedNickname === snapshotName;
-}
-
-function repairUtf8Mojibake(value: string) {
-  if (!value) {
-    return value;
-  }
-  if (/[\u4e00-\u9fff]/.test(value)) {
-    return value;
-  }
-  if (!hasMojibakeLeadBytes(value)) {
-    return value;
-  }
-
-  try {
-    const repaired = Buffer.from(value, "latin1").toString("utf8");
-    if (!repaired || repaired === value || repaired.includes("\ufffd")) {
-      return value;
-    }
-    if (/[\u4e00-\u9fff]/.test(repaired)) {
-      return repaired;
-    }
-    const suspiciousOriginal = countMojibakeLeadBytes(value);
-    const suspiciousRepaired = countMojibakeLeadBytes(repaired);
-    return suspiciousRepaired < suspiciousOriginal ? repaired : value;
-  } catch {
-    return value;
-  }
-}
-
-function hasMojibakeLeadBytes(value: string) {
-  return countMojibakeLeadBytes(value) > 0;
-}
-
-function countMojibakeLeadBytes(value: string) {
-  return Array.from(value).filter((char) => {
-    const code = char.charCodeAt(0);
-    return code >= 0xc0 && code <= 0xff;
-  }).length;
-}
-
 function deriveFallbackName(input: {
   nickname?: string | null;
   email?: string | null;
   phone?: string | null;
   dtUserId?: string | null;
 }) {
-  return (
-    normalizeOptionalString(input.nickname) ??
-    normalizeOptionalString(input.email) ??
-    normalizeOptionalString(input.phone) ??
-    normalizeOptionalString(input.dtUserId) ??
-    "Unnamed account"
-  );
+  return resolveAccountDisplayName(input);
 }
 
 function resolveAccountName(input: {
@@ -4633,14 +5117,70 @@ function resolveAccountName(input: {
   dtUserId: string | null;
   snapshot?: { fullName: string | null } | null;
 }) {
-  return (
-    normalizeOptionalString(input.nickname) ??
-    normalizeOptionalString(input.snapshot?.fullName) ??
-    normalizeOptionalString(input.email) ??
-    normalizeOptionalString(input.phone) ??
-    normalizeOptionalString(input.dtUserId) ??
-    "Unnamed account"
-  );
+  return resolveAccountDisplayName(input);
+}
+
+export function resolveAccountNameForTest(input: Parameters<typeof resolveAccountName>[0]) {
+  return resolveAccountName(input);
+}
+
+export function resolveRefreshedNicknameForTest(
+  currentNickname: string | null,
+  snapshotName: string | null,
+  account: { email?: string | null; phone?: string | null; dtUserId?: string | null }
+) {
+  return resolveRefreshedAccountNickname(currentNickname, snapshotName, account);
+}
+
+async function resolvePhoneActionBalance(
+  account: {
+    id: number;
+    dtUserId: string | null;
+    dtToken: string | null;
+    dtDeviceId: string;
+    appVariant: "dingtone" | "dingdong";
+  },
+  useDirect: boolean
+) {
+  const cached = (await prisma.accountSnapshot.findUnique({ where: { accountId: account.id }, select: { primaryBalance: true } }))
+    ?.primaryBalance ?? null;
+  if (!useDirect) return cached;
+  try {
+    const snapshot = await directRefreshGateway.refreshSnapshot({
+      dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+      token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+      deviceId: account.dtDeviceId,
+      appVariant: account.appVariant
+    });
+    return snapshot.primaryBalance ?? cached;
+  } catch (error) {
+    logger.warn("Phone action could not refresh account balance; using cached balance", {
+      accountId: account.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return cached;
+  }
+}
+
+function formatPhoneRenewalExtension(before?: string | null, after?: string | null) {
+  const beforeEpoch = parsePhoneEpochValue(before);
+  const afterEpoch = parsePhoneEpochValue(after);
+  if (!beforeEpoch || !afterEpoch || afterEpoch <= beforeEpoch) return null;
+  const days = Math.round((afterEpoch - beforeEpoch) / 86_400_000);
+  if (days >= 28) return `${Math.max(1, Math.round(days / 31))} 个月`;
+  return `${Math.max(1, days)} 天`;
+}
+
+function formatPhoneExpiryTime(value?: string | null) {
+  const epoch = parsePhoneEpochValue(value);
+  return epoch ? new Date(epoch).toISOString() : value || null;
+}
+
+function parsePhoneEpochValue(value?: string | null) {
+  if (!value) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed > 1_000_000_000_000 ? parsed : parsed * 1000;
 }
 
 function resolveAccountBoundPhone(input: {
@@ -4681,7 +5221,8 @@ function mapPurchaseCandidate(input: z.infer<typeof purchasePhoneCandidateSchema
     goodNumberLevel: input.good_number_level,
     useHistory: input.use_history,
     price: input.price,
-    productId: normalizeOptionalString(input.product_id) ?? undefined
+    productId: normalizeOptionalString(input.product_id) ?? undefined,
+    rawJson: normalizeOptionalString(input.raw_json) ?? undefined
   };
 }
 
@@ -4845,7 +5386,7 @@ function normalizeHelperPhoneCandidate(value: unknown): DingtonePhonePurchaseCan
     providerId: pickNumber(merged, ["providerId", "provider_id"]) ?? undefined,
     packageServiceId: pickString(merged, ["packageServiceId", "package_service_id"]) ?? undefined,
     category: pickNumber(merged, ["category", "purchaseType", "purchase_type"]) ?? undefined,
-    phoneType: pickNumber(merged, ["phoneType", "phone_type", "payType", "pay_type"]) ?? undefined,
+    phoneType: pickNumber(merged, ["phoneType", "phone_type", "type", "payType", "pay_type"]) ?? undefined,
     displayName: pickString(merged, ["displayName", "display_name", "cityName", "city_name", "stateName", "state_name"]) ?? undefined,
     cityName: pickString(merged, ["cityName", "city_name"]) ?? undefined,
     stateName: pickString(merged, ["stateName", "state_name"]) ?? undefined,
@@ -5194,6 +5735,59 @@ async function assertAccount(accountId: number) {
     }),
     "Account not found"
   );
+}
+
+async function assertAdminAccount(accountId: number, adminId: number) {
+  return assertFound(
+    await prisma.dtAccount.findFirst({
+      where: { id: accountId, adminId }
+    }),
+    "Account not found"
+  );
+}
+
+function serializePhoneActionOperation(operation: {
+  id: number;
+  accountId: number;
+  phoneId: number;
+  action: string;
+  state: string;
+  appVariant: string;
+  confirmationSource: string | null;
+  responseClass: string | null;
+  errorSummary: string | null;
+  quotedPrice: number | null;
+  balanceBefore: number | null;
+  balanceAfter: number | null;
+  baselineExpiry: string | null;
+  confirmedExpiry: string | null;
+  extensionMonths: number | null;
+  reconcileAttempts: number;
+  createdAt: Date;
+  updatedAt: Date;
+  confirmedAt: Date | null;
+}) {
+  return {
+    id: operation.id,
+    account_id: operation.accountId,
+    phone_id: operation.phoneId,
+    action: operation.action,
+    state: operation.state,
+    app_variant: operation.appVariant,
+    confirmation_source: operation.confirmationSource,
+    response_class: operation.responseClass,
+    error_summary: operation.errorSummary,
+    quoted_price: operation.quotedPrice,
+    balance_before: operation.balanceBefore,
+    balance_after: operation.balanceAfter,
+    baseline_expiry: operation.baselineExpiry,
+    confirmed_expiry: operation.confirmedExpiry,
+    extension_months: operation.extensionMonths,
+    reconcile_attempts: operation.reconcileAttempts,
+    created_at: operation.createdAt,
+    updated_at: operation.updatedAt,
+    confirmed_at: operation.confirmedAt
+  };
 }
 
 export async function assertAccountPhoneNumber(accountId: number, phoneId: number) {

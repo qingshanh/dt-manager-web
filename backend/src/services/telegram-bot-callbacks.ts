@@ -10,12 +10,25 @@ export type TelegramPanelCallback =
         | "refresh_phones"
         | "monitor_on"
         | "monitor_off"
+        | "relogin_send_code"
         | "notify_on"
         | "notify_off";
       accountId: number;
     }
   | { scope: "account"; action: "phones"; accountId: number; page: number }
-  | { scope: "phone"; action: "detail" | "note"; accountId: number; phoneId: number };
+  | {
+      scope: "phone";
+      action: "detail" | "note" | "renew_request" | "cancel_request";
+      accountId: number;
+      phoneId: number;
+    }
+  | {
+      scope: "phone";
+      action: "renew_confirm" | "cancel_confirm";
+      accountId: number;
+      phoneId: number;
+      version: string;
+    };
 
 const PANEL_CODES = {
   root: "r",
@@ -34,13 +47,18 @@ const ACCOUNT_CODES = {
   refresh_phones: "f",
   monitor_on: "o1",
   monitor_off: "o0",
+  relogin_send_code: "lc",
   notify_on: "t1",
   notify_off: "t0"
 } as const;
 
 const PHONE_CODES = {
   detail: "d",
-  note: "e"
+  note: "e",
+  renew_request: "rr",
+  cancel_request: "cr",
+  renew_confirm: "rx",
+  cancel_confirm: "cx"
 } as const;
 
 export function encodeTelegramCallback(callback: TelegramPanelCallback) {
@@ -53,7 +71,8 @@ export function encodeTelegramCallback(callback: TelegramPanelCallback) {
     const base = `a:${accountId}:${ACCOUNT_CODES[callback.action]}`;
     encoded = "page" in callback ? `${base}:${positiveInteger(callback.page, "page")}` : base;
   } else {
-    encoded = `n:${positiveInteger(callback.accountId, "accountId")}:${positiveInteger(callback.phoneId, "phoneId")}:${PHONE_CODES[callback.action]}`;
+    const base = `n:${positiveInteger(callback.accountId, "accountId")}:${positiveInteger(callback.phoneId, "phoneId")}:${PHONE_CODES[callback.action]}`;
+    encoded = "version" in callback ? `${base}:${callbackVersion(callback.version)}` : base;
   }
 
   if (Buffer.byteLength(encoded, "utf8") > 64) {
@@ -91,9 +110,12 @@ export function parseTelegramCallback(value: string | undefined): TelegramPanelC
     const accountId = parsePositiveInteger(parts[1]);
     const phoneId = parsePositiveInteger(parts[2]);
     const action = phoneAction(parts[3]);
-    return parts.length === 4 && accountId && phoneId && action
-      ? { scope: "phone", action, accountId, phoneId }
-      : null;
+    if (!accountId || !phoneId || !action) return null;
+    if (action === "renew_confirm" || action === "cancel_confirm") {
+      const version = parseCallbackVersion(parts[4]);
+      return parts.length === 5 && version ? { scope: "phone", action, accountId, phoneId, version } : null;
+    }
+    return parts.length === 4 ? { scope: "phone", action, accountId, phoneId } : null;
   }
 
   return null;
@@ -123,6 +145,18 @@ function parsePositiveInteger(value: string | undefined) {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
+function callbackVersion(value: string) {
+  const normalized = parseCallbackVersion(value);
+  if (!normalized) {
+    throw new RangeError("version must contain 6 to 16 lowercase letters or digits");
+  }
+  return normalized;
+}
+
+function parseCallbackVersion(value: string | undefined) {
+  return value && /^[a-z0-9]{6,16}$/.test(value) ? value : null;
+}
+
 function panelAction(value: string | undefined) {
   if (value === PANEL_CODES.root) return "root" as const;
   if (value === PANEL_CODES.status) return "status" as const;
@@ -141,6 +175,7 @@ function accountAction(value: string | undefined) {
   if (value === ACCOUNT_CODES.refresh_phones) return "refresh_phones" as const;
   if (value === ACCOUNT_CODES.monitor_on) return "monitor_on" as const;
   if (value === ACCOUNT_CODES.monitor_off) return "monitor_off" as const;
+  if (value === ACCOUNT_CODES.relogin_send_code) return "relogin_send_code" as const;
   if (value === ACCOUNT_CODES.notify_on) return "notify_on" as const;
   if (value === ACCOUNT_CODES.notify_off) return "notify_off" as const;
   return null;
@@ -149,5 +184,9 @@ function accountAction(value: string | undefined) {
 function phoneAction(value: string | undefined) {
   if (value === PHONE_CODES.detail) return "detail" as const;
   if (value === PHONE_CODES.note) return "note" as const;
+  if (value === PHONE_CODES.renew_request) return "renew_request" as const;
+  if (value === PHONE_CODES.cancel_request) return "cancel_request" as const;
+  if (value === PHONE_CODES.renew_confirm) return "renew_confirm" as const;
+  if (value === PHONE_CODES.cancel_confirm) return "cancel_confirm" as const;
   return null;
 }

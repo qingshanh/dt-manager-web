@@ -397,14 +397,12 @@ function Find-LegacyRuntimeService {
   }
 
   $rootProcess = $chain[0]
-  foreach ($process in $chain) {
-    $command = [string]$process.CommandLine
-    $isSafeAncestor = $command -match $escapedRoot -or
-      $command -match '(?i)scripts[\\/]dev-supervisor\.mjs' -or
-      $command -match '(?i)npm-cli\.js.*\brun\s+dev\b' -or
-      $command -match '(?i)cmd\.exe.*\bnpm\s+run\s+dev\b'
-    if ($isSafeAncestor) {
-      $rootProcess = $process
+  if ($Name -eq "backend") {
+    $supervisor = @($chain | Where-Object {
+      $_.CommandLine -and [string]$_.CommandLine -match '(?i)scripts[\\/]dev-supervisor\.mjs'
+    }) | Select-Object -First 1
+    if ($null -ne $supervisor) {
+      $rootProcess = $supervisor
     }
   }
   $creationTime = if ($rootProcess.CreationDate -is [datetime]) {

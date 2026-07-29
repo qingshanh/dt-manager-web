@@ -688,6 +688,59 @@ test("upgrades an existing team summary when the same helper message is scanned 
   assert.ok((runtime.messages[0]?.receivedAt.getTime() ?? 0) <= Date.now() + 1_000);
 });
 
+test("repairs an existing secretary boss push that was previously misclassified as verification", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    appVariant: "dingtone",
+    nickname: null,
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: false
+  });
+  runtime.messages.push({
+    id: 1,
+    accountId: 1,
+    direction: MessageDirection.incoming,
+    msgType: MessageType.verification,
+    fromNumber: "2684354560",
+    toNumber: null,
+    content: '{"schemaType":4,"pushContent":"Please verify your identity"}',
+    rawInfo: null,
+    rawK3: "existing-boss-push",
+    k5Flag: 3300,
+    isRead: false,
+    telegramSent: false,
+    telegramMsgId: null,
+    receivedAt: new Date(),
+    createdAt: new Date()
+  });
+  const rows = normalizeDirectWebOfflineMessages({
+    Result: 1,
+    Message: [{
+      content: '{"schemaType":4,"pushContent":"Please verify your identity"}',
+      from: "2684354560",
+      msgId: "existing-boss-push",
+      msgType: 3300,
+      msgTimeStamp: 1_800_000_005
+    }]
+  }, "dingtone");
+
+  const imported = await storeHelperSmsMessages(1, rows, {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  });
+
+  assert.equal(imported, 0);
+  assert.equal(runtime.messages[0]?.msgType, MessageType.system);
+  assert.equal(runtime.messages[0]?.fromNumber, "说道团队");
+  assert.equal(runtime.messages[0]?.content, "Please verify your identity");
+  assert.equal(runtime.messages[0]?.isRead, true);
+});
+
 test("upgrades repeated team messages from outer 3300 to inner 531 and 532 types", async () => {
   for (const scenario of [
     { k1: 531, actionType: 99, credits: 4, expected: "获得 4.00 叮咚币" },
@@ -755,7 +808,7 @@ test("upgrades repeated team messages from outer 3300 to inner 531 and 532 types
   }
 });
 
-test("isolates normalized team credits from events and Telegram even when forced on", async () => {
+test("emits normalized team credits to the live team view without sending Telegram", async () => {
   const runtime = createMessageRuntimeDb();
   runtime.accounts.set(1, {
     id: 1,
@@ -798,7 +851,19 @@ test("isolates normalized team credits from events and Telegram even when forced
     assert.equal(runtime.messages[0]?.isRead, true);
     assert.equal(runtime.messages[0]?.telegramSent, false);
     assert.equal(runtime.messages[0]?.telegramMsgId, null);
-    assert.equal(events.filter((event) => event.type === "new_message").length, 0);
+    const messageEvents = events.filter((event) => event.type === "new_message");
+    assert.equal(messageEvents.length, 1);
+    assert.deepEqual(messageEvents[0]?.payload, {
+      id: runtime.messages[0]?.id,
+      accountId: 1,
+      accountNickname: "Team account",
+      from: "说道团队",
+      toNumber: null,
+      content: "兑换成功，20.00 说道币已到账",
+      msgType: MessageType.system,
+      k5Flag: 531,
+      receivedAt: runtime.messages[0]?.receivedAt.toISOString()
+    });
   } finally {
     eventBus.off("event", listener);
   }

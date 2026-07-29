@@ -22,6 +22,7 @@ import { ensureDefaultSettings, getGatewayMode, getSettingsMap } from "./service
 import { telegramBotService } from "./services/telegram-bot.js";
 import { accountAutoRefreshService } from "./services/account-auto-refresh.js";
 import { phoneExpiryReminderService } from "./services/phone-expiry-reminder.js";
+import { recoverPhoneActionOperations } from "./services/phone-action-reconciliation.js";
 import { buildHealthPayload } from "./services/runtime-health.js";
 import { installJsonBodyParsers } from "./services/request-body-limits.js";
 import { RuntimeLifecycle } from "./services/runtime-lifecycle.js";
@@ -153,6 +154,9 @@ async function bootstrap() {
   await prisma.$connect();
   await ensureDefaultAdmin();
   await ensureDefaultSettings();
+  await recoverPhoneActionOperations().catch((error) => {
+    logger.error("Failed to recover pending phone actions", error);
+  });
 
   let shuttingDown = false;
   const server = app.listen(config.PORT, () => {

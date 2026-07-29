@@ -1,0 +1,1 @@
+-- SQLite stores Prisma enum values as TEXT, so this state addition requires no table rewrite.

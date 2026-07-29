@@ -24,8 +24,13 @@ test("telegram callbacks round-trip every supported action within 64 bytes", () 
     { scope: "account", action: "monitor_off", accountId: 433 },
     { scope: "account", action: "notify_on", accountId: 433 },
     { scope: "account", action: "notify_off", accountId: 433 },
+    { scope: "account", action: "relogin_send_code", accountId: 433 },
     { scope: "phone", action: "detail", accountId: 433, phoneId: 91 },
-    { scope: "phone", action: "note", accountId: 433, phoneId: 91 }
+    { scope: "phone", action: "note", accountId: 433, phoneId: 91 },
+    { scope: "phone", action: "renew_request", accountId: 433, phoneId: 91 },
+    { scope: "phone", action: "cancel_request", accountId: 433, phoneId: 91 },
+    { scope: "phone", action: "renew_confirm", accountId: 433, phoneId: 91, version: "a1b2c3d4" },
+    { scope: "phone", action: "cancel_confirm", accountId: 433, phoneId: 91, version: "f5e6d7c8" }
   ] satisfies TelegramPanelCallback[];
 
   for (const callback of callbacks) {
@@ -55,6 +60,9 @@ test("telegram callback parser rejects malformed and unsupported values", () => 
     "n:1:0:d",
     "n:1:2:x",
     "n:1:2:d:extra",
+    "n:1:2:rx",
+    "n:1:2:rx:bad-version!",
+    "n:1:2:cx:",
     "other"
   ];
 
@@ -74,11 +82,24 @@ test("telegram callback encoder rejects non-positive identifiers", () => {
   );
 });
 
-test("telegram callback protocol cannot parse dangerous phone actions", () => {
-  for (const action of ["buy", "renew", "pause", "resume", "cancel"]) {
+test("telegram callback protocol exposes only two-stage renew and cancel actions", () => {
+  for (const action of ["buy", "renew", "pause", "resume", "cancel", "renew_confirm", "cancel_confirm"]) {
     assert.equal(parseTelegramCallback(`n:1:2:${action}`), null);
     assert.equal(parseTelegramCallback(`a:1:${action}`), null);
   }
+  assert.deepEqual(parseTelegramCallback("n:1:2:rr"), {
+    scope: "phone",
+    action: "renew_request",
+    accountId: 1,
+    phoneId: 2
+  });
+  assert.deepEqual(parseTelegramCallback("n:1:2:rx:a1b2c3d4"), {
+    scope: "phone",
+    action: "renew_confirm",
+    accountId: 1,
+    phoneId: 2,
+    version: "a1b2c3d4"
+  });
 });
 
 test("telegram pagination clamps pages and preserves empty collections", () => {

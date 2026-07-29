@@ -9,7 +9,7 @@ const configSource = readFileSync(new URL("../config.ts", import.meta.url), "utf
 const directGatewaySource = readFileSync(new URL("./dingtone/direct-gateway.ts", import.meta.url), "utf8");
 
 test("transient monitor failures keep listening enabled and retry with bounded backoff", async () => {
-  const { monitorFailureRetryDelayForTest } = await import("./account-monitor.js");
+  const { monitorFailureRetryDelayForTest, shouldSurfaceMonitorErrorForTest } = await import("./account-monitor.js");
   const tickStart = monitorSource.indexOf("private async tick(accountId: number)");
   const tickEnd = monitorSource.indexOf("private hasDedicatedDirectSlots", tickStart);
   const tickSource = monitorSource.slice(tickStart, tickEnd);
@@ -24,6 +24,12 @@ test("transient monitor failures keep listening enabled and retry with bounded b
   assert.equal(monitorFailureRetryDelayForTest(4), 40_000);
   assert.equal(monitorFailureRetryDelayForTest(5), 60_000);
   assert.equal(monitorFailureRetryDelayForTest(20), 60_000);
+  assert.equal(shouldSurfaceMonitorErrorForTest("Direct gateway socket ended after 5091ms (keepaliveWrites=1)", 1, 3), false);
+  assert.equal(shouldSurfaceMonitorErrorForTest("Direct gateway socket is not writable", 2, 3), false);
+  assert.equal(shouldSurfaceMonitorErrorForTest("read ECONNRESET", 1, 3), false);
+  assert.equal(shouldSurfaceMonitorErrorForTest("Direct gateway socket ended after 5091ms (keepaliveWrites=1)", 3, 3), false);
+  assert.equal(shouldSurfaceMonitorErrorForTest("connect ECONNREFUSED 127.0.0.1:3066", 3, 3), false);
+  assert.equal(shouldSurfaceMonitorErrorForTest("Unexpected parser invariant", 1, 3), true);
 });
 
 test("direct monitors default to bounded concurrency", () => {
@@ -77,7 +83,7 @@ test("dedicated direct slots extend the active socket instead of reconnecting at
   assert.equal(extendDirectListenDeadlineForTest(now, 900_000, () => true, now), now + 900_000);
   assert.match(directGatewaySource, /shouldContinue\?: \(\) => boolean/);
   assert.match(directGatewaySource, /onListenWindowExtended\?: \(\) => Promise<void> \| void/);
-  assert.match(monitorSource, /shouldContinue: \(\) => !runner\.stopped && this\.hasDedicatedDirectSlots\(runner\)/);
+  assert.match(monitorSource, /shouldContinue: \(\) => shouldContinueDirectPhoneInventoryListen\(\{/);
   assert.match(monitorSource, /onListenWindowExtended: async \(\) => \{/);
   assert.match(monitorSource, /heartbeatCount: \{ increment: 1 \}/);
 });
@@ -127,6 +133,14 @@ test("account monitor restore timers stay referenced and independent", () => {
   assert.ok(restoreStart >= 0 && restoreEnd > restoreStart);
   const restoreSource = monitorSource.slice(restoreStart, restoreEnd);
   assert.doesNotMatch(restoreSource, /\.unref\?\.\(\)/);
+});
+
+test("terminal monitor failures notify Telegram with recovery actions", () => {
+  assert.match(monitorSource, /sendAccountStatusTelegramNotification/);
+  const expiredStart = monitorSource.indexOf('if (classification === "expired")');
+  const expiredEnd = monitorSource.indexOf("const shouldSurfaceTransientError", expiredStart);
+  const expiredSource = monitorSource.slice(expiredStart, expiredEnd);
+  assert.match(expiredSource, /notifyAccountMonitorUnavailable/);
 });
 
 test("account monitor restore stagger is capped to keep restart gaps short", () => {

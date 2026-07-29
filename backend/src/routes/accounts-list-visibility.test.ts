@@ -6,6 +6,8 @@ import {
   accountsRouter,
   buildMessagesWhereForTest,
   otherVerificationAppVariant,
+  resolveAccountNameForTest,
+  resolveRefreshedNicknameForTest,
   selectVerificationTrackCode,
   shouldRetryVerificationWithOtherVariant,
   shouldShowAccountInList
@@ -28,7 +30,7 @@ test("keeps expired logged-in accounts visible so they can be re-logged in", () 
     shouldShowAccountInList({
       status: AccountStatus.expired,
       loginType: "email_code",
-      dtUserId: "145138338218889",
+      dtUserId: "100000000000001",
       dtToken: "encrypted-token"
     }),
     true
@@ -64,6 +66,28 @@ test("message list filters can isolate and exclude system messages", () => {
     accountId: 7,
     msgType: { not: MessageType.system }
   });
+  assert.deepEqual(buildMessagesWhereForTest(7, { page: 1, pageSize: 20, msg_type: MessageType.system, credit_only: true }), {
+    accountId: 7,
+    msgType: MessageType.system,
+    fromNumber: { in: ["叮咚团队", "说道团队"] },
+    k5Flag: { in: [531, 532] }
+  });
+});
+
+test("account names repair repeated UTF-8 mojibake before display and persistence", () => {
+  const mojibake = "ÃÂÃÂ¨ÃÂÃÂÃÂÃÂ¡ÃÂÃÂ¦ÃÂÃÂ²ÃÂÃÂ";
+  assert.equal(resolveAccountNameForTest({
+    nickname: mojibake,
+    snapshot: { fullName: mojibake },
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1"
+  }), "股沟");
+  assert.equal(resolveRefreshedNicknameForTest(mojibake, mojibake, {
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1"
+  }), "股沟");
 });
 test("account routes include point and point store endpoints", () => {
   const routes = accountsRouter.stack

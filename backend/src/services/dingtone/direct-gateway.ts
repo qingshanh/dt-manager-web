@@ -9,10 +9,27 @@ import { AppError } from "../../utils/errors.js";
 import { advanceActivationTrackCode } from "../../utils/crypto.js";
 import { logger } from "../../utils/logger.js";
 import { TtlLruCache } from "../../utils/ttl-lru-cache.js";
+import { derivePhoneSmsReceptionState } from "../../utils/phone-sms-reception.js";
 import { getSettingsMap } from "../settings.service.js";
 import { buildTeamMessageEnvelope, parseTeamMessageMeta } from "../team-message-normalizer.js";
+import {
+  resolvePhoneRenewalCommandTag,
+  resolvePhoneRenewalExtraChargeMonths,
+  resolvePhoneRenewalMonths
+} from "../phone-renewal-confirmation.js";
 import { parseDirectActionTemplate, type DirectActionTemplate, type DirectTemplateParams } from "./direct-template.js";
 import { isOfflineMessageIndexPush, parseSmsPush, type ParsedSmsPush } from "./message-parser.js";
+import {
+  ORDER_PRIVATE_NUMBER_API_NAME,
+  encodeOrderPrivateNumberRpcContext,
+  patchProxyRestRequestContext
+} from "./order-private-number-rpc.js";
+import {
+  buildPrivateNumberSettingPayload,
+  resolvePhoneActionProtocol,
+  type PhoneActionProtocolKind,
+  type PrivateNumberSettingPatch
+} from "./phone-action-protocol.js";
 import { buildDirectTransportKey, DirectTransportGovernor, type DirectTransportPermit, type DirectTransportRole } from "./direct-transport-governor.js";
 import type {
   DingtoneGateway,
@@ -21,6 +38,7 @@ import type {
   DingtonePhonePurchaseCandidate,
   DingtonePhonePurchasePreview,
   DingtonePhoneCountryOption,
+  DingtonePhoneMutationResult,
   DingtoneSessionExportInput,
   DingtoneSessionExport,
   DingtonePhoneNumber,
@@ -91,6 +109,11 @@ type DirectAccountIdentity = {
   appVariant?: "dingtone" | "dingdong";
 };
 type DirectActivationIdentity = string | DirectAccountIdentity;
+
+type SingleWritePhoneMutationInput<T extends ApiResult> = {
+  hosts: string[];
+  execute: (host: string, markWritten: () => void) => Promise<T>;
+};
 type DirectActivationTemplateSettingKey =
   | "dt_direct_template_check_activated_user"
   | "dt_direct_template_check_activated_user_talku"
@@ -158,7 +181,7 @@ export type DirectProbePushResult = {
 };
 
 export type DirectWebOfflineMessage = {
-  conversationType: 4;
+  conversationType: number;
   conversationId: string | null;
   type: number | null;
   senderId: string | null;
@@ -284,6 +307,13 @@ const MAX_DIRECT_RAW_QUEUE = 512;
 const MAX_DIRECT_RAW_QUEUE_BYTES = 16 * 1024 * 1024;
 const MAX_DIRECT_JSON_QUEUE = 256;
 const MAX_DIRECT_JSON_QUEUE_BYTES = 8 * 1024 * 1024;
+const PHONE_PURCHASE_LOCK_API_NAME = "/number/lock";
+const PHONE_PURCHASE_UNLOCK_API_NAME = "/number/unlock";
+const PHONE_PURCHASE_ORDER_EDGE_API_NAME = "pstn/share/orderPrivateNumber";
+const PHONE_PURCHASE_EDGE_REST_CALL_TYPES = [10000, 10001] as const;
+const PHONE_PURCHASE_LOCK_REST_CALL_TYPE = PHONE_PURCHASE_EDGE_REST_CALL_TYPES[0];
+const PHONE_PURCHASE_ORDER_REST_CALL_TYPE = PHONE_PURCHASE_EDGE_REST_CALL_TYPES[1];
+const PHONE_PURCHASE_ORDER_TIMEOUT_MS = 60_000;
 const DIRECT_PUSH_READ_BATCH_LIMIT = 100;
 const DIRECT_ACCOUNT_CACHE_MAX_ENTRIES = 500;
 const DIRECT_PHONE_COUNTRY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -330,10 +360,12 @@ const DIRECT_TALKU_ACTIVATION_CLIENT_VERSION = -1610218751;
 const DIRECT_DINGDONG_ACTIVATION_CLIENT_VERSION = -1610218240;
 const DIRECT_ACTIVATION_EMAIL_CRYPTO_IV = Buffer.from("5875b9f15ed445239539cb455cdcbed7", "hex");
 const DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS = 4_000;
-const DIRECT_OFFLINE_CATCHUP_INTERVAL_MS = 30_000;
+const DIRECT_OFFLINE_CATCHUP_INTERVAL_MS = 10 * 60_000;
 const DIRECT_OFFLINE_CATCHUP_RETRY_MS = 30_000;
 const DIRECT_NOTIFY_ONLY_CATCHUP_THROTTLE_MS = 60_000;
-const DIRECT_WEB_OFFLINE_POLL_INTERVAL_MS = 60_000;
+const DIRECT_OFFLINE_CATCHUP_JITTER_MS = 60_000;
+const DIRECT_OFFLINE_CATCHUP_MAX_CONCURRENCY = 3;
+const DIRECT_OFFLINE_DELIVERY_BATCH_SIZE = 100;
 const DIRECT_RECONNECT_BACKOFF_MAX_MS = 1_000;
 const DIRECT_LINK_BOOTSTRAP_WAIT_MS = 1_250;
 const DIRECT_LINK_HEALTHY_AFTER_MS = 15_000;
@@ -347,6 +379,42 @@ const DIRECT_SOCKET_FRAME_BUDGET_PER_TICK = 20;
 const DIRECT_PAIRED_KEEPALIVE_INTERVAL_MS = 5_000;
 const DIRECT_SESSION_KEEPALIVE_INTERVAL_MS = 5_000;
 const directTransportGovernor = new DirectTransportGovernor();
+let activeDirectOfflineCatchups = 0;
+const directOfflineCatchupWaiters: Array<() => void> = [];
+
+async function withDirectOfflineCatchupPermit<T>(task: () => Promise<T>) {
+  if (activeDirectOfflineCatchups >= DIRECT_OFFLINE_CATCHUP_MAX_CONCURRENCY) {
+    await new Promise<void>((resolve) => directOfflineCatchupWaiters.push(resolve));
+  } else {
+    activeDirectOfflineCatchups += 1;
+  }
+  try {
+    return await task();
+  } finally {
+    const next = directOfflineCatchupWaiters.shift();
+    if (next) {
+      next();
+    } else {
+      activeDirectOfflineCatchups = Math.max(0, activeDirectOfflineCatchups - 1);
+    }
+  }
+}
+
+function directOfflineCatchupDelayMs(account: { dtUserId: string }) {
+  let hash = 0;
+  for (const char of account.dtUserId) {
+    hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  }
+  return DIRECT_OFFLINE_CATCHUP_INTERVAL_MS + (hash % DIRECT_OFFLINE_CATCHUP_JITTER_MS);
+}
+
+export async function withDirectOfflineCatchupPermitForTest<T>(task: () => Promise<T>) {
+  return await withDirectOfflineCatchupPermit(task);
+}
+
+export function directOfflineCatchupDelayMsForTest(dtUserId: string) {
+  return directOfflineCatchupDelayMs({ dtUserId });
+}
 
 class DirectListenerCallbackError extends Error {
   constructor(readonly originalError: unknown) {
@@ -568,7 +636,7 @@ export function sliceDirectRetainedTraceForTest<T>(retained: readonly T[], total
   return sliceDirectRetainedTrace(retained, totalProduced, totalSeen);
 }
 const LOGIN_INIT_PACKET = Buffer.from(
-  "010700000399810727c6004700000389010200000389d33d000300502788000000000000000108010000000001000000010000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e3031000000090000032a0000002b416e642e30303030303030303030303030303030303030303030303030303030303030302e647474616c6b0000000f3130303030303030303030303030300000002030303030303030303030303030303030303030303030303030303030303030300000000932303334303431393700000016706c616365686f6c646572406578616d706c652e696fd33d0003005027880000000002000000117b227374617475734f6666223a2230227d0000027764657669636549643d416e642e30303030303030303030303030303030303030303030303030303030303030302e647474616c6b267573657249643d31303030303030303030303030303026746f6b656e3d3030303030303030303030303030303030303030303030303030303030303030266d616769633d35343037372677536974653d33266477486f73743d3532353330303026616464724368616e67653d3026547261636b436f64653d343030353131383533303132393130313126634150494c6576656c3d31264c433d7a68266a736f6e3d253762253232436c69656e7456657273696f6e2532322533612d31363130323138373531253263253232436f6e6e65637456657273696f6e253232253361313638343533313425326325323250726573656e63654d6573736167652532322533612532322537622535632532327374617475734f66662535632532322533612535632532323025356325323225376425323225326325323250726573656e63655374617475732532322533613225326325323274696d657a6f6e65253232253361253232474d542532623038253361303025323225376426636c69656e74496e666f3d25376225323270696e6754696d65253232253361253232313030303030253362313030303030253232253263253232636f6e6e65637465645625323225336130253263253232686173562532322533613025326325323261707049642532322533612532326d652e74616c6b796f752e6170702e696d2532322532632532327369676e4d643525323225336125323263333830656335626638383731626164646133383764343137396262376134312532322537642641736b41636b3d310107000000fa810727c60047000000ea0102000000ead33d000300502788000000000000000101010000000001000000020000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e3031000000080000008b0000000000000012676574496e666f4265666f72654c6f67696e0000006600000065789c0dccb10a84300c00d0bfe9589268aeedd0419cdce5f6d0e4a02855b4dcf7ebf2c6a7f6afc516cd53531fc9e49388852c618c2fe9c71858690802685e7b977d73eb25659b0fb53c023062e4019012230427e7f96eaeecd55affda75d7a3e5071a051edd00000000",
+  "010700000399810727c6004700000389010200000389d33d000300502788000000000000000108010000000001000000010000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e3031000000090000032a0000002b416e642e30303030303030303030303030303030303030303030303030303030303030302e647474616c6b0000000f3130303030303030303030303030300000002030303030303030303030303030303030303030303030303030303030303030300000000932303334303431393700000016706c616365686f6c646572406578616d706c652e696fd33d0003005027880000000002000000117b227374617475734f6666223a2230227d0000027764657669636549643d416e642e30303030303030303030303030303030303030303030303030303030303030302e647474616c6b267573657249643d31303030303030303030303030303026746f6b656e3d3030303030303030303030303030303030303030303030303030303030303030266d616769633d35343037372677536974653d33266477486f73743d3532353330303026616464724368616e67653d3026547261636b436f64653d343030353131383533303132393130313126634150494c6576656c3d31264c433d7a68266a736f6e3d253762253232436c69656e7456657273696f6e2532322533612d31363130323138373531253263253232436f6e6e65637456657273696f6e253232253361313638343533313425326325323250726573656e63654d6573736167652532322533612532322537622535632532327374617475734f66662535632532322533612535632532323025356325323225376425323225326325323250726573656e63655374617475732532322533613225326325323274696d657a6f6e65253232253361253232474d542532623038253361303025323225376426636c69656e74496e666f3d25376225323270696e6754696d65253232253361253232313030303030253362313030303030253232253263253232636f6e6e65637465645625323225336130253263253232686173562532322533613025326325323261707049642532322533612532326d652e74616c6b796f752e6170702e696d2532322532632532327369676e4d643525323225336125323263333830656335626638383731626164646133383764343137396262376134312532322537642641736b41636b3d310107000000d8810727c60047000000c80102000000c8d33d000300502788000000000000000101010000000001000000020000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e3031000000080000008b0000000000000012676574496e666f4265666f72654c6f67696e0000006800000043789c4b492dcb4c4ef54cb175cc4bd1332000f4524a4a1273b2d5428a1293b39df353526d4d3015a925161478a6d8aa25e764a6e69584a5161567e6e7d90200a0551cce00000000",
   "hex"
 );
 
@@ -593,19 +661,19 @@ const TEMPLATES = {
     "hex"
   ),
   getBalance: Buffer.from(
-    "010700000148810727c6004700000138010200000138d33d0003005027880000000000000001010100000000010000001a0000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e303100000008000000d900000001320000001762696c6c696e672f757365722f67657442616c616e6365000000d4000000ad789c0d8eb18e03210c44ff8672651b6ca0d8224a95faa2f43e3027b4d16eb4e1f2fda199629ee669aa7d7ab15b5d2f7b5d12994a2656b28c29cdc88d3172251f15d0963a863e37773fb56cd7a3da1a001831b1070c0c91d9397dbd1e76befbb1afb2f80567b15ded1cbdf5a2c37efadfbe9606d92b98fc42acc57c4906dc620d9a0b0916f7ffb6739e9a52f4c95326c8c1a31bc766734d162446c9d9071299a44464a2a4d8c89a7c0145da3d8b00000000",
+    "010700000117810727c6004700000107010200000107d33d0003005027880000000000000001010100000000010000001a0000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e303100000008000000d900000001320000001762696c6c696e672f757365722f67657442616c616e6365000000d60000007c789c858eb10ec2201040ff869180546a871b4ca7ce6ddccfbbc3100c108afd7e771dfae69797c772449285e19e599b1334f78eefa4b68694e6c202c3bfa414d6fa90b6c792c16ba7adc29a66693d8648d8658daf0c14cce4d0887f9a91491cddc45cc3c8034e74f196d46797b630d89f782f49329c8d7e01c332395e00000000",
     "hex"
   ),
   getPrivateNumber: Buffer.from(
-    "010700000152810727c6004700000142010200000142d33d0003005027880000000000000001010100000000010000001c0000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e303100000008000000e300000001320000001c2f7073746e2f73686172652f676574507269766174654e756d626572000000e7000000b2789c5d8e3d6fc3300c44ff8d464324f5c5c1439029738bee2c45058203db70d4fefe6aee72c33d1cde55fbed6a8fbadef6ba1434498c51d0184a99c12d428e15298b075bea18f2dadce725badd8f6a6bf03e0294481e422c1cb2d357b77d7cd9f5eec7bea6851670729eff8bed6ed7e8adab0cfbe8cf7dd5e699c45bfaf6b9aa9116f3b1e51a841513a8fb79db357f4e0f502164f41c08dc38369b6bb490724ecc1430a5493443442c020dada53faa1b442e00000000",
+    "010700000121810727c6004700000111010200000111d33d0003005027880000000000000001010100000000010000001c0000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e303100000008000000e300000001320000001c2f7073746e2f73686172652f676574507269766174654e756d626572000000e900000081789c858eb10ec2300c05ff2663949292d2c103ead4b988ddd80e8a5225556af87ef632f48da793eeb17c13c9cc702f6cddc92cabe29acda321e5a9b240ff2f195a93147d4adb532d10acb79dc16d3b823c49d31413a1ca92de0528bad1a393f072039378ba89bbc6817b1ce9123a329f5ddaccd01d7a5ab31438fbfe03f98d3ff600000000",
     "hex"
   ),
   getWebOfflineMessage: Buffer.from(
-    "0107000000eb81078656004e000000db0102000000dbe7e9000300508372000000000000000101010000000001000000150000001765372e65392e30302e30332e30302e35302e38332e37320000001730302e30302e30302e30302e30302e30302e30302e3031000000080000007c000000013200000011676574557365724f66666c696e654d73670000009800000056789c4b492dcb4c4ef54cb175cc4bd1332000f4524a4a1273b2d54a8b538b3c536c0d5165d54af2b353f36c0919a2165294989ced9c9f926a6b6260606a6868616a6c60686469686068a896e402768fad21006f6125e500000000",
+    "0107000000dc81078656004e000000cc0102000000cce7e9000300508372000000000000000101010000000001000000150000001765372e65392e30302e30332e30302e35302e38332e37320000001730302e30302e30302e30302e30302e30302e30302e3031000000080000007c000000013200000011676574557365724f66666c696e654d73670000009a00000047789c4b492dcb4c4ef54cb175cc4bd1332000f4524a4a1273b2d54a8b538b3c536c0d5165d54af2b353f36c0919a2165294989ced9c9f926a6b824536c905ec225b4300b5dc261f00000000",
     "hex"
   ),
   getUserSetting: Buffer.from(
-    "01070000014c810727c600470000013c01020000013cd33d000300502788000000000000000101010000000001000000140000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e303100000008000000dd0000000132000000137073746e2f6765745573657253657474696e67000000f1000000b5789c6d8eb16ec3300c44ff46a3219212250d1e8a4c999b766729aa101cd881a3e6fbabee5d6eb8c37bb86aafae76adebdb5e978c265c300a5a819c67941621c58a94c4832d750cb96fee768a6e97a3da1abc8f003992072a14009cd37bb77d7c3ced9c560811281316f4251038793c3eed7cf6635f79a1e5afd82e768edebacab0f7febdafda7c21f1c65f3e5535d26c3eb65483144506753fffbbc7b1d9a4d102a7c465de41e6b968828898051a5ae35f9ba645bb00000000",
+    "01070000011b810727c600470000010b01020000010bd33d000300502788000000000000000101010000000001000000140000001764332e33642e30302e30332e30302e35302e32372e38380000001730302e30302e30302e30302e30302e30302e30302e303100000008000000dd0000000132000000137073746e2f6765745573657253657474696e67000000f300000084789c858f3b0ec32010056f43892038382eb6885cb9cea7dfec2e11c2028449ce9f3e89e4d7ce68a4c7f28e240bc339b3363bd3dc3bae495d1b529a0b0b0cbf9252b446c9fdb6495b18ec17c55aefd2b6583278edb45558d32cadc71009bb5ce2330305333934e21f666412472731c730f280131dbc25f5fadfee254986bd171fc2ec415d00000000",
     "hex"
   ),
   requestAllOfflineMessage: Buffer.from(
@@ -613,48 +681,55 @@ const TEMPLATES = {
     "hex"
   ),
   followerListInfo: Buffer.from(
-    "01070000010f8107c7d8001c000000ff0102000000fff6e7000c02412950000000000000000101010000000001000004460000001766362e65372e30302e30632e30322e34312e32392e35300000001730302e30302e30302e30302e30302e30302e30302e303100000008000000a0000000013200000010466f6c6c6f7765724c697374496e666f0000008e0000007b789c0dcb310ec2300c00c0df74acecd871eca1036262e703716c2454d44aa5f07eb8fd22bfcf91b7582e5bcc15c8cd5d5d3944d25435fde1a0a3942614739c677fadd3e79dc7bf205724a562058c09a7735f735b841c4758e712d16180097668cede85238ca6fbd1c77add231706a8885acda4a182951fddcd28d900000000",
+    "0107000000d58107c7d8001c000000c50102000000c5f6e7000c02412950000000000000000101010000000001000004460000001766362e65372e30302e30632e30322e34312e32392e35300000001730302e30302e30302e30302e30302e30302e30302e303100000008000000a0000000013200000010466f6c6c6f7765724c697374496e666f0000009000000041789c4b492dcb4c4ef54cb175cc4bd1332000f4524a4a1273b2d54a8b538b3c536c0d5165d54af2b353f36c0919a2165294989ced9c9f926a6b82290b00474b22d900000000",
     "hex"
   ),
   getFriendList: Buffer.from(
-    "0107000001188107c7d8001c00000108010200000108f6e7000c02412950000000000000000101010000000001000004470000001766362e65372e30302e30632e30322e34312e32392e35300000001730302e30302e30302e30302e30302e30302e30302e303100000008000000a900000001320000000d676574667269656e646c6973740000009d00000087789c0dcc3b0ec2300c00d0db64acec7c5c7bc88098d818b8401c1b0915a5521b383fbc033cf3efabfbcdea65d85220a9a8b27236221766767d2a708f71a5648bcdd9de5b98fbe6a35252ec262d47b3061d84b0c1aa591b653349e173faf19f31174c9ca244909c300c77bb1f7efae85e313c8ed6b7eb6e5e334041e422426b8cc8fc03be632e3f00000000",
+    "0107000000e08107c7d8001c000000d00102000000d0f6e7000c02412950000000000000000101010000000001000004470000001766362e65372e30302e30632e30322e34312e32392e35300000001730302e30302e30302e30302e30302e30302e30302e303100000008000000a900000001320000000d676574667269656e646c6973740000009f0000004f789c4b492dcb4c4ef54cb175cc4bd1332000f4524a4a1273b2d54af2b353f36c09a9562b2d4e2df24cb1354413ce4b4d4d09284a2d4ecd4b4eb535540b294a4cce76ce4f49b535c13403009929283e00000000",
     "hex"
   ),
   infoBus: Buffer.from(
-    "0107000001608107c7d8001c00000150010200000150f6e7000c02412950000000000000000101010000000001000004480000001766362e65372e30302e30632e30322e34312e32392e35300000001730302e30302e30302e30302e30302e30302e30302e303100000008000000f100000001320000000c7073746e2f696e666f42757300000114000000d0789c5dce316bc3301086e17fa3d1e8a493741a3c944c5d42a121bba43b15e1d4368a92fcfd7a2814babe7c3c7c2ccf56e49de7b79527a76d8e39532664ef251291e49a35156382b73cf118e9b6a84b4f65396d2c336aed00c8c5e883f18650a955c66bebcb417e9c41955b93753ca5dfdbb6ce7eb213a8b4b7eb6f30aa7691f3e3fb2fa47dbffe9b2f27e9a3d556d290cff6b5cee8a854ac565cf0d543321e28b001124c35b2558fbbf4e301a0034bd644a3235a50635be4606d86c231a1614ebae878083a64ccc92373b43f1158558000000000",
+    "01070000012d8107c7d8001c0000011d01020000011df6e7000c02412950000000000000000101010000000001000004480000001766362e65372e30302e30632e30322e34312e32392e35300000001730302e30302e30302e30302e30302e30302e30302e303100000008000000f100000001320000000c7073746e2f696e666f427573000001160000009d789c858fb10a83301445ff26636834463b64289d5ca4d0e2fec87b29213691f8b4bfdfa550b083773c9ce15ca42d38ead15e12cad3c12432c314c5a3808bd78c64f5bf2444227ee7127bb4b7410937054abc5159424ed6c85a2a017318bfa012be100debeb07609ec79d1eaf5438f8e080e91e9ec9eaa6735efb9a9ad678a3a032aa6bb1521d69f067acc5ba50e9d1aa5d1ce748c91e1dfd004ffb4f7e00000000",
     "hex"
   ),
   queryRtcServersEx: Buffer.from(
-    "0107000000f98107c7d8001c000000e90102000000e9f6e7000c024129500000000000000001010100000000010000044c0000001766362e65372e30302e30632e30322e34312e32392e35300000001730302e30302e30302e30302e30302e30302e30302e3031000000080000008a000000105f5f454447455f505249564154455f5f0000001471756572795f7274635f736572766572735f65780000004d00000052789c2b4e2d2ececccf8bcf4cb13550cb2cce4fce2fcd2b29aab475f603f18a4b124b526d3d52f312f3d4d27212d38b6d2dd5428a1293b39df353526d4d0c0c4c0d0d2d4c2d2dcdcc8d2d4ccd8d004d0e19a600000000",
+    "0107000000ec8107c7d8001c000000dc0102000000dcf6e7000c024129500000000000000001010100000000010000044c0000001766362e65372e30302e30632e30322e34312e32392e35300000001730302e30302e30302e30302e30302e30302e30302e3031000000080000008a000000105f5f454447455f505249564154455f5f0000001471756572795f7274635f736572766572735f65780000004f00000045789c2b4e2d2ececccf8bcf4cb13550cb2cce4fce2fcd2b29aab475f603f18a4b124b526d3d52f312f3d4d27212d38b6d2dd5428a1293b39df353526d4d0c3000007e2e19ba00000000",
     "hex"
   ),
   updateClientLink: Buffer.from(
-    "0107000001528107c7d8001c00000142010200000142f6e7000c024129500000000000000001010100000000010000044e0000001766362e65372e30302e30632e30322e34312e32392e35300000001730302e30302e30302e30302e30302e30302e30302e303100000008000000e3000000013200000010757064617465636c69656e746c696e6b000000f0000000be789c0dceb16ec5200c40d1bf6144361863860cd59bdedcaa3b6053a15449949756fdfc66bdc3d155fb9ddd9ebabc6dea13c4565a9326a4cc5644c4da68203d84cc51bd5e57fd5eddc759fbfad8d516024888924ae14c9c999cfb9bc732d85bf6001eba87e0097d28b7eeea717cdaf99afbb6b08f1eefb03eecbce698bd5ef63ebfb68592f441235aca3c186b6094ac01c5a88ea2d1fdbcecbc8791124689a1042814d15dfb6a371b1b762d95826a850ee51620376a9549b5c47f12d4457400000000",
+    "0107000001238107c7d8001c00000113010200000113f6e7000c024129500000000000000001010100000000010000044e0000001766362e65372e30302e30632e30322e34312e32392e35300000001730302e30302e30302e30302e30302e30302e30302e303100000008000000e3000000013200000010757064617465636c69656e746c696e6b000000f20000008f789c858fb10ac3201040ffc6f150634c32dc5032656ee97e7867118b11634b3fbf7b3be4cd0f1e8fe59d826c8c97c2a04f00ee9d9e59dd1a85bcee2ce8fe25a53ea962f42013680d3a80b6e00cd80546ada8d6bbb423ed053d0c6014d5bc4aeb29a6405daee951d08d73882e0e324e3e7a43d69b79626b667114171ed4eb90b6319a9f70dfb3143c9bf802b0fa3f6d00000000",
     "hex"
   )
 } as const;
 
+
 const APP_PHONE_COUNTRY_CONFIGS: PrivatePhoneRequestConfig[] = [
-  { countryKey: "US", label: "缂傚洤楠稿ù?+1", countryCode: 1, isoCountryCode: "US", providerIdList: ["2000", "2001"], packageServiceId: "DT01001", applyType: 1, randomAreaCodes: [213, 646, 312, 415, 305, 212, 323, 424, 469, 512, 628, 702, 786, 929, 971] },
-  { countryKey: "CA", label: "闁告梻濮电€ｄ焦寰?+1", countryCode: 1, isoCountryCode: "CA", providerIdList: ["2000", "2001"], packageServiceId: "DT02002", applyType: 2, randomAreaCodes: [416, 647, 437, 604, 778, 236, 514, 438, 613, 343] },
-  { countryKey: "GB", label: "闁艰宕ù?+44", countryCode: 44, isoCountryCode: "GB", providerIdList: ["2001", "2007"], packageServiceId: "DT02001", applyType: 3 },
-  { countryKey: "BE", label: "婵絾鏌ㄩ崺鍕籍?+32", countryCode: 32, isoCountryCode: "BE", providerIdList: ["2002"], packageServiceId: "DT03001", applyType: 5 },
-  { countryKey: "NL", label: "闁艰棄鍢查崣?+31", countryCode: 31, isoCountryCode: "NL", providerIdList: ["2006"], packageServiceId: "DT03005", applyType: 9 },
-  { countryKey: "RU", label: "濞ｅ洤瀚紞蹇涘棘?+7", countryCode: 7, isoCountryCode: "RU", providerIdList: ["2003"], packageServiceId: "DT03002", applyType: 6 },
-  { countryKey: "ES", label: "閻熸娉曡ぐ顕€鎮?+34", countryCode: 34, isoCountryCode: "ES", providerIdList: ["2004"], packageServiceId: "DT03003", applyType: 7 },
-  { countryKey: "CN", label: "濞戞搩鍘煎ù?+86", countryCode: 86, isoCountryCode: "CN", providerIdList: ["2030"], packageServiceId: "DT04001", applyType: 11 },
-  { countryKey: "AU", label: "婵犮垹鍟块妵鍥礆閳衡偓缁?+61", countryCode: 61, isoCountryCode: "AU", providerIdList: ["2008"], packageServiceId: "DT03007", applyType: 13 },
-  { countryKey: "AT", label: "濠靛倶鍎卞﹢鎾礆?+43", countryCode: 43, isoCountryCode: "AT", providerIdList: ["2100"], packageServiceId: "DT03008", applyType: 14 },
-  { countryKey: "FR", label: "婵炲娲栧ù?+33", countryCode: 33, isoCountryCode: "FR", providerIdList: ["2100"], packageServiceId: "DT03009", applyType: 15 },
-  { countryKey: "SE", label: "闁荤喓鍋涢崥鈧?+46", countryCode: 46, isoCountryCode: "SE", providerIdList: ["2100"], packageServiceId: "DT03010", applyType: 16 },
-  { countryKey: "MU", label: "婵絾鐩崳宄靶ч崒娑欑効 +230", countryCode: 230, isoCountryCode: "MU", providerIdList: ["2100"], packageServiceId: "DT03011", applyType: 17 },
-  { countryKey: "PL", label: "婵炲鍨归崣?+48", countryCode: 48, isoCountryCode: "PL", providerIdList: ["2300"], packageServiceId: "DT05003", applyType: 18 },
-  { countryKey: "ID", label: "闁告婢樼€瑰磭浜搁懝鑸仾濞?+62", countryCode: 62, isoCountryCode: "ID", providerIdList: ["2300"], packageServiceId: "DT05004", applyType: 19 },
-  { countryKey: "PR", label: "婵炲鍨归ˇ鎸庮渶鎼粹剝鍊?+1787", countryCode: 1787, isoCountryCode: "PR", providerIdList: ["2300"], packageServiceId: "DT05005", applyType: 20 },
-  { countryKey: "CZ", label: "闁圭懓鍢查崢?+420", countryCode: 420, isoCountryCode: "CZ", providerIdList: ["2300"], packageServiceId: "DT05006", applyType: 21 },
-  { countryKey: "MY", label: "濡炶鍓氬鐢垫啿婢跺摜鑲?+60", countryCode: 60, isoCountryCode: "MY", providerIdList: ["2300"], packageServiceId: "DT05007", applyType: 22 },
-  { countryKey: "DK", label: "濞戞挸缍婄€?+45", countryCode: 45, isoCountryCode: "DK", providerIdList: ["2300"], packageServiceId: "DT05008", applyType: 23 },
-  { countryKey: "RO", label: "缂傚啯顨婇埞鍫焊闂傚鑲?+40", countryCode: 40, isoCountryCode: "RO", providerIdList: ["2300"], packageServiceId: "DT05009", applyType: 24 }
+  { countryKey: "AT", label: "AT", countryCode: 43, isoCountryCode: "AT", providerIdList: ["2100"], packageServiceId: "DT03008", applyType: 14 },
+  { countryKey: "AU", label: "AU", countryCode: 61, isoCountryCode: "AU", providerIdList: ["2008"], packageServiceId: "DT03007", applyType: 13 },
+  { countryKey: "BR", label: "BR", countryCode: 55, isoCountryCode: "BR", providerIdList: [], packageServiceId: "DT08003", applyType: 31 },
+  { countryKey: "BE", label: "BE", countryCode: 32, isoCountryCode: "BE", providerIdList: ["2002"], packageServiceId: "DT03001", applyType: 5 },
+  { countryKey: "PR", label: "PR", countryCode: 1787, isoCountryCode: "PR", providerIdList: ["2300"], packageServiceId: "DT05005", applyType: 20 },
+  { countryKey: "PL", label: "PL", countryCode: 48, isoCountryCode: "PL", providerIdList: ["2300"], packageServiceId: "DT05003", applyType: 18 },
+  { countryKey: "DK", label: "DK", countryCode: 45, isoCountryCode: "DK", providerIdList: ["2300"], packageServiceId: "DT05008", applyType: 23 },
+  { countryKey: "FR", label: "FR", countryCode: 33, isoCountryCode: "FR", providerIdList: ["2100"], packageServiceId: "DT03009", applyType: 15 },
+  { countryKey: "FI", label: "FI", countryCode: 358, isoCountryCode: "FI", providerIdList: [], packageServiceId: "DT08005", applyType: 34 },
+  { countryKey: "CO", label: "CO", countryCode: 57, isoCountryCode: "CO", providerIdList: [], packageServiceId: "DT03011", applyType: 40 },
+  { countryKey: "NL", label: "NL", countryCode: 31, isoCountryCode: "NL", providerIdList: ["2006"], packageServiceId: "DT03005", applyType: 9 },
+  { countryKey: "CA", label: "CA", countryCode: 1, isoCountryCode: "CA", providerIdList: ["2000", "2001"], packageServiceId: "DT02002", applyType: 2, randomAreaCodes: [416, 647, 437, 604, 778, 236, 514, 438, 613, 343] },
+  { countryKey: "CZ", label: "CZ", countryCode: 420, isoCountryCode: "CZ", providerIdList: ["2300"], packageServiceId: "DT05006", applyType: 21 },
+  { countryKey: "LT", label: "LT", countryCode: 370, isoCountryCode: "LT", providerIdList: [], packageServiceId: "DT05026", applyType: 42 },
+  { countryKey: "RO", label: "RO", countryCode: 40, isoCountryCode: "RO", providerIdList: ["2300"], packageServiceId: "DT05009", applyType: 24 },
+  { countryKey: "US", label: "US", countryCode: 1, isoCountryCode: "US", providerIdList: ["2000", "2001"], packageServiceId: "DT01001", applyType: 1, randomAreaCodes: [213, 646, 312, 415, 305, 212, 323, 424, 469, 512, 628, 702, 786, 929, 971] },
+  { countryKey: "MX", label: "MX", countryCode: 52, isoCountryCode: "MX", providerIdList: [], packageServiceId: "DT06015", applyType: 32 },
+  { countryKey: "NO", label: "NO", countryCode: 47, isoCountryCode: "NO", providerIdList: [], packageServiceId: "DT05025", applyType: 41 },
+  { countryKey: "SE", label: "SE", countryCode: 46, isoCountryCode: "SE", providerIdList: ["2100"], packageServiceId: "DT03010", applyType: 16 },
+  { countryKey: "CH", label: "CH", countryCode: 41, isoCountryCode: "CH", providerIdList: [], packageServiceId: "DT05021", applyType: 37 },
+  { countryKey: "ES", label: "ES", countryCode: 34, isoCountryCode: "ES", providerIdList: ["2004"], packageServiceId: "DT03003", applyType: 7 },
+  { countryKey: "HU", label: "HU", countryCode: 36, isoCountryCode: "HU", providerIdList: [], packageServiceId: "DT05022", applyType: 38 },
+  { countryKey: "IL", label: "IL", countryCode: 972, isoCountryCode: "IL", providerIdList: [], packageServiceId: "DT05023", applyType: 39 },
+  { countryKey: "IT", label: "IT", countryCode: 39, isoCountryCode: "IT", providerIdList: [], packageServiceId: "DT05020", applyType: 36 },
+  { countryKey: "GB", label: "GB", countryCode: 44, isoCountryCode: "GB", providerIdList: ["2001", "2007"], packageServiceId: "DT02001", applyType: 3 },
+  { countryKey: "CL", label: "CL", countryCode: 56, isoCountryCode: "CL", providerIdList: [], packageServiceId: "DT06017", applyType: 33 }
 ];
 
 export class DirectDingtoneGateway implements DingtoneGateway {
@@ -845,7 +920,12 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     });
   }
 
-  async listPhoneNumberCountries(account: { dtUserId: string; token: string; deviceId?: string | null }): Promise<DingtonePhoneCountryOption[]> {
+  async listPhoneNumberCountries(account: {
+    dtUserId: string;
+    token: string;
+    deviceId?: string | null;
+    appVariant?: "dingtone" | "dingdong";
+  }): Promise<DingtonePhoneCountryOption[]> {
     const runtime = await getDirectRuntimeConfig();
     try {
       return await this.withSession(runtime, account, async (session) => {
@@ -882,52 +962,41 @@ export class DirectDingtoneGateway implements DingtoneGateway {
   }
 
   async requestPhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
     payload: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null; areaCode?: number | null }
   ): Promise<DingtonePhonePurchasePreview> {
     const runtime = await getDirectRuntimeConfig();
     const requestConfig = resolvePrivatePhoneRequestConfig(payload.countryCode, payload.isoCountryCode, payload.countryKey);
-    const previews: DingtonePhonePurchasePreview[] = [];
     let directError: unknown;
-
-    for (let index = 0; index < 200; index += 1) {
-      try {
-        const result = await this.withSession(runtime, account, async (session) => {
-          const attempts = buildRequestPrivateNumberQueryAttempts(account, runtime, requestConfig, () => session.nextTrackCode(), payload.areaCode);
-          const query = attempts[index];
-          if (!query) {
-            throw new Error("No more requestPrivateNumber parameter attempts");
-          }
-          const preview = await session.callCommonRestJson(
-            `requestPrivateNumber#${index + 1}`,
-            "/pstn/share/requestPrivateNumber",
-            query
-          );
-          const normalized = applyPreviewAttemptAreaCode(normalizePhonePurchasePreview(preview), query);
-          if (normalized.candidates.length > 0) {
-            return enrichPreviewWithLivePrices(session, account, normalized, requestConfig);
-          }
-          return normalized;
-        }, 1);
-        previews.push(result);
-        if (result.candidates.length > 0) {
-          return result;
-        }
-      } catch (error) {
-        if (error instanceof Error && error.message === "No more requestPrivateNumber parameter attempts") {
-          break;
-        }
-        directError = error;
-        logger.warn("Direct requestPrivateNumber attempt failed; trying next app-compatible parameter set", {
-          countryCode: requestConfig.countryCode,
-          isoCountryCode: requestConfig.isoCountryCode,
-          attempt: index + 1,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        if (isDirectTransportError(error)) {
-          break;
-        }
-      }
+    try {
+      return await this.withRegisteredSession(runtime, account, async (session) => {
+        // Rebuild the authenticated query and the ProxyRest wire context observed from the App.
+        const [query] = buildRequestPrivateNumberQueryAttempts(
+          account,
+          runtime,
+          requestConfig,
+          () => session.nextTrackCode(),
+          payload.areaCode
+        );
+        const preview = await session.callCommonRestJson(
+          "requestPrivateNumber",
+          "/pstn/share/requestPrivateNumber",
+          query!,
+          undefined,
+          encodeRequestPrivateNumberRpcContext()
+        );
+        const normalized = applyPreviewAttemptAreaCode(normalizePhonePurchasePreview(preview), query!);
+        return normalized.candidates.length > 0
+          ? enrichPreviewWithLivePrices(session, account, normalized, requestConfig)
+          : normalized;
+      }, 1);
+    } catch (error) {
+      directError = error;
+      logger.warn("Direct requestPrivateNumber native CommonRest preview failed", {
+        countryCode: requestConfig.countryCode,
+        isoCountryCode: requestConfig.isoCountryCode,
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
 
     if (directError) {
@@ -952,50 +1021,35 @@ export class DirectDingtoneGateway implements DingtoneGateway {
   }
 
   async purchasePhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
     payload: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null; candidate: DingtonePhonePurchaseCandidate }
   ): Promise<DingtonePhoneNumber> {
-    const templateParams = {
-      ...flattenTemplateObject(payload.candidate, "candidate"),
-      countryCode: payload.countryCode ?? payload.candidate.countryCode,
-      countryKey: payload.countryKey ?? undefined,
-      phoneNumber: payload.candidate.phoneNumber,
-      areaCode: resolvePhoneActionAreaCode(payload.candidate, {
-        countryCode: payload.countryCode,
-        isoCountryCode: payload.isoCountryCode ?? payload.candidate.isoCountryCode,
-        countryKey: payload.countryKey
-      }),
-      providerId: payload.candidate.providerId,
-      packageServiceId: payload.candidate.packageServiceId,
-      category: payload.candidate.category,
-      phoneType: payload.candidate.phoneType,
+    const runtime = await getDirectRuntimeConfig();
+    const lockQuery = buildPhonePurchaseLockQuery(payload.candidate, {
+      countryCode: payload.countryCode,
       isoCountryCode: payload.isoCountryCode ?? payload.candidate.isoCountryCode,
-      price: payload.candidate.price,
-      productId: payload.candidate.productId
-    };
-    const result = await this.callDirectPhoneAction(
-      "purchasePhone",
-      account,
-      () =>
-        buildOrderPrivateNumberQuery(account, payload.candidate, {
-          countryCode: payload.countryCode,
-          isoCountryCode: payload.isoCountryCode ?? payload.candidate.isoCountryCode,
-          countryKey: payload.countryKey,
-          payFlag: 2
-        }),
-      "dt_direct_template_purchase_phone",
-      templateParams,
-      {
-        acceptSocketCloseAfterWrite: true,
-        queryAttempts: () =>
-          buildOrderPrivateNumberQueryAttempts(account, payload.candidate, {
-            countryCode: payload.countryCode,
-            isoCountryCode: payload.isoCountryCode ?? payload.candidate.isoCountryCode,
-            countryKey: payload.countryKey,
-            payFlag: 2
-          })
+      countryKey: payload.countryKey
+    });
+    const query = buildEdgeOrderPrivateNumberQuery(payload.candidate, {
+      countryCode: payload.countryCode,
+      isoCountryCode: payload.isoCountryCode ?? payload.candidate.isoCountryCode,
+      countryKey: payload.countryKey
+    });
+    const result = await this.withRegisteredSession(runtime, account, async (session) => {
+      const lock = await session.callEdgeRestJson("phone purchase lock", PHONE_PURCHASE_LOCK_API_NAME, lockQuery);
+      assertPhonePurchaseLockSuccess(lock);
+      try {
+        return await session.callEdgeOrderPrivateNumberJson(query, PHONE_PURCHASE_ORDER_TIMEOUT_MS);
+      } catch (error) {
+        if (isNoResponseAfterPhoneActionWrite(error)) {
+          logger.warn("Direct Edge orderPrivateNumber was written without a JSON response; deferring to remote inventory confirmation", {
+            error: error instanceof Error ? error.message : String(error)
+          });
+          return { result: "no_response_after_write" };
+        }
+        throw error;
       }
-    );
+    });
     assertDirectApiSuccess(result, "purchasePhone");
     const orderedPhone = extractOrderedPhone(result) ?? payload.candidate;
     const normalized = normalizePhoneNumber(orderedPhone);
@@ -1006,150 +1060,192 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     };
   }
 
+  async probePhonePurchaseLock(
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+    payload: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null; candidate: DingtonePhonePurchaseCandidate }
+  ): Promise<ApiResult> {
+    const runtime = await getDirectRuntimeConfig();
+    const lockQuery = buildPhonePurchaseLockQuery(payload.candidate, {
+      countryCode: payload.countryCode,
+      isoCountryCode: payload.isoCountryCode ?? payload.candidate.isoCountryCode,
+      countryKey: payload.countryKey
+    });
+    return this.withRegisteredSession(runtime, account, async (session) => {
+      let locked = false;
+      try {
+        const lock = await session.callEdgeRestJson("phone purchase lock probe", PHONE_PURCHASE_LOCK_API_NAME, lockQuery);
+        assertPhonePurchaseLockSuccess(lock);
+        locked = true;
+        return lock;
+      } finally {
+        if (locked) {
+          await session.callEdgeRestJson("phone purchase unlock probe", PHONE_PURCHASE_UNLOCK_API_NAME, lockQuery).catch((error) => {
+            logger.warn("Phone purchase lock probe could not unlock candidate", {
+              error: error instanceof Error ? error.message : String(error)
+            });
+          });
+        }
+      }
+    });
+  }
+
   async renewPhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: DirectSessionAccount,
     phoneNumber: string,
     phone?: DirectPhoneActionContext
   ): Promise<Partial<DingtonePhoneNumber>> {
+    const mutation = await this.renewPhoneNumberMutation(account, phoneNumber, phone);
+    if (mutation.outcome === "unknown_after_write") {
+      return {
+        phoneNumber,
+        rawJson: safeJsonStringify({ result: "no_response_after_write", error: mutation.error })
+      };
+    }
+    return mutation.payload as Partial<DingtonePhoneNumber>;
+  }
+
+  async renewPhoneNumberMutation(
+    account: DirectSessionAccount,
+    phoneNumber: string,
+    phone?: DirectPhoneActionContext
+  ): Promise<DingtonePhoneMutationResult<ApiResult>> {
     const context = { ...phone, phoneNumber };
-    const result = await this.callDirectPhoneAction(
-      "renewPhone",
-      account,
-      () => buildOrderPrivateNumberQuery(account, context, { payFlag: context.status === "expired" ? 2 : 3 }),
-      "dt_direct_template_renew_phone",
-      buildPhoneTemplateParams(context, { phoneNumber })
-    );
-    assertDirectApiSuccess(result, "renewPhone");
-    return normalizePhoneNumberPatch({
-      phoneNumber,
-      ...(isRecord(result) ? result : { result })
+    const extensionMonths = resolvePhoneRenewalMonths(context);
+    const runtime = await getDirectRuntimeConfig();
+    const query = buildOrderPrivateNumberQuery(account, context, {
+      payFlag: context.status === "expired" ? 2 : 3,
+      extraChargeMonthsCount: resolvePhoneRenewalExtraChargeMonths(extensionMonths)
     });
+    const mutation = await this.withSingleWriteRegisteredSession(runtime, account, (session, markWritten) => {
+      return session.callOrderPrivateNumberJson(query, runtime.ioTimeoutMs, markWritten, {
+        commandTag: resolvePhoneRenewalCommandTag(extensionMonths)
+      });
+    });
+    if (mutation.outcome === "unknown_after_write") return mutation;
+    assertDirectApiSuccess(mutation.payload, "renewPhone");
+    return {
+      outcome: "response",
+      payload: normalizeRenewedPhoneNumberResponse(mutation.payload, phoneNumber) as ApiResult
+    };
   }
 
   async cancelPhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: DirectSessionAccount,
     phoneNumber: string,
     phone?: DirectPhoneActionContext
   ): Promise<void> {
+    const mutation = await this.cancelPhoneNumberMutation(account, phoneNumber, phone);
+    assertConfirmedPhoneMutationResponse(mutation, "cancelPhone");
+  }
+
+  async cancelPhoneNumberMutation(
+    account: DirectSessionAccount,
+    phoneNumber: string,
+    phone?: DirectPhoneActionContext
+  ): Promise<DingtonePhoneMutationResult<ApiResult>> {
     const context = { ...phone, phoneNumber };
-    await this.callDirectPhoneAction(
+    return this.callSingleWritePhoneAction(
       "cancelPhone",
       account,
-      () => buildDeletePrivateNumberQuery(account, phoneNumber),
-      "dt_direct_template_cancel_phone",
-      buildPhoneTemplateParams(context, { phoneNumber, action: "cancel" })
-    ).then((result) => assertDirectApiSuccess(result, "cancelPhone"));
+      "cancel",
+      buildDeletePrivateNumberQuery(account, phoneNumber)
+    );
   }
 
   async pausePhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: DirectSessionAccount,
     phoneNumber: string,
     phone?: DirectPhoneActionContext
   ): Promise<void> {
+    const mutation = await this.pausePhoneNumberMutation(account, phoneNumber, phone);
+    assertConfirmedPhoneMutationResponse(mutation, "pausePhone");
+  }
+
+  async pausePhoneNumberMutation(
+    account: DirectSessionAccount,
+    phoneNumber: string,
+    phone?: DirectPhoneActionContext
+  ): Promise<DingtonePhoneMutationResult<ApiResult>> {
     const context = { ...phone, phoneNumber };
-    await this.callDirectPhoneAction(
+    return this.callSingleWritePhoneAction(
       "pausePhone",
       account,
-      () => buildPrivateNumberSettingQuery(account, context, 1),
-      "dt_direct_template_pause_phone",
-      buildPhoneTemplateParams(context, { phoneNumber, action: "pause", suspendFlag: 1 }),
-      { acceptSocketCloseAfterWrite: true }
-    ).then((result) => assertDirectApiSuccess(result, "pausePhone"));
+      "settings",
+      buildPrivateNumberSettingQuery(account, context, { suspendFlag: true })
+    );
   }
 
   async resumePhoneNumber(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: DirectSessionAccount,
     phoneNumber: string,
     phone?: DirectPhoneActionContext
   ): Promise<void> {
+    const mutation = await this.resumePhoneNumberMutation(account, phoneNumber, phone);
+    assertConfirmedPhoneMutationResponse(mutation, "resumePhone");
+  }
+
+  async resumePhoneNumberMutation(
+    account: DirectSessionAccount,
+    phoneNumber: string,
+    phone?: DirectPhoneActionContext
+  ): Promise<DingtonePhoneMutationResult<ApiResult>> {
     const context = { ...phone, phoneNumber };
-    let settingWasUnconfirmed = false;
-    const settingError = await this.callDirectPhoneAction(
+    return this.callSingleWritePhoneAction(
       "resumePhone",
       account,
-      () => buildPrivateNumberSettingQuery(account, context, 0),
-      "dt_direct_template_resume_phone",
-      buildPhoneTemplateParams(context, { phoneNumber, action: "resume", suspendFlag: 0 }),
-      { acceptSocketCloseAfterWrite: true }
-    )
-      .then((result) => {
-        assertDirectApiSuccess(result, "resumePhone");
-        settingWasUnconfirmed = isUnconfirmedPhoneActionResult(result);
-        return null;
-      })
-      .catch((error) => error);
-
-    if (!settingError && !settingWasUnconfirmed) {
-      return;
-    }
-
-    const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
-    const reactivateApiName = settings.dt_direct_api_reactivate_phone?.trim() || "/pstn/share/reactivateGoogleVoiceNumber";
-
-    logger.warn("Direct privateNumberSetting resume failed; trying reactivateGoogleVoiceNumber", {
-      phoneNumber: redactSensitiveText(phoneNumber),
-      error: settingError
-        ? settingError instanceof Error
-          ? settingError.message
-          : String(settingError)
-        : "privateNumberSetting write was not confirmed by a JSON response"
-    });
-
-    await this.callDirectPhoneAction(
-      "resumePhone",
-      account,
-      () => buildReactivateGoogleVoiceNumberQuery(account, phoneNumber),
-      "dt_direct_template_resume_phone",
-      buildPhoneTemplateParams(context, { phoneNumber, action: "reactivate", suspendFlag: 0 }),
-      { acceptSocketCloseAfterWrite: true, apiNameOverride: reactivateApiName }
-    ).then((result) => assertDirectApiSuccess(result, "reactivatePhone"));
+      "settings",
+      buildPrivateNumberSettingQuery(account, context, { suspendFlag: false })
+    );
   }
 
   async updatePhoneNumberLabel(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: DirectSessionAccount,
     phoneNumber: string,
     displayName: string,
     phone?: DirectPhoneActionContext
   ): Promise<Partial<DingtonePhoneNumber>> {
+    const mutation = await this.updatePhoneNumberLabelMutation(account, phoneNumber, displayName, phone);
+    assertConfirmedPhoneMutationResponse(mutation, "updatePhoneLabel");
+    return { phoneNumber, displayName, status: phone?.status };
+  }
+
+  async updatePhoneNumberLabelMutation(
+    account: DirectSessionAccount,
+    phoneNumber: string,
+    displayName: string,
+    phone?: DirectPhoneActionContext
+  ): Promise<DingtonePhoneMutationResult<ApiResult>> {
     const context = { ...phone, phoneNumber, displayName };
-    const suspendFlag = context.status === "paused" ? 1 : 0;
-    const result = await this.callDirectPhoneAction(
+    return this.callSingleWritePhoneAction(
       "updatePhoneLabel",
       account,
-      () => buildPrivateNumberSettingQuery(account, context, suspendFlag),
-      "dt_direct_template_phone_setting",
-      buildPhoneTemplateParams(context, { phoneNumber, action: "label", displayName, suspendFlag }),
-      { acceptSocketCloseAfterWrite: true }
+      "settings",
+      buildPrivateNumberSettingQuery(account, context, { displayName })
     );
-    assertDirectApiSuccess(result, "updatePhoneLabel");
-    return {
-      phoneNumber,
-      displayName,
-      status: context.status
-    };
   }
 
   async enablePhoneNumberSmsReception(
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: DirectSessionAccount,
     phoneNumber: string,
     phone?: DirectPhoneActionContext
   ): Promise<Partial<DingtonePhoneNumber>> {
+    const mutation = await this.enablePhoneNumberSmsReceptionMutation(account, phoneNumber, phone);
+    assertConfirmedPhoneMutationResponse(mutation, "enableSmsReceive");
+    return { phoneNumber, allowReceiveSms: true, status: phone?.status };
+  }
+
+  async enablePhoneNumberSmsReceptionMutation(
+    account: DirectSessionAccount,
+    phoneNumber: string,
+    phone?: DirectPhoneActionContext
+  ): Promise<DingtonePhoneMutationResult<ApiResult>> {
     const context = { ...phone, phoneNumber };
-    const suspendFlag = context.status === "paused" ? 1 : 0;
-    const result = await this.callDirectPhoneAction(
+    return this.callSingleWritePhoneAction(
       "enableSmsReceive",
       account,
-      () => buildPrivateNumberSettingQuery(account, context, suspendFlag),
-      "dt_direct_template_phone_setting",
-      buildPhoneTemplateParams(context, { phoneNumber, action: "enable-sms", allowReceiveSMS: 1, suspendFlag }),
-      { acceptSocketCloseAfterWrite: true }
+      "settings",
+      buildPrivateNumberSettingQuery(account, context, { allowReceiveSms: true })
     );
-    assertDirectApiSuccess(result, "enableSmsReceive");
-    return {
-      phoneNumber,
-      allowReceiveSms: true,
-      status: context.status
-    };
   }
 
   async buildPhoneActionDryRuns(
@@ -1187,28 +1283,31 @@ export class DirectDingtoneGateway implements DingtoneGateway {
         buildPhoneActionDryRun(
           "renewPhone",
           settings,
-          buildOrderPrivateNumberQuery(account, context, { payFlag: context.status === "expired" ? 2 : 3 })
+          buildOrderPrivateNumberQuery(account, context, {
+            payFlag: context.status === "expired" ? 2 : 3,
+            extraChargeMonthsCount: resolvePhoneRenewalExtraChargeMonths(resolvePhoneRenewalMonths(context))
+          })
         ),
         buildPhoneActionDryRun("cancelPhone", settings, buildDeletePrivateNumberQuery(account, options.phoneNumber)),
         buildPhoneActionDryRun(
           "pausePhone",
           settings,
-          buildPrivateNumberSettingQuery(account, context, 1)
+          buildPrivateNumberSettingQuery(account, context, { suspendFlag: true })
         ),
         buildPhoneActionDryRun(
           "resumePhone",
           settings,
-          buildPrivateNumberSettingQuery(account, context, 0)
+          buildPrivateNumberSettingQuery(account, context, { suspendFlag: false })
         ),
         buildPhoneActionDryRun(
           "updatePhoneLabel",
           settings,
-          buildPrivateNumberSettingQuery(account, { ...context, displayName: "codex-label-dry-run" }, context.status === "paused" ? 1 : 0)
+          buildPrivateNumberSettingQuery(account, context, { displayName: "codex-label-dry-run" })
         ),
         buildPhoneActionDryRun(
           "clearPhoneLabel",
           settings,
-          buildPrivateNumberSettingQuery(account, { ...context, displayName: "" }, context.status === "paused" ? 1 : 0)
+          buildPrivateNumberSettingQuery(account, context, { displayName: "" })
         )
       );
     }
@@ -1216,75 +1315,9 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     return actions;
   }
 
-  private async callDirectPhoneAction(
-    label: DirectPhoneActionLabel,
-    account: { dtUserId: string; token: string; deviceId?: string | null },
-    buildQuery: () => string,
-    fallbackTemplateKey: DirectPhoneTemplateSettingKey,
-    fallbackParams: DirectTemplateParams,
-    options: { acceptSocketCloseAfterWrite?: boolean; apiNameOverride?: string; queryAttempts?: () => string[] } = {}
-  ): Promise<ApiResult> {
-    const runtime = await getDirectRuntimeConfig();
-    const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
-    const apiName = options.apiNameOverride
-      ? normalizeDirectPhoneApiName(label, options.apiNameOverride)
-      : resolvePhoneActionApiName(label, settings);
-    let directError: unknown;
-    try {
-      return await this.withSession(runtime, account, async (session) => {
-        const queries = uniqueStrings(options.queryAttempts?.() ?? [buildQuery()]);
-        let lastError: unknown;
-        for (const [index, query] of queries.entries()) {
-          try {
-            return await session.callCommonRestJson(index === 0 ? label : `${label}#${index + 1}`, apiName, query);
-          } catch (error) {
-            lastError = error;
-            if (options.acceptSocketCloseAfterWrite && isNoResponseAfterPhoneActionWrite(error)) {
-              logger.warn("Direct private phone action wrote request but did not receive JSON; verifying result without retrying purchase write", {
-                label,
-                apiName,
-                attempt: index + 1,
-                error: error instanceof Error ? error.message : String(error)
-              });
-              return { result: "no_response_after_write" };
-            }
-            logger.warn("Direct private phone action query attempt failed; trying next shape", {
-              label,
-              apiName,
-              attempt: index + 1,
-              error: error instanceof Error ? error.message : String(error)
-            });
-          }
-        }
-        throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "unknown direct action error"));
-      });
-    } catch (error) {
-      if (options.acceptSocketCloseAfterWrite && isNoResponseAfterPhoneActionWrite(error)) {
-        logger.warn("Direct private phone action did not return a JSON response after request write; deferring to remote verification", {
-          label,
-          apiName,
-          error: error instanceof Error ? error.message : String(error)
-        });
-        return { result: "no_response_after_write" };
-      }
-      directError = error;
-      logger.warn("Direct private phone action failed; trying configured frame template", {
-        label,
-        apiName,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-
-    return this.callConfiguredPhoneTemplate(fallbackTemplateKey, account, fallbackParams).catch((templateError) => {
-      const directMessage = directError instanceof Error ? directError.message : String(directError);
-      const templateMessage = templateError instanceof Error ? templateError.message : String(templateError);
-      throw new AppError(`Direct ${label} failed (${directMessage}); template fallback failed (${templateMessage})`, 501, 501);
-    });
-  }
-
   private async callConfiguredPhoneTemplate(
     settingKey: DirectPhoneTemplateSettingKey,
-    account: { dtUserId: string; token: string; deviceId?: string | null },
+    account: DirectSessionAccount,
     extraParams: DirectTemplateParams
   ): Promise<ApiResult> {
     const runtime = await getDirectRuntimeConfig();
@@ -1318,11 +1351,80 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     });
   }
 
+  private async withSingleWriteRegisteredSession(
+    runtime: DirectRuntimeConfig,
+    account: DirectSessionAccount,
+    handler: (session: DirectSession, markWritten: () => void) => Promise<ApiResult>
+  ): Promise<DingtonePhoneMutationResult<ApiResult>> {
+    if (await preemptActiveDirectPushListener(account)) {
+      await delay(750);
+    }
+
+    return runWithDirectSessionOperationLock(account, async () => {
+      return runSingleWritePhoneMutation({
+        hosts: uniqueHosts([runtime.primaryHost, runtime.backupHost]),
+        execute: async (host, markWritten) => {
+          const session = new DirectSession(runtime, host);
+          try {
+            await session.openLink(account);
+            await runPushMaintenanceCalls(session, runtime, account, true);
+            const registration = await runPushLinkRegistration(session, runtime, account);
+            if (!registration.ok) {
+              throw new AppError(registration.error ?? "Direct client link registration failed", 502, 502);
+            }
+            return await handler(session, markWritten);
+          } finally {
+            await session.close().catch(() => undefined);
+          }
+        }
+      });
+    });
+  }
+
+  private async callSingleWritePhoneAction(
+    label: DirectPhoneActionLabel,
+    account: DirectSessionAccount,
+    protocolKind: PhoneActionProtocolKind,
+    query: string
+  ): Promise<DingtonePhoneMutationResult<ApiResult>> {
+    const runtime = await getDirectRuntimeConfig();
+    const protocol = resolvePhoneActionProtocol(account.appVariant ?? "dingtone", protocolKind);
+    const mutation = await this.withSingleWriteRegisteredSession(runtime, account, (session, markWritten) => {
+      return session.callCommonRestJson(
+        label,
+        protocol.apiName,
+        query,
+        runtime.ioTimeoutMs,
+        undefined,
+        markWritten
+      );
+    });
+    if (mutation.outcome === "unknown_after_write") return mutation;
+    assertDirectApiSuccess(mutation.payload, label);
+    return mutation;
+  }
+
+  private async withRegisteredSession<T>(
+    runtime: DirectRuntimeConfig,
+    account: DirectSessionAccount,
+    handler: (session: DirectSession) => Promise<T>,
+    maxAttempts = 2
+  ) {
+    return this.withSession(runtime, account, handler, maxAttempts, async (session) => {
+      await session.openLink(account);
+      const registration = await runPushLinkRegistration(session, runtime, account);
+      if (!registration.ok) {
+        throw new AppError(registration.error ?? "Direct client link registration failed", 502, 502);
+      }
+    });
+  }
+
   private async withSession<T>(
     runtime: DirectRuntimeConfig,
     account: { dtUserId: string; token: string; deviceId?: string | null; email?: string | null },
     handler: (session: DirectSession) => Promise<T>,
-    maxAttempts = 2
+    maxAttempts = 2,
+    openSession?: (session: DirectSession) => Promise<void>
   ): Promise<T> {
     if (await preemptActiveDirectPushListener(account)) {
       await delay(750);
@@ -1335,7 +1437,11 @@ export class DirectDingtoneGateway implements DingtoneGateway {
       for (const host of hosts) {
         const session = new DirectSession(runtime, host);
         try {
-          await session.open(account);
+          if (openSession) {
+            await openSession(session);
+          } else {
+            await session.open(account);
+          }
           const result = await handler(session);
           await session.close();
           return result;
@@ -1469,7 +1575,7 @@ export async function listenDirectSessionPushes(input: {
   let offlineTemplateAttempted = false;
   let offlineTemplateSendCount = 0;
   let offlineCatchupInFlight: Promise<void> | null = null;
-  let webOfflinePollInFlight: Promise<void> | null = null;
+  let webOfflinePollInFlight: Promise<boolean> | null = null;
   const calls: DirectProbeCallResult[] = [];
   let resolveListenerDone!: () => void;
   const listenerDone = new Promise<void>((resolve) => {
@@ -1490,7 +1596,6 @@ export async function listenDirectSessionPushes(input: {
   let nextOfflineCatchupAt = 0;
   let startupOfflineCatchupCompleted = false;
   let nextNotifyOnlyCatchupAt = 0;
-  let nextWebOfflinePollAt = 0;
 
   await preemptActiveDirectPushListener(input.account);
   activeDirectPushListeners.set(listener.key, listener);
@@ -1516,8 +1621,9 @@ export async function listenDirectSessionPushes(input: {
       await offlineCatchupInFlight;
       return;
     }
-    offlineCatchupInFlight = (async () => {
+    offlineCatchupInFlight = withDirectOfflineCatchupPermit(async () => {
       offlineTemplateAttempted = true;
+      let responseReceived = false;
       try {
         const sent = await session.sendConfiguredTemplate("dt_direct_template_offline_messages", input.account, {
           action: "requestAllOfflineMessage"
@@ -1534,15 +1640,21 @@ export async function listenDirectSessionPushes(input: {
         } else {
           offlineTemplateError = offlineTemplateError ?? "dt_direct_template_offline_messages is not configured";
         }
+        responseReceived = await requestWebOfflineMessages(session, host);
+        if (!responseReceived) {
+          offlineTemplateError = offlineTemplateError ?? "getUserOfflineMsg response was not received";
+        }
       } catch (error) {
         offlineTemplateError = error instanceof Error ? error.message : String(error);
-        logger.warn("Direct offline message template was not sent", {
+        logger.warn("Direct offline message catch-up failed", {
           host,
           reason,
           error: offlineTemplateError
         });
       } finally {
-        nextOfflineCatchupAt = offlineTemplateError ? Date.now() + DIRECT_OFFLINE_CATCHUP_RETRY_MS : deadline;
+        nextOfflineCatchupAt = responseReceived
+          ? Date.now() + directOfflineCatchupDelayMs(input.account)
+          : Date.now() + DIRECT_OFFLINE_CATCHUP_RETRY_MS;
         try {
           await input.onOfflineCatchup?.({
             host,
@@ -1561,14 +1673,13 @@ export async function listenDirectSessionPushes(input: {
         }
         offlineCatchupInFlight = null;
       }
-    })();
+    });
     await offlineCatchupInFlight;
   };
 
   const requestWebOfflineMessages = async (session: DirectSession, host: string) => {
     if (webOfflinePollInFlight) {
-      await webOfflinePollInFlight;
-      return;
+      return await webOfflinePollInFlight;
     }
     webOfflinePollInFlight = (async () => {
       const payload = await session.callJsonFromTemplate("getWebOfflineMessage", TEMPLATES.getWebOfflineMessage, {
@@ -1585,18 +1696,19 @@ export async function listenDirectSessionPushes(input: {
         input.onWebOfflineMessages,
         getDirectWebOfflineDeliveryTracker(input.account)
       );
+      return true;
     })()
       .catch((error) => {
         logger.warn("Direct web-offline message poll failed", {
           host,
           error: error instanceof Error ? error.message : String(error)
         });
+        return false;
       })
       .finally(() => {
-        nextWebOfflinePollAt = Date.now() + DIRECT_WEB_OFFLINE_POLL_INTERVAL_MS;
         webOfflinePollInFlight = null;
       });
-    await webOfflinePollInFlight;
+    return await webOfflinePollInFlight;
   };
 
   try {
@@ -1837,9 +1949,6 @@ export async function listenDirectSessionPushes(input: {
             throw new Error("Direct listener was preempted during private-number refresh");
           }
           successfulPairs += 1;
-          if (nextWebOfflinePollAt <= 0) {
-            nextWebOfflinePollAt = Date.now() + DIRECT_WEB_OFFLINE_POLL_INTERVAL_MS;
-          }
           return linkSession;
         } catch (error) {
           if (!linkTransportReady && isDirectTransportError(error)) {
@@ -1858,6 +1967,22 @@ export async function listenDirectSessionPushes(input: {
         diagnostics.recordFrame(push);
         if (push.sms) {
           rememberDirectSmsHost(input.account, frameHost);
+        }
+        if (push.jsonPayload) {
+          const messages = normalizeDirectWebOfflineMessages(push.jsonPayload, input.account.appVariant);
+          if (messages.length > 0) {
+            await deliverDirectWebOfflineMessages(
+              messages,
+              frameHost,
+              input.onWebOfflineMessages,
+              getDirectWebOfflineDeliveryTracker(input.account)
+            ).catch((error) => {
+              logger.warn("Direct offline push payload delivery failed", {
+                host: frameHost,
+                error: error instanceof Error ? error.message : String(error)
+              });
+            });
+          }
         }
         if (
           isNotifyOnlyMessageIndexPush(push)
@@ -1945,8 +2070,7 @@ export async function listenDirectSessionPushes(input: {
           }
           const waitUntil = Math.min(
             deadline,
-            nextOfflineCatchupAt > 0 ? nextOfflineCatchupAt : deadline,
-            nextWebOfflinePollAt > 0 ? nextWebOfflinePollAt : deadline
+            nextOfflineCatchupAt > 0 ? nextOfflineCatchupAt : deadline
           );
           const waitMs = Math.max(250, Math.min(5_000, waitUntil - Date.now()));
           const linkWaitMs = currentLinkSession ? Math.max(250, Math.ceil(waitMs / 2)) : 0;
@@ -2015,9 +2139,6 @@ export async function listenDirectSessionPushes(input: {
           }
           if (Date.now() >= nextOfflineCatchupAt && currentLinkSession && linkOwnsRoute) {
             await requestOfflineCatchup(currentLinkSession, host, "interval");
-          }
-          if (Date.now() >= nextWebOfflinePollAt && currentLinkSession && linkOwnsRoute) {
-            await requestWebOfflineMessages(currentLinkSession, host);
           }
         }
       } catch (error) {
@@ -2345,8 +2466,11 @@ async function deliverDirectWebOfflineMessages<T extends DirectWebOfflineDeliver
   if (unseen.length === 0) {
     return;
   }
-  await onMessages(unseen, host);
-  deliveryTracker?.remember(unseen);
+  for (let index = 0; index < unseen.length; index += DIRECT_OFFLINE_DELIVERY_BATCH_SIZE) {
+    const batch = unseen.slice(index, index + DIRECT_OFFLINE_DELIVERY_BATCH_SIZE);
+    await onMessages(batch, host);
+    deliveryTracker?.remember(batch);
+  }
 }
 
 export function createDirectWebOfflineDeliveryTrackerForTest(maxEntries?: number) {
@@ -3191,6 +3315,7 @@ class DirectSession {
   private bootstrapPayloads: ApiResult[] = [];
   private pushDeliveryConfirmSerial = 6;
   private trackCodeGenerator: (() => string) | null = null;
+  private readonly nextEdgeRestCallType = createEdgeRestCallTypeSequencer();
   private resourceReleased = false;
 
   constructor(private runtime: DirectRuntimeConfig, private host: string) {
@@ -3199,8 +3324,8 @@ class DirectSession {
 
   async open(account: DirectSessionAccount) {
     await this.openPrelogin(account);
-    await this.startSocketKeepalive();
     await this.bootstrapAuthenticatedSession(account);
+    await this.startSocketKeepalive();
   }
 
   async openPush(account: DirectSessionAccount) {
@@ -3377,28 +3502,93 @@ class DirectSession {
     }
   }
 
-  async callCommonRestJson(label: string, apiName: string, query: string, timeoutMs = this.runtime.ioTimeoutMs) {
+  async callCommonRestJson(
+    label: string,
+    apiName: string,
+    query: string,
+    timeoutMs = this.runtime.ioTimeoutMs,
+    rpcContext?: Buffer,
+    onWriteStarted?: () => void
+  ) {
     const request = buildCommonRestRequestFrame({
       template: TEMPLATES.getPrivateNumber,
       session: this.sessionId,
       route: this.route,
       status: 0x0102,
       apiName,
-      query
+      query,
+      rpcContext
     });
 
     this.clearJsonQueue();
     this.beginJsonCapture(timeoutMs);
+    onWriteStarted?.();
     await this.write(request);
     return this.waitForJsonPayload(timeoutMs, `${label} JSON response`, (payload) => {
-      const expected = isExpectedCommonRestJsonPayload(apiName, payload);
-      return (
-        expected &&
-        (matchesExpectedTrackCode(payload, extractQueryParam(query, "TrackCode")) ||
-          hasStrongExpectedCommonRestShape(apiName, payload) ||
-          isActivationCommonRestResult(apiName, payload))
-      );
+      return acceptsCommonRestJsonPayload(apiName, query, payload);
     });
+  }
+
+  async callEdgeRestJson(label: string, apiName: string, query: string, timeoutMs = this.runtime.ioTimeoutMs) {
+    const restCallType = this.nextEdgeRestCallType();
+    const request = buildCommonRestRequestFrame({
+      template: TEMPLATES.getPrivateNumber,
+      session: this.sessionId,
+      route: this.route,
+      status: 0x0102,
+      apiName,
+      query,
+      rpcContext: encodeEdgeRestRpcContext(restCallType)
+    });
+
+    this.clearJsonQueue();
+    this.beginJsonCapture(timeoutMs);
+    dumpDirectDebugFrame(label, request);
+    await this.write(request);
+    return this.waitForJsonPayload(timeoutMs, `${label} JSON response`, isExpectedEdgeRestPayload);
+  }
+
+  async callEdgeOrderPrivateNumberJson(query: string, timeoutMs = this.runtime.ioTimeoutMs) {
+    const restCallType = this.nextEdgeRestCallType();
+    const request = buildCommonRestRequestFrame({
+      template: TEMPLATES.getPrivateNumber,
+      session: this.sessionId,
+      route: this.route,
+      status: 0x0102,
+      apiName: PHONE_PURCHASE_ORDER_EDGE_API_NAME,
+      query,
+      rpcContext: encodeEdgeRestRpcContext(restCallType)
+    });
+
+    this.clearJsonQueue();
+    this.beginJsonCapture(timeoutMs);
+    dumpDirectDebugFrame("phone purchase order", request);
+    await this.write(request);
+    return this.waitForJsonPayload(timeoutMs, "phone purchase order JSON response", isExpectedEdgeOrderPrivateNumberPayload);
+  }
+
+  async callOrderPrivateNumberJson(
+    query: string,
+    timeoutMs = this.runtime.ioTimeoutMs,
+    onWritten?: () => void,
+    options?: { commandTag?: number }
+  ) {
+    const request = buildCommonRestRequestFrame({
+      template: TEMPLATES.getPrivateNumber,
+      session: this.sessionId,
+      route: this.route,
+      status: 0x0102,
+      apiName: ORDER_PRIVATE_NUMBER_API_NAME,
+      query,
+      rpcContext: encodeOrderPrivateNumberRpcContext({ commandTag: options?.commandTag })
+    });
+
+    this.clearJsonQueue();
+    this.beginJsonCapture(timeoutMs);
+    dumpDirectDebugFrame("orderPrivateNumber", request);
+    onWritten?.();
+    await this.write(request);
+    return this.waitForJsonPayload(timeoutMs, "orderPrivateNumber JSON response", isExpectedOrderPrivateNumberPayload);
   }
 
   async callConfiguredActivationTemplate(
@@ -3804,7 +3994,11 @@ class DirectSession {
         parsed.status === 0x0103 ||
         (parsed.status === 0x0102 && Date.now() <= this.routeRegistrationCaptureUntil) ||
         this.rawWaiters.size > 0;
-      const shouldTraceFrame = shouldQueueRawFrame || Boolean(jsonPayload) || Boolean(process.env.DT_DIRECT_DEBUG_DUMP_DIR);
+      const shouldTraceFrame =
+        shouldQueueRawFrame ||
+        Boolean(jsonPayload) ||
+        (shouldExtractJsonPayload && !jsonPayload) ||
+        Boolean(process.env.DT_DIRECT_DEBUG_DUMP_DIR);
       if (!shouldTraceFrame) {
         processedFrames += 1;
         if (this.shouldYieldBufferedConsume(processedFrames)) {
@@ -4124,6 +4318,7 @@ class DirectSession {
 
   private async waitForJsonPayload(timeoutMs: number, label: string, predicate: (payload: ApiResult) => boolean = () => true) {
     const deadline = Date.now() + timeoutMs;
+    const captureStartedAt = new Date().toISOString();
     while (Date.now() < deadline) {
       const queuedIndex = this.jsonQueue.findIndex((payload) => predicate(payload));
       if (queuedIndex >= 0) {
@@ -4155,7 +4350,13 @@ class DirectSession {
       });
     }
 
-    throw new AppError(`Timed out waiting for ${label}`, 504, 504);
+    const traceWindowSummary = summarizeDirectTraceWindow(this.trace, captureStartedAt);
+    logger.warn("Timed out waiting for direct JSON response; dumping frames observed during capture window", {
+      host: this.host,
+      label,
+      traceWindowSummary
+    });
+    throw new AppError(`Timed out waiting for ${label}; ${traceWindowSummary}`, 504, 504);
   }
 
   private nextJsonPayload(timeoutMs: number, label: string) {
@@ -4263,6 +4464,12 @@ function isExpectedCommonRestJsonPayload(apiName: string, payload: ApiResult) {
   if (normalized.includes("pstn/share/getprivatenumber")) {
     return hasPhoneListPayload(payload) || hasErrCode(payload, 7001);
   }
+  if (normalized.includes("requestprivatenumber")) {
+    return hasPhoneListPayload(payload) || hasCommonRestFailure(payload);
+  }
+  if (normalized.includes("getnumberprice")) {
+    return hasPhonePricePayload(payload) || hasCommonRestFailure(payload);
+  }
   if (normalized.includes("getwebofflinemessage") || normalized.includes("getuserofflinemsg")) {
     return hasWebOfflineMessagePayload(payload) || hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]);
   }
@@ -4270,6 +4477,63 @@ function isExpectedCommonRestJsonPayload(apiName: string, payload: ApiResult) {
     return hasActivatedUserPayload(payload) || hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]);
   }
   return true;
+}
+
+function acceptsCommonRestJsonPayload(apiName: string, query: string, payload: ApiResult) {
+  return (
+    isExpectedCommonRestJsonPayload(apiName, payload) &&
+    (matchesExpectedTrackCode(payload, extractQueryParam(query, "TrackCode")) ||
+      hasStrongExpectedCommonRestShape(apiName, payload) ||
+      isActivationCommonRestResult(apiName, payload))
+  );
+}
+
+export function acceptsCommonRestJsonPayloadForTest(apiName: string, query: string, payload: ApiResult) {
+  return acceptsCommonRestJsonPayload(apiName, query, payload);
+}
+
+function isExpectedOrderPrivateNumberPayload(payload: ApiResult) {
+  return (
+    hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]) ||
+    hasNestedOwnKey(payload, "phoneNumber") ||
+    hasNestedOwnKey(payload, "payFlag") ||
+    hasNestedOwnKey(payload, "provision")
+  );
+}
+
+function isExpectedEdgeRestPayload(payload: ApiResult) {
+  return (
+    hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode", "code", "data", "Data", "success", "ok"]) ||
+    hasNestedOwnKey(payload, "errCode") ||
+    hasNestedOwnKey(payload, "data")
+  );
+}
+
+function isExpectedEdgeOrderPrivateNumberPayload(payload: ApiResult) {
+  const result = payload.Result ?? payload.result;
+  const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode ?? payload.code;
+  const success = payload.success ?? payload.ok;
+  const hasTypedOrderShape =
+    hasNestedOwnKey(payload, "phoneNumber") ||
+    hasNestedOwnKey(payload, "payFlag") ||
+    hasNestedOwnKey(payload, "payType") ||
+    hasNestedOwnKey(payload, "provision") ||
+    hasNestedOwnKey(payload, "expireTime") ||
+    hasNestedOwnKey(payload, "gainTime");
+  if (hasTypedOrderShape) {
+    return true;
+  }
+  return (
+    success === false ||
+    result === 0 ||
+    result === "0" ||
+    (errCode !== undefined && Number(errCode) !== 0) ||
+    hasAnyOwnKey(payload, ["Reason", "reason", "message", "error", "resultMsg", "result_msg"])
+  );
+}
+
+export function isExpectedEdgeOrderPrivateNumberPayloadForTest(payload: ApiResult) {
+  return isExpectedEdgeOrderPrivateNumberPayload(payload);
 }
 
 function isExpectedActivationPayload(label: string, payload: ApiResult) {
@@ -4326,6 +4590,12 @@ function hasStrongExpectedCommonRestShape(apiName: string, payload: ApiResult) {
   if (normalized.includes("pstn/share/getprivatenumber")) {
     return hasPhoneListPayload(payload);
   }
+  if (normalized.includes("requestprivatenumber")) {
+    return hasPhoneListPayload(payload) || hasCommonRestResult(payload);
+  }
+  if (normalized.includes("getnumberprice")) {
+    return hasPhonePricePayload(payload) || hasCommonRestResult(payload);
+  }
   if (normalized.includes("getwebofflinemessage") || normalized.includes("getuserofflinemsg")) {
     return hasWebOfflineMessagePayload(payload);
   }
@@ -4377,41 +4647,60 @@ export function normalizeDirectWebOfflineMessages(payload: unknown, appVariant?:
     const teamName =
       resolveDirectWebOfflineTeamName(messageType, title, originalSenderId, appVariant) ??
       (hasCreditMeta ? (appVariant === "dingdong" ? "叮咚团队" : "说道团队") : null);
-    if (!teamName) {
-      continue;
-    }
-    const body = commonEvent?.content ?? rawBody;
-    const plainContent = title && body && title !== body ? `${title}\n${body}` : title ?? body;
+    const body = commonEvent?.content ?? extractDirectOfflineMessageText(rawBody) ?? rawBody;
+    const plainContent = teamName && title && body && title !== body ? `${title}\n${body}` : body ?? title;
     const content = hasCreditMeta || (!plainContent && parsedMeta.raw)
       ? buildTeamMessageEnvelope({ title, body, meta: parsedMeta.raw })
       : plainContent;
-    if (!content) {
+    if (!content || (!teamName && !originalSenderId)) {
       continue;
     }
     const msgId = pickString(record, ["msgId", "messageId", "id"]) ?? null;
     const timestamp = pickNumber(record, ["msgTimeStamp", "timestamp", "time", "createdAt"]) ?? null;
     const meta = parsedMeta.raw ?? normalizeDirectWebOfflineMeta(record.msgMeta ?? record.meta ?? record.data2 ?? commonEvent?.args);
     const effectiveType = parsedMeta.k1 ?? messageType;
-    const dedupeKey = msgId ?? `${teamName}|${timestamp ?? ""}|${content}`;
+    const senderId = teamName ?? originalSenderId;
+    const conversationType = teamName
+      ? 4
+      : pickNumber(record, ["conversationType", "conversation_type", "convType", "chatType"]) ?? 1;
+    const conversationId = teamName
+      ? "10000"
+      : pickString(record, ["conversationId", "conversationID", "conversation_id", "chatId", "sessionId"]) ?? null;
+    const dedupeKey = msgId ?? `${senderId}|${conversationId ?? ""}|${timestamp ?? ""}|${content}`;
     if (seen.has(dedupeKey)) {
       continue;
     }
     seen.add(dedupeKey);
     rows.push({
-      conversationType: 4,
-      conversationId: "10000",
+      conversationType,
+      conversationId,
       type: effectiveType,
-      senderId: teamName,
+      senderId,
       msgId,
       content,
       timestamp,
-      isRead: 0,
-      data1: teamName,
+      isRead: pickNumber(record, ["isRead", "read", "readFlag"]) ?? 0,
+      data1: teamName ?? originalSenderId,
       data2: meta,
       data3: "direct-web-offline"
     });
   }
   return rows;
+}
+
+function extractDirectOfflineMessageText(value: string | null | undefined) {
+  if (!value?.trim()) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!isRecord(parsed)) {
+      return null;
+    }
+    return pickString(parsed, ["pushContent", "content", "msgContent", "message", "body", "text"]);
+  } catch {
+    return null;
+  }
 }
 
 function resolveDirectWebOfflineTeamName(
@@ -4420,7 +4709,7 @@ function resolveDirectWebOfflineTeamName(
   senderId: string | null | undefined,
   appVariant?: "dingtone" | "dingdong"
 ) {
-  if (messageType === 3300) {
+  if (messageType === 3300 || senderId === "2684354560") {
     return appVariant === "dingdong" ? "叮咚团队" : "说道团队";
   }
   for (const value of [title, senderId]) {
@@ -4485,7 +4774,23 @@ function collectDirectWebOfflineRecords(value: unknown, depth = 0): Record<strin
   if (!isRecord(value)) {
     return [];
   }
-  if (hasAnyOwnKey(value, ["msgContent", "msgId", "msgSenderID", "msgTimeStamp", "msgTitle"])) {
+  const hasMessageBody = hasAnyOwnKey(value, ["msgContent", "content", "message", "body", "text", "msgMeta", "data2"]);
+  const hasMessageIdentity = hasAnyOwnKey(value, [
+    "msgId",
+    "messageId",
+    "id",
+    "msgSenderID",
+    "msgSenderId",
+    "senderId",
+    "sender",
+    "from",
+    "msgType",
+    "type",
+    "msgTimeStamp",
+    "timestamp",
+    "conversationId"
+  ]);
+  if (hasMessageBody && hasMessageIdentity) {
     return [value];
   }
 
@@ -4832,6 +5137,7 @@ function buildCommonRestRequestFrame(input: {
   status: number;
   apiName: string;
   query: string;
+  rpcContext?: Buffer;
 }) {
   const { body: templateBody } = getDirectTemplateBody(input.template);
   const zlibOffset = findZlibOffset(templateBody);
@@ -4852,8 +5158,12 @@ function buildCommonRestRequestFrame(input: {
     input.apiName,
     compressed.length
   );
+  const routedPrefix = replaceRouteBytes(prefix, input.route);
+  const requestPrefix = input.rpcContext
+    ? patchProxyRestRequestContext(routedPrefix, input.rpcContext)
+    : routedPrefix;
   const body = Buffer.concat([
-    replaceRouteBytes(prefix, input.route),
+    requestPrefix,
     u32be(Buffer.byteLength(input.query, "utf8")),
     u32be(compressed.length),
     compressed,
@@ -4861,6 +5171,104 @@ function buildCommonRestRequestFrame(input: {
   ]);
 
   return encodeFrame(input.session, input.status, body);
+}
+
+export function buildOrderPrivateNumberRequestFrameForTest(input: {
+  session: Buffer;
+  route: Buffer;
+  query: string;
+  commandTag?: number;
+}) {
+  return buildCommonRestRequestFrame({
+    template: TEMPLATES.getPrivateNumber,
+    session: input.session,
+    route: input.route,
+    status: 0x0102,
+    apiName: ORDER_PRIVATE_NUMBER_API_NAME,
+    query: input.query,
+    rpcContext: encodeOrderPrivateNumberRpcContext({ commandTag: input.commandTag })
+  });
+}
+
+export function buildRequestPrivateNumberRequestFrameForTest(input: {
+  session: Buffer;
+  route: Buffer;
+  query: string;
+}) {
+  return buildCommonRestRequestFrame({
+    template: TEMPLATES.getPrivateNumber,
+    session: input.session,
+    route: input.route,
+    status: 0x0102,
+    apiName: "/pstn/share/requestPrivateNumber",
+    query: input.query,
+    rpcContext: encodeRequestPrivateNumberRpcContext()
+  });
+}
+
+export function buildPhonePurchaseLockRequestFrameForTest(input: {
+  session: Buffer;
+  route: Buffer;
+  query: string;
+}) {
+  return buildCommonRestRequestFrame({
+    template: TEMPLATES.getPrivateNumber,
+    session: input.session,
+    route: input.route,
+    status: 0x0102,
+    apiName: PHONE_PURCHASE_LOCK_API_NAME,
+    query: input.query,
+    rpcContext: encodeEdgeRestRpcContext(PHONE_PURCHASE_LOCK_REST_CALL_TYPE)
+  });
+}
+
+export function buildEdgeOrderPrivateNumberRequestFrameForTest(input: {
+  session: Buffer;
+  route: Buffer;
+  query: string;
+  restCallType?: number;
+}) {
+  return buildCommonRestRequestFrame({
+    template: TEMPLATES.getPrivateNumber,
+    session: input.session,
+    route: input.route,
+    status: 0x0102,
+    apiName: PHONE_PURCHASE_ORDER_EDGE_API_NAME,
+    query: input.query,
+    rpcContext: encodeEdgeRestRpcContext(input.restCallType ?? PHONE_PURCHASE_ORDER_REST_CALL_TYPE)
+  });
+}
+
+function createEdgeRestCallTypeSequencer() {
+  let index = 0;
+  return () => {
+    const value = PHONE_PURCHASE_EDGE_REST_CALL_TYPES[index % PHONE_PURCHASE_EDGE_REST_CALL_TYPES.length]!;
+    index += 1;
+    return value;
+  };
+}
+
+export function nextEdgeRestCallTypesForTest(count: number) {
+  const next = createEdgeRestCallTypeSequencer();
+  return Array.from({ length: count }, () => next());
+}
+
+function encodeRequestPrivateNumberRpcContext() {
+  return Buffer.from("0000000000000001", "hex");
+}
+
+function encodeEdgeRestRpcContext(restCallType: number, commandCookie = 0) {
+  if (!Number.isInteger(restCallType) || restCallType < 0 || restCallType > 0xffff) {
+    throw new RangeError("restCallType must be an unsigned 16-bit integer");
+  }
+  if (!Number.isInteger(commandCookie) || commandCookie < 0 || commandCookie > 0xffff_ffff) {
+    throw new RangeError("commandCookie must be an unsigned 32-bit integer");
+  }
+  const encoded = Buffer.alloc(8);
+  encoded.writeUInt32BE(commandCookie, 0);
+  encoded.writeUInt16BE(restCallType, 4);
+  encoded.writeUInt16BE(0x0101, 6);
+  return encoded;
 }
 
 function replaceCommonRestApiName(prefix: Buffer, apiName: string) {
@@ -4959,6 +5367,36 @@ function directTrackCodesMatch(actual: unknown, expected: string) {
     return Number.isFinite(numericExpected) && actual === numericExpected;
   }
   return false;
+}
+
+function hasCommonRestResult(payload: ApiResult) {
+  return hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]);
+}
+
+function hasCommonRestFailure(payload: ApiResult) {
+  const result = payload.Result ?? payload.result;
+  if (result !== undefined && Number(result) !== 1) {
+    return true;
+  }
+  const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode;
+  return errCode !== undefined && Number(errCode) !== 0;
+}
+
+function hasPhonePricePayload(payload: ApiResult) {
+  return [
+    "orderPrice",
+    "order_price",
+    "price",
+    "creditPrice",
+    "credit_price",
+    "payAmount",
+    "pay_amount",
+    "amount",
+    "needPay",
+    "need_pay",
+    "totalPrice",
+    "total_price"
+  ].some((key) => hasNestedOwnKey(payload, key));
 }
 
 function findDirectBootstrapError(payloads: unknown[], expectedTrackCode: string) {
@@ -5394,13 +5832,14 @@ function buildRequestPrivateNumberQuery(
   trackCode: string,
   options: PrivatePhoneRequestQueryOptions = {}
 ) {
+  const appVersion = resolveDirectAppVersion(account, runtime);
   const providerKey = options.providerKey ?? "providerList";
   const providerIdList = options.providerIdList?.length ? options.providerIdList : requestConfig.providerIdList;
   const query = [
     queryPair("countryCode", requestConfig.countryCode),
-    queryPair(providerKey, providerIdList.join(",")),
+    queryPair(providerKey, providerIdList.length > 0 ? providerIdList.join(",") : "null"),
     queryPair("isoCountryCode", requestConfig.isoCountryCode),
-    queryPair("clientversion", runtime.appVersion),
+    queryPair("clientversion", appVersion),
     queryPair("supportCA", 1),
     queryPair("useStateCity", 0),
     queryPair("apiVersion", options.apiVersion ?? 5),
@@ -5767,42 +6206,78 @@ function buildRequestPrivateNumberQueryAttempts(
   nextTrackCode: () => string,
   requestedAreaCode?: number | null
 ) {
-  const areaCodes = resolvePreviewAreaCodeAttempts(requestConfig, requestedAreaCode);
-  const baseVariants: PrivatePhoneRequestQueryOptions[] = [
-    { apiVersion: 1, providerKey: "providerList", includeAppContext: true, includeZeroAreaCode: true, includeAppRequestFields: true },
-    { apiVersion: 1, providerKey: "providerIdList", includeAppContext: true, includeZeroAreaCode: true, includeAppRequestFields: true },
-    { apiVersion: 5, providerKey: "providerList", includeAppContext: false, leadingAmpersand: true },
-    { apiVersion: 5, providerKey: "providerList", includeAppContext: true, includeZeroAreaCode: true },
-    { apiVersion: 5, providerKey: "providerList", includeAppContext: true },
-    { apiVersion: 0, providerKey: "providerList", includeAppContext: true },
-    { apiVersion: 0, providerKey: "providerIdList", includeAppContext: true },
-    { apiVersion: 1, providerKey: "providerList", includeAppContext: true },
-    { apiVersion: 5, providerKey: "providerList", includeAppContext: false },
-    { apiVersion: 5, providerKey: "providerIdList", includeAppContext: false, leadingAmpersand: true }
+  const trackCode = nextTrackCode();
+  const [effectiveAreaCode] = resolvePreviewAreaCodeAttempts(requestConfig, requestedAreaCode);
+  const apiParams = buildRequestPrivateNumberQuery(account, runtime, requestConfig, trackCode, {
+    apiVersion: 5,
+    providerKey: "providerList",
+    includeAppContext: false,
+    leadingAmpersand: true,
+    areaCode: effectiveAreaCode
+  });
+  return [
+    buildAuthenticatedCommonRestQuery(account, runtime, trackCode, apiParams)
   ];
-  const singleProviderVariants = requestConfig.providerIdList.flatMap((providerId) => [
-    { apiVersion: 1, providerKey: "providerList" as const, providerIdList: [providerId], includeAppContext: true, includeZeroAreaCode: true, includeAppRequestFields: true },
-    { apiVersion: 5, providerKey: "providerList" as const, providerIdList: [providerId], includeAppContext: false, leadingAmpersand: true },
-    { apiVersion: 5, providerKey: "providerList" as const, providerIdList: [providerId], includeAppContext: true },
-    { apiVersion: 5, providerKey: "providerIdList" as const, providerIdList: [providerId], includeAppContext: true },
-    { apiVersion: 0, providerKey: "providerList" as const, providerIdList: [providerId], includeAppContext: true }
-  ]);
-  const variants = [...baseVariants, ...singleProviderVariants];
-  const queries: string[] = [];
-  const seen = new Set<string>();
-  for (const areaCode of areaCodes) {
-    for (const variant of variants) {
-      const query = buildRequestPrivateNumberQuery(account, runtime, requestConfig, nextTrackCode(), {
-        ...variant,
-        areaCode
-      });
-      if (!seen.has(query)) {
-        seen.add(query);
-        queries.push(query);
-      }
-    }
+}
+
+function buildAuthenticatedCommonRestQuery(
+  account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+  runtime: DirectRuntimeConfig,
+  trackCode: string,
+  apiParams: string
+) {
+  let nativeApiParams = apiParams.replace("&apkCertificateSign=", "&forgeCertificateSign=");
+  if (!nativeApiParams.includes("&appVersion=")) {
+    nativeApiParams += `&${queryPair("appVersion", resolveDirectAppVersion(account, runtime))}`;
   }
-  return queries;
+  nativeApiParams += `&${queryPair(
+    "apkCertificateSign",
+    resolveDirectApiApkCertificateSign(account, runtime.apkCertificateSign)
+  )}`;
+
+  return [
+    queryPair("deviceId", accountDeviceId(account)),
+    queryPair("TrackCode", trackCode)
+  ].join("&") +
+    `&${nativeApiParams}` +
+    `&${queryPair("userId", account.dtUserId)}` +
+    `&${queryPair("token", account.token)}`;
+}
+
+export function buildRequestPrivateNumberQueriesForTest(input: {
+  countryCode: number;
+  isoCountryCode?: string | null;
+  countryKey?: string | null;
+  areaCode?: number | null;
+  appVersion?: string;
+}) {
+  const runtime: DirectRuntimeConfig = {
+    primaryHost: "127.0.0.1",
+    backupHost: "127.0.0.1",
+    port: 443,
+    registerEmailPort: 443,
+    connectTimeoutMs: 1_000,
+    ioTimeoutMs: 1_000,
+    useTls: false,
+    registerEmailUseTls: false,
+    appVersion: input.appVersion ?? "6.3.1",
+    dingdongAppVersion: input.appVersion ?? "6.3.1",
+    apkCertificateSign: "",
+    proxyUrl: ""
+  };
+  const account = {
+    dtUserId: "test-user",
+    token: "test-token",
+    deviceId: "And.test.dttalk",
+    appVariant: "dingtone" as const
+  };
+  return buildRequestPrivateNumberQueryAttempts(
+    account,
+    runtime,
+    resolvePrivatePhoneRequestConfig(input.countryCode, input.isoCountryCode, input.countryKey),
+    () => "40051185300000003",
+    input.areaCode
+  );
 }
 
 function resolvePreviewAreaCodeAttempts(requestConfig: PrivatePhoneRequestConfig, requestedAreaCode?: number | null) {
@@ -5943,7 +6418,13 @@ function redactSecret(value: string) {
 function buildOrderPrivateNumberQuery(
   account: { dtUserId: string; token: string; deviceId?: string | null },
   phone: DirectPhoneActionContext,
-  options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null; payFlag: number }
+  options: {
+    countryCode?: number;
+    isoCountryCode?: string | null;
+    countryKey?: string | null;
+    payFlag: number;
+    extraChargeMonthsCount?: number;
+  }
 ) {
   const raw = collectPhoneActionRecords(phone);
   const candidateCountryCode = options.countryCode ?? pickPhoneNumber(phone, raw, ["countryCode", "country_code"]) ?? 1;
@@ -5958,7 +6439,7 @@ function buildOrderPrivateNumberQuery(
     requestConfig
   });
   const phoneType =
-    pickPhoneNumber(phone, raw, ["phoneType", "phone_type", "payType", "pay_type", "purchaseType", "purchase_type"]) ?? 2;
+    pickPhoneNumber(phone, raw, ["phoneType", "phone_type", "type", "payType", "pay_type", "purchaseType", "purchase_type"]) ?? 2;
   const providerId = pickPhoneNumber(phone, raw, ["providerId", "provider_id", "reserved3"]) ?? resolveDefaultProviderId(countryCode, isoCountryCode, countryKey);
   const packageServiceId =
     pickPhoneString(phone, raw, ["packageServiceId", "package_service_id", "reserved4"]) ??
@@ -5971,8 +6452,11 @@ function buildOrderPrivateNumberQuery(
       : pickPhoneNumber(phone, raw, ["category", "specialNumberType", "special_number_type", "purchaseType", "purchase_type"]) ?? 0;
   const orderPhoneType = resolveOrderPrivateNumberType(options.payFlag, phone.status, phoneType);
   const orderPhoneNumber = stripPhonePrefix(phone.phoneNumber ?? "");
-  const productId = pickPhoneString(phone, raw, ["productId", "product_id"]);
-  const simCountryCode = pickPhoneString(phone, raw, ["simCC", "sim_cc"]);
+  const coupon = pickPhoneString(phone, raw, ["coupon"]) ?? "";
+  const callPlanId = pickPhoneNumber(phone, raw, ["callPlanId", "callplanId", "call_plan_id"]) ?? 0;
+  const formerPhoneNumber = pickPhoneString(phone, raw, ["formerPhoneNumber", "former_phone_number", "oldPhoneNum", "old_phone_num"]);
+  const simCountryCode = pickPhoneString(phone, raw, ["simCC", "sim_cc"]) ?? "";
+  const extraChargeMonthsCount = options.extraChargeMonthsCount ?? pickPhoneNumber(phone, raw, ["extraChargeMonthsCount", "extra_charge_months_count"]) ?? 0;
 
   const query = [
     queryPair("token", account.token),
@@ -5984,34 +6468,129 @@ function buildOrderPrivateNumberQuery(
     queryPair("type", orderPhoneType),
     queryPair("payFlag", options.payFlag),
     queryPair("payYears", 1),
+    queryPair("coupon", coupon),
     queryPair("specialNumber", specialNumber),
-    ...(options.payFlag === 2 ? [] : [queryPair("coupon", "")]),
-    ...(options.payFlag === 2 ? [] : [queryPair("callplanId", pickPhoneNumber(phone, raw, ["callPlanId", "callplanId", "call_plan_id"]) ?? 0)]),
-    ...(options.payFlag === 2 ? [] : [queryPair("oldPhoneNum", "")]),
+    queryPair("callplanId", callPlanId),
+    ...(formerPhoneNumber ? [queryPair("oldPhoneNum", formerPhoneNumber)] : []),
     queryPair("providerId", providerId),
     queryPair("packageServiceId", packageServiceId),
-    ...(simCountryCode ? [queryPair("simCC", simCountryCode)] : []),
+    queryPair("simCC", simCountryCode),
     queryPair("simu", pickPhoneBoolean(phone, raw, ["isSimulator", "simulator", "simu"]) ? 1 : 0),
-    queryPair("apiVersion", options.payFlag === 2 ? 3 : 4),
-    "buyCredit=1",
-    ...(options.payFlag === 2 && productId ? [queryPair("productId", productId)] : [])
+    ...(formerPhoneNumber ? [] : [queryPair("extraChargeMonthsCount", extraChargeMonthsCount)]),
+    queryPair("apiVersion", 4),
+    "buyCredit=1"
   ];
   return query.join("&");
+}
+
+function buildPhonePurchaseLockQuery(
+  phone: DirectPhoneActionContext,
+  options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null }
+) {
+  const raw = collectPhoneActionRecords(phone);
+  const candidateCountryCode = options.countryCode ?? pickPhoneNumber(phone, raw, ["countryCode", "country_code"]) ?? 1;
+  const isoCountryCode = options.isoCountryCode ?? pickPhoneString(phone, raw, ["isoCountryCode", "iso_country_code", "isoCC", "iso_cc"]);
+  const countryKey = options.countryKey ?? pickPhoneString(phone, raw, ["countryKey", "country_key"]);
+  const requestConfig = resolvePrivatePhoneRequestConfig(candidateCountryCode, isoCountryCode, countryKey);
+  const providerId = pickPhoneNumber(phone, raw, ["providerId", "provider_id", "reserved3"]) ?? resolveDefaultProviderId(
+    requestConfig.countryCode,
+    requestConfig.isoCountryCode,
+    requestConfig.countryKey
+  );
+  return [
+    queryPair("phoneNumber", stripPhonePrefix(phone.phoneNumber ?? "")),
+    queryPair("countryCode", requestConfig.countryCode),
+    queryPair("providerId", providerId)
+  ].join("&");
+}
+
+function buildEdgeOrderPrivateNumberQuery(
+  phone: DirectPhoneActionContext,
+  options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null }
+) {
+  const raw = collectPhoneActionRecords(phone);
+  const candidateCountryCode = options.countryCode ?? pickPhoneNumber(phone, raw, ["countryCode", "country_code"]) ?? 1;
+  const isoCountryCode = options.isoCountryCode ?? pickPhoneString(phone, raw, ["isoCountryCode", "iso_country_code", "isoCC", "iso_cc"]);
+  const countryKey = options.countryKey ?? pickPhoneString(phone, raw, ["countryKey", "country_key"]);
+  const requestConfig = resolvePrivatePhoneRequestConfig(candidateCountryCode, isoCountryCode, countryKey);
+  const countryCode = requestConfig.countryCode;
+  const areaCode = resolvePhoneActionAreaCode(phone, {
+    countryCode,
+    isoCountryCode,
+    countryKey,
+    requestConfig
+  });
+  const phoneType =
+    pickPhoneNumber(phone, raw, ["phoneType", "phone_type", "type", "payType", "pay_type", "purchaseType", "purchase_type"]) ?? 2;
+  const providerId = pickPhoneNumber(phone, raw, ["providerId", "provider_id", "reserved3"]) ?? resolveDefaultProviderId(countryCode, isoCountryCode, countryKey);
+  const packageServiceId =
+    pickPhoneString(phone, raw, ["packageServiceId", "package_service_id", "reserved4"]) ??
+    requestConfig.packageServiceId ??
+    resolvePackageServiceId(countryCode, providerId, isoCountryCode, countryKey);
+  const specialNumber = pickPhoneNumber(phone, raw, ["category", "specialNumberType", "special_number_type", "purchaseType", "purchase_type"]) ?? 0;
+  const productId = pickPhoneString(phone, raw, ["productId", "product_id"]);
+  if (!productId) {
+    throw new AppError("Phone purchase candidate is missing productId from the App price quote.", 400, 400);
+  }
+  const simCountryCode = pickPhoneString(phone, raw, ["simCC", "sim_cc"]) ?? "CN";
+  return [
+    queryPair("countryCode", countryCode),
+    queryPair("areaCode", areaCode),
+    queryPair("phoneNumber", stripPhonePrefix(phone.phoneNumber ?? "")),
+    queryPair("type", phoneType),
+    queryPair("payFlag", 2),
+    queryPair("payYears", 1),
+    queryPair("specialNumber", specialNumber),
+    queryPair("packageServiceId", packageServiceId),
+    queryPair("providerId", providerId),
+    queryPair("simCC", simCountryCode),
+    queryPair("simu", pickPhoneBoolean(phone, raw, ["isSimulator", "simulator", "simu"]) ? 1 : 0),
+    queryPair("apiVersion", 3),
+    "buyCredit=1",
+    queryPair("productId", productId)
+  ].join("&");
 }
 
 function buildOrderPrivateNumberQueryAttempts(
   account: { dtUserId: string; token: string; deviceId?: string | null },
   phone: DirectPhoneActionContext,
-  options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null; payFlag: number }
+  options: {
+    countryCode?: number;
+    isoCountryCode?: string | null;
+    countryKey?: string | null;
+    payFlag: number;
+    extraChargeMonthsCount?: number;
+  }
 ) {
-  const base = buildOrderPrivateNumberQuery(account, phone, options);
-  const params = new URLSearchParams(base);
-  const appShape = new URLSearchParams(params);
-  appShape.delete("apiVersion");
-  const nativeShape = new URLSearchParams(params);
-  nativeShape.set("privateNumber", params.get("phoneNumber") ?? stripPhonePrefix(phone.phoneNumber ?? ""));
-  const leadingAmpersand = `&${appShape.toString()}`;
-  return uniqueStrings([base, appShape.toString(), nativeShape.toString(), leadingAmpersand]);
+  return [buildOrderPrivateNumberQuery(account, phone, options)];
+}
+
+export function buildOrderPrivateNumberQueriesForTest(input: {
+  account: { dtUserId: string; token: string; deviceId?: string | null };
+  phone: DirectPhoneActionContext;
+  options: {
+    countryCode?: number;
+    isoCountryCode?: string | null;
+    countryKey?: string | null;
+    payFlag: number;
+    extraChargeMonthsCount?: number;
+  };
+}) {
+  return buildOrderPrivateNumberQueryAttempts(input.account, input.phone, input.options);
+}
+
+export function buildPhonePurchaseLockQueryForTest(input: {
+  phone: DirectPhoneActionContext;
+  options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null };
+}) {
+  return buildPhonePurchaseLockQuery(input.phone, input.options);
+}
+
+export function buildEdgeOrderPrivateNumberQueryForTest(input: {
+  phone: DirectPhoneActionContext;
+  options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null };
+}) {
+  return buildEdgeOrderPrivateNumberQuery(input.phone, input.options);
 }
 
 function uniqueStrings(values: string[]) {
@@ -6045,7 +6624,7 @@ function resolveRenewSpecialNumberType(payType: number | undefined) {
 }
 
 function buildDeletePrivateNumberQuery(
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: DirectSessionAccount,
   phoneNumber: string
 ) {
   const strippedPhoneNumber = stripPhonePrefix(phoneNumber);
@@ -6059,7 +6638,7 @@ function buildDeletePrivateNumberQuery(
 }
 
 function buildReactivateGoogleVoiceNumberQuery(
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: DirectSessionAccount,
   phoneNumber: string
 ) {
   return [
@@ -6071,11 +6650,11 @@ function buildReactivateGoogleVoiceNumberQuery(
 }
 
 function buildPrivateNumberSettingQuery(
-  account: { dtUserId: string; token: string; deviceId?: string | null },
+  account: DirectSessionAccount,
   phone: DirectPhoneActionContext,
-  suspendFlag: 0 | 1
+  patch: PrivateNumberSettingPatch
 ) {
-  const setting = buildPrivateNumberSettingJson(phone, suspendFlag);
+  const setting = buildPrivateNumberSettingJson(phone, patch);
   return [
     queryPair("token", account.token),
     queryPair("deviceId", accountDeviceId(account)),
@@ -6084,55 +6663,8 @@ function buildPrivateNumberSettingQuery(
   ].join("&");
 }
 
-export function buildPrivateNumberSettingJson(phone: DirectPhoneActionContext, suspendFlag: 0 | 1) {
-  const raw = collectPhoneActionRecords(phone);
-  const slientFlag = pickPhoneBoolean(phone, raw, ["slientFlag", "silentFlag", "slient_flag", "silent_flag"]);
-  const isSuspending = suspendFlag === 1;
-  const primaryFlag = isSuspending ? false : (pickPhoneBoolean(phone, raw, ["isPrimary", "primaryFlag", "primary_flag"]) ?? true);
-  const callForwardFlag = pickPhoneBoolean(phone, raw, ["callForwardFlag", "call_forward_flag"]);
-  const autoRenew = pickPhoneBoolean(phone, raw, ["autoRenew", "auto_renew"]) ?? true;
-  const filterSetting = {
-    ...parsePrivateNumberFilterSetting(pickPhoneValue(phone, raw, ["filterSetting", "filter_setting"])),
-    allowReceiveSMS: true
-  };
-  return {
-    phoneNumber: stripPhonePrefix(phone.phoneNumber ?? pickPhoneString(phone, raw, ["phoneNumber", "phone_number"]) ?? ""),
-    displayName: phone.displayName ?? pickPhoneString(phone, raw, ["displayName", "display_name"]) ?? "",
-    primaryFlag: booleanFlagNumber(primaryFlag),
-    faxEnabled: pickPhoneNumber(phone, raw, ["faxEnabled", "fax_enabled"]) ?? 0,
-    slientFlag: booleanFlagNumber(slientFlag),
-    suspendFlag,
-    callForwardFlag: booleanFlagNumber(callForwardFlag),
-    forwardNumber: pickPhoneString(phone, raw, ["forwardNumber", "forward_number"]) ?? "",
-    forwardCountryCode: pickPhoneNumber(phone, raw, ["forwardCountryCode", "forward_country_code"]) ?? 0,
-    forwardDestCode: pickPhoneNumber(phone, raw, ["forwardDestCode", "forward_dest_code"]) ?? 0,
-    autoSMSReply: pickPhoneNumber(phone, raw, ["autoSMSReply", "auto_sms_reply"]) ?? 0,
-    useVoicemail: pickPhoneNumber(phone, raw, ["useVoicemail", "use_voicemail"]) ?? 0,
-    voicemailId: pickPhoneString(phone, raw, ["voicemailId", "voicemail_id"]) ?? "",
-    autoSMSContent: pickPhoneString(phone, raw, ["autoSMSContent", "auto_sms_content"]) ?? "",
-    defaultGreetings: pickPhoneNumber(phone, raw, ["defaultGreetings", "default_greetings"]) ?? 0,
-    autoRenew: autoRenew ? 1 : 0,
-    filterSetting
-  };
-}
-
-function booleanFlagNumber(value: boolean | undefined) {
-  return value ? 1 : 0;
-}
-
-function parsePrivateNumberFilterSetting(value: unknown) {
-  if (isRecord(value)) {
-    return value;
-  }
-  if (typeof value !== "string" || !value.trim()) {
-    return {};
-  }
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return isRecord(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
+export function buildPrivateNumberSettingJson(phone: DirectPhoneActionContext, patch: PrivateNumberSettingPatch) {
+  return buildPrivateNumberSettingPayload(phone as unknown as Record<string, unknown>, patch);
 }
 
 function buildPhoneTemplateParams(phone: DirectPhoneActionContext, extraParams: DirectTemplateParams): DirectTemplateParams {
@@ -6143,7 +6675,7 @@ function buildPhoneTemplateParams(phone: DirectPhoneActionContext, extraParams: 
     providerId: pickPhoneNumber(phone, raw, ["providerId", "provider_id", "reserved3"]),
     packageServiceId: pickPhoneString(phone, raw, ["packageServiceId", "package_service_id", "reserved4"]),
     category: pickPhoneNumber(phone, raw, ["category", "specialNumberType", "special_number_type", "purchaseType", "purchase_type"]),
-    phoneType: pickPhoneNumber(phone, raw, ["phoneType", "phone_type", "payType", "pay_type"]),
+    phoneType: pickPhoneNumber(phone, raw, ["phoneType", "phone_type", "type", "payType", "pay_type"]),
     displayName: pickPhoneString(phone, raw, ["displayName", "display_name"]),
     autoRenew: pickPhoneBoolean(phone, raw, ["autoRenew", "auto_renew"]) ? 1 : 0,
     ...extraParams
@@ -6309,11 +6841,11 @@ function resolvePrivatePhoneRequestConfig(countryCode?: number, isoCountryCode?:
   }
   return (
     {
-      countryKey: resolveIsoCountryCode(normalized),
+      countryKey: normalizedIso ?? normalizedKey ?? resolveIsoCountryCode(normalized),
       label: `+${normalized}`,
       countryCode: normalized,
-      isoCountryCode: resolveIsoCountryCode(normalized),
-      providerIdList: ["2000"]
+      isoCountryCode: normalizedIso ?? normalizedKey ?? resolveIsoCountryCode(normalized),
+      providerIdList: []
     }
   );
 }
@@ -6326,12 +6858,20 @@ function resolveIsoCountryCode(countryCode: number) {
     32: "BE",
     33: "FR",
     34: "ES",
+    36: "HU",
+    39: "IT",
     40: "RO",
+    41: "CH",
     43: "AT",
     44: "GB",
     45: "DK",
     46: "SE",
+    47: "NO",
     48: "PL",
+    52: "MX",
+    55: "BR",
+    56: "CL",
+    57: "CO",
     60: "MY",
     61: "AU",
     62: "ID",
@@ -6340,9 +6880,12 @@ function resolveIsoCountryCode(countryCode: number) {
     82: "KR",
     86: "CN",
     230: "MU",
+    358: "FI",
+    370: "LT",
     420: "CZ",
     852: "HK",
     886: "TW",
+    972: "IL",
     1787: "PR"
   };
   return mapping[countryCode] ?? "US";
@@ -7192,6 +7735,7 @@ function frameToDirectFrameSummary(frame: ParsedFrame): DirectProbePushResult {
 }
 
 function frameToDirectPush(frame: ParsedFrame): DirectProbePushResult {
+  const sms = tryParseSmsPush(frame.raw) ?? tryParseSmsPush(frame.body);
   return {
     receivedAt: new Date().toISOString(),
     frameType: frame.type,
@@ -7202,8 +7746,8 @@ function frameToDirectPush(frame: ParsedFrame): DirectProbePushResult {
     bodyHex: frame.body.toString("hex"),
     rawHexPreview: frame.raw.subarray(0, 160).toString("hex"),
     bodyHexPreview: frame.body.subarray(0, 160).toString("hex"),
-    jsonPayload: null,
-    sms: tryParseSmsPush(frame.raw) ?? tryParseSmsPush(frame.body)
+    jsonPayload: sms ? null : extractJsonPayload(frame.raw),
+    sms
   };
 }
 
@@ -7258,6 +7802,29 @@ function summarizeJsonPayload(payload: ApiResult | null | undefined) {
     return text;
   }
   return `${text.slice(0, 600)}...`;
+}
+
+function summarizeDirectTraceEntry(entry: DirectProbeFrameTrace) {
+  const typeHex = `0x${entry.frameType.toString(16)}`;
+  const statusHex = entry.status !== undefined ? `0x${entry.status.toString(16)}` : "undefined";
+  if (entry.jsonPayload) {
+    return `type=${typeHex} status=${statusHex} len=${entry.rawLength} json=${summarizeJsonPayload(entry.jsonPayload)}`;
+  }
+  return `type=${typeHex} status=${statusHex} len=${entry.rawLength} rawHex=${entry.rawHexPreview.slice(0, 80)}`;
+}
+
+function summarizeDirectTraceWindow(trace: DirectProbeFrameTrace[], sinceIso: string, limit = 6) {
+  const windowEntries = trace.filter((entry) => entry.receivedAt >= sinceIso);
+  if (windowEntries.length === 0) {
+    return "no frames observed during capture window";
+  }
+  const shown = windowEntries.slice(-limit).map(summarizeDirectTraceEntry);
+  const omitted = windowEntries.length - shown.length;
+  return `${windowEntries.length} frame(s) observed${omitted > 0 ? ` (showing last ${shown.length})` : ""}: ${shown.join(" | ")}`;
+}
+
+export function summarizeDirectTraceWindowForTest(trace: DirectProbeFrameTrace[], sinceIso: string, limit?: number) {
+  return summarizeDirectTraceWindow(trace, sinceIso, limit);
 }
 
 function redactJsonPayload(value: unknown): unknown {
@@ -7354,53 +7921,37 @@ function findZlibOffsets(buffer: Buffer) {
   return offsets;
 }
 
-const APP_PHONE_COUNTRY_LABELS: Record<string, string> = {
-  US: "缂傚洤楠稿ù?+1",
-  CA: "闁告梻濮电€ｄ焦寰?+1",
-  GB: "闁艰宕ù?+44",
-  BE: "婵絾鏌ㄩ崺鍕籍?+32",
-  NL: "闁艰棄鍢查崣?+31",
-  RU: "濞ｅ洤瀚紞蹇涘棘?+7",
-  ES: "閻熸娉曡ぐ顕€鎮?+34",
-  CN: "濞戞搩鍘煎ù?+86",
-  AU: "婵犮垹鍟块妵鍥礆閳衡偓缁?+61",
-  AT: "濠靛倶鍎卞﹢鎾礆?+43",
-  FR: "婵炲娲栧ù?+33",
-  SE: "闁荤喓鍋涢崥鈧?+46",
-  MU: "婵絾鐩崳宄靶ч崒娑欑効 +230",
-  PL: "婵炲鍨归崣?+48",
-  ID: "闁告婢樼€瑰磭浜搁懝鑸仾濞?+62",
-  PR: "婵炲鍨归ˇ鎸庮渶鎼粹剝鍊?+1787",
-  CZ: "闁圭懓鍢查崢?+420",
-  MY: "濡炶鍓氬鐢垫啿婢跺摜鑲?+60",
-  DK: "濞戞挸缍婄€?+45",
-  RO: "缂傚啯顨婇埞鍫焊闂傚鑲?+40"
-};
 
 const APP_PHONE_COUNTRY_DISPLAY_NAMES: Record<string, string> = {
-  US: 'US',
-  CA: 'CA',
-  GB: 'GB',
-  BE: 'BE',
-  NL: 'NL',
-  RU: 'RU',
-  ES: 'ES',
-  CN: 'CN',
-  AU: 'AU',
-  AT: 'AT',
-  FR: 'FR',
-  SE: 'SE',
-  MU: 'MU',
-  PL: 'PL',
-  ID: 'ID',
-  PR: 'PR',
-  CZ: 'CZ',
-  MY: 'MY',
-  DK: 'DK',
-  RO: 'RO'
+  AT: "奥地利",
+  AU: "澳大利亚",
+  BR: "巴西",
+  BE: "比利时",
+  PR: "波多黎各",
+  PL: "波兰",
+  DK: "丹麦",
+  FR: "法国",
+  FI: "芬兰",
+  CO: "哥伦比亚",
+  NL: "荷兰",
+  CA: "加拿大",
+  CZ: "捷克共和国",
+  LT: "立陶宛",
+  RO: "罗马尼亚",
+  US: "美国",
+  MX: "墨西哥",
+  NO: "挪威",
+  SE: "瑞典",
+  CH: "瑞士",
+  ES: "西班牙",
+  HU: "匈牙利",
+  IL: "以色列",
+  IT: "意大利",
+  GB: "英国",
+  CL: "智利"
 };
 
-function staticPhoneCountryOptions(): DingtonePhoneCountryOption[] {
+export function staticPhoneCountryOptions(): DingtonePhoneCountryOption[] {
   return APP_PHONE_COUNTRY_CONFIGS.map((item) => ({
     countryKey: item.countryKey,
     label: `${APP_PHONE_COUNTRY_DISPLAY_NAMES[item.countryKey] ?? item.label} +${item.countryCode}`,
@@ -7411,7 +7962,7 @@ function staticPhoneCountryOptions(): DingtonePhoneCountryOption[] {
     rawJson: safeJsonStringify({
       source: "talku-apk-static",
       strictAppCountryList: true,
-      note: "Panel country list is pinned to TalkU app packageServiceId/applyType countries. Remote-only countries are intentionally ignored.",
+      note: "Fallback mirrors the current TalkU country picker when getNumberCountries is temporarily unavailable.",
       countryKey: item.countryKey,
       countryCode: item.countryCode,
       isoCountryCode: item.isoCountryCode,
@@ -7423,28 +7974,21 @@ function staticPhoneCountryOptions(): DingtonePhoneCountryOption[] {
 }
 
 function orderPhoneCountryOptions(items: DingtonePhoneCountryOption[]) {
-  const staticItems = staticPhoneCountryOptions();
-  const remoteByKey = new Map(items.map((item) => [`${item.countryCode}:${item.isoCountryCode}`, item]));
-  const merged = staticItems.map((staticItem) => {
-    const item = remoteByKey.get(`${staticItem.countryCode}:${staticItem.isoCountryCode}`);
+  const staticByKey = new Map(staticPhoneCountryOptions().map((item) => [`${item.countryCode}:${item.isoCountryCode}`, item]));
+  return items.map((item) => {
+    const staticItem = staticByKey.get(`${item.countryCode}:${item.isoCountryCode}`);
     return {
-      ...staticItem,
-      ...(item ?? {}),
-      label: staticItem.label,
-      providerIdList: item?.providerIdList?.length ? item.providerIdList : staticItem.providerIdList,
-      available: item?.available ?? true,
+      ...(staticItem ?? {}),
+      ...item,
+      providerIdList: item.providerIdList?.length ? item.providerIdList : staticItem?.providerIdList,
+      available: item.available ?? true,
       rawJson: safeJsonStringify({
-        ...(parseJsonRecord(staticItem.rawJson) ?? {}),
-        remoteCountry: parseJsonRecord(item?.rawJson),
-        remoteEnriched: Boolean(item)
+        ...(parseJsonRecord(staticItem?.rawJson) ?? {}),
+        remoteCountry: parseJsonRecord(item.rawJson),
+        remoteEnriched: true
       })
     };
   });
-  // The TalkU purchase UI exposes a curated country list. The direct API can
-  // return backend-only countries that the app does not show, so keep the panel
-  // aligned with the app by default and only use remote data to enrich known
-  // app countries.
-  return sortPhoneCountries(merged);
 }
 
 function normalizePhoneCountryOptions(value: unknown): DingtonePhoneCountryOption[] {
@@ -7460,7 +8004,10 @@ function normalizePhoneCountryOptions(value: unknown): DingtonePhoneCountryOptio
     }
     const config = resolvePrivatePhoneRequestConfig(countryCode, iso);
     const key = `${countryCode}:${iso}`;
-    const name = pickString(record, ["countryName", "country_name", "name", "country"]) ?? config.label.replace(/\s*\+\d+$/, "");
+    const name =
+      pickString(record, ["countryName", "country_name", "name", "country"]) ??
+      APP_PHONE_COUNTRY_DISPLAY_NAMES[config.countryKey] ??
+      config.label.replace(/\s*\+\d+$/, "");
     output.set(key, {
       countryKey: config.countryKey,
       label: `${name} +${countryCode}`,
@@ -7471,7 +8018,15 @@ function normalizePhoneCountryOptions(value: unknown): DingtonePhoneCountryOptio
       rawJson: safeJsonStringify(item)
     });
   }
-  return output.size > 0 ? sortPhoneCountries(Array.from(output.values())) : [];
+  return Array.from(output.values());
+}
+
+export function normalizePhoneCountryOptionsForTest(value: unknown) {
+  return normalizePhoneCountryOptions(value);
+}
+
+export function staticPhoneCountryOptionsForTest() {
+  return staticPhoneCountryOptions();
 }
 
 function pickProviderIdList(record: Record<string, unknown>) {
@@ -8015,7 +8570,7 @@ function normalizePhonePurchaseCandidate(value: unknown): DingtonePhonePurchaseC
     providerId: pickNumber(record, ["providerId", "provider_id"]),
     packageServiceId: pickString(record, ["packageServiceId", "package_service_id"]),
     category: pickNumber(record, ["category", "purchaseType", "purchase_type"]),
-    phoneType: pickNumber(record, ["phoneType", "phone_type", "payType", "pay_type"]),
+    phoneType: pickNumber(record, ["phoneType", "phone_type", "type", "payType", "pay_type"]),
     displayName: pickString(record, ["displayName", "display_name", "cityName", "city_name", "stateName", "state_name"]),
     cityName: pickString(record, ["cityName", "city_name"]),
     stateName: pickString(record, ["stateName", "state_name"]),
@@ -8118,6 +8673,54 @@ function assertDirectApiSuccess(value: unknown, action: string) {
   }
 }
 
+function assertConfirmedPhoneMutationResponse(
+  mutation: DingtonePhoneMutationResult<ApiResult>,
+  action: string
+): asserts mutation is { outcome: "response"; payload: ApiResult } {
+  if (mutation.outcome === "unknown_after_write") {
+    throw new AppError(
+      `Direct ${action} outcome is unknown after the request write. Do not retry until remote inventory confirmation completes.`,
+      409,
+      409
+    );
+  }
+}
+
+function assertPhonePurchaseLockSuccess(value: unknown) {
+  if (!isRecord(value)) {
+    throw new AppError("Phone purchase lock did not return a valid response.", 502, 502);
+  }
+  const errCode = value.ErrCode ?? value.errCode ?? value.errorCode ?? value.code;
+  const result = value.Result ?? value.result;
+  const status = value.status ?? value.Status;
+  const success = value.success ?? value.ok;
+  const data = value.data ?? value.Data;
+  const message = stringifyPrimitive(value.Reason ?? value.reason ?? value.message ?? value.error ?? value.resultMsg ?? value.result_msg);
+  const numericErrCode = errCode === undefined ? undefined : Number(errCode);
+
+  if (numericErrCode === 9001) {
+    throw new AppError(
+      `Phone purchase requires identity verification before this number can be locked${message ? `: ${redactSensitiveText(message)}` : "."}`,
+      403,
+      9001
+    );
+  }
+  if (errCode !== undefined && Number.isFinite(numericErrCode) && numericErrCode !== 0) {
+    throw new AppError(
+      `Phone purchase lock failed: ${message ? redactSensitiveText(message) : `server returned ${String(errCode)}`}`,
+      502,
+      502
+    );
+  }
+  if (success === false || data === false || result === 0 || result === "0" || status === "error") {
+    throw new AppError(
+      `Phone purchase lock failed: ${message ? redactSensitiveText(message) : "server did not accept the number lock"}`,
+      502,
+      502
+    );
+  }
+}
+
 function isUnconfirmedPurchaseError(message: string | null | undefined, errCode: unknown, result: unknown, status: unknown) {
   const text = [message, errCode, result, status].map((item) => String(item ?? "")).join(" ");
   return /rest call failed|jsonobject text must begin|jsontokener|responsejson/i.test(text);
@@ -8165,7 +8768,7 @@ function normalizePhoneNumber(value: unknown): DingtonePhoneNumber {
     autoRenew: pickBoolean(record, ["autoRenew", "auto_renew"]),
     isPrimary: pickBoolean(record, ["isPrimary", "is_primary", "primaryFlag", "primary_flag"]),
     isGoodNumber: pickBoolean(record, ["isGoodNumber", "is_good_number"]),
-    allowReceiveSms: parsePhoneAllowReceiveSms(record),
+    allowReceiveSms: derivePhoneSmsReceptionState(record),
     portoutInfo: pickString(record, ["portoutInfo", "portout_info"]),
     rawJson: safeJsonStringify(value)
   };
@@ -8192,35 +8795,16 @@ function normalizePhoneNumberPatch(value: unknown): Partial<DingtonePhoneNumber>
   };
 }
 
-function parsePhoneAllowReceiveSms(record: Record<string, unknown>) {
-  const keys = ["allowReceiveSMS", "allowReceiveSms", "allow_receive_sms"];
-  for (const candidate of collectNestedRecords(record)) {
-    const direct = pickBoolean(candidate, keys);
-    if (direct !== undefined) {
-      return direct;
-    }
-    const filterSetting = candidate.filterSetting ?? candidate.filter_setting;
-    if (isRecord(filterSetting)) {
-      const nested = pickBoolean(filterSetting, keys);
-      if (nested !== undefined) {
-        return nested;
-      }
-    }
-    if (typeof filterSetting === "string" && filterSetting.trim()) {
-      try {
-        const parsed = JSON.parse(filterSetting) as unknown;
-        if (isRecord(parsed)) {
-          const nested = pickBoolean(parsed, keys);
-          if (nested !== undefined) {
-            return nested;
-          }
-        }
-      } catch {
-        // Ignore malformed legacy filter settings and keep searching nested records.
-      }
-    }
-  }
-  return undefined;
+export function normalizeRenewedPhoneNumberResponse(value: unknown, phoneNumber: string): Partial<DingtonePhoneNumber> {
+  const orderedPhone = extractOrderedPhone(value);
+  return {
+    phoneNumber,
+    ...normalizePhoneNumberPatch({
+      phoneNumber,
+      ...(isRecord(value) ? value : { result: value }),
+      ...(isRecord(orderedPhone) ? orderedPhone : {})
+    })
+  };
 }
 
 function pickPhoneValue(phone: DirectPhoneActionContext, records: Record<string, unknown>[], keys: string[]) {
@@ -9207,6 +9791,38 @@ function parsePositiveIntSetting(value: string | undefined, fallback: number, mi
     return fallback;
   }
   return Math.min(parsed, max);
+}
+
+async function runSingleWritePhoneMutation<T extends ApiResult>(
+  input: SingleWritePhoneMutationInput<T>
+): Promise<DingtonePhoneMutationResult<T>> {
+  let lastError: unknown;
+
+  for (const host of uniqueHosts(input.hosts)) {
+    let writeStarted = false;
+    try {
+      const payload = await input.execute(host, () => {
+        writeStarted = true;
+      });
+      return { outcome: "response", payload };
+    } catch (error) {
+      lastError = error;
+      if (writeStarted) {
+        return {
+          outcome: "unknown_after_write",
+          error: redactSensitiveText(error instanceof Error ? error.message : String(error))
+        };
+      }
+    }
+  }
+
+  throw normalizeDirectError(lastError);
+}
+
+export function runSingleWritePhoneMutationForTest<T extends ApiResult>(
+  input: SingleWritePhoneMutationInput<T>
+): Promise<DingtonePhoneMutationResult<T>> {
+  return runSingleWritePhoneMutation(input);
 }
 
 function uniqueHosts(hosts: string[]) {
