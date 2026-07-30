@@ -1,5 +1,5 @@
-ARG NODE_IMAGE=docker.hanxi.cc/library/node:22-alpine
-ARG NGINX_IMAGE=docker.hanxi.cc/library/nginx:1.27-alpine
+ARG NODE_IMAGE=node:22-alpine
+ARG NGINX_IMAGE=nginx:1.27-alpine
 
 FROM ${NODE_IMAGE} AS build
 

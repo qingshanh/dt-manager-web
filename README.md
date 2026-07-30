@@ -173,16 +173,14 @@ DT_HELPER_REMOTE_HOST=172.17.0.1:27042
 
 ### Docker 拉取卡住
 
-项目默认通过 `docker.hanxi.cc` 拉取官方基础镜像，以减少 VPS 直连 Docker Hub 卡住的概率。如果构建仍然长时间停在基础镜像拉取阶段，可以先单独测试：
+项目默认使用 Docker Hub 官方基础镜像，不绑定任何第三方镜像站。如果构建停在基础镜像拉取阶段，可以先单独测试：
 
 ```bash
-docker pull docker.hanxi.cc/library/node:22-alpine
-docker pull docker.hanxi.cc/library/nginx:1.27-alpine
+docker pull node:22-alpine
+docker pull nginx:1.27-alpine
 ```
 
-我这里用 registry manifest 检查过：`docker.hanxi.cc` 对 `library/node`、`library/nginx`、`library/python` 会返回 Docker Registry 鉴权挑战，Docker 客户端应可继续拉取；`ghcr.nju.edu.cn` 对这些 Docker Hub 官方基础镜像返回 `404`，不适合作为本项目默认基础镜像源。
-
-如果 `docker.hanxi.cc` 在你的 VPS 上也不可用，请在 `.env` 里把基础镜像改成你的 VPS 可访问的镜像源，例如：
+如果 VPS 无法访问 Docker Hub，请在 `.env` 中改成该服务器能够访问且可信的镜像源。旧部署若仍配置了 `docker.hanxi.cc`，也必须替换以下三项，否则 `.env` 会覆盖项目的新默认值：
 
 ```env
 DOCKER_NODE_IMAGE=你的镜像源/library/node:22-alpine

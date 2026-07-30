@@ -11,7 +11,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
       args:
-        NODE_IMAGE: ${DOCKER_NODE_IMAGE:-docker.hanxi.cc/library/node:22-alpine}
+        NODE_IMAGE: ${DOCKER_NODE_IMAGE:-node:22-alpine}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         APP_COMMIT_SHA: ${APP_COMMIT_SHA:-}
     env_file:
@@ -51,8 +51,8 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        NODE_IMAGE: ${DOCKER_NODE_IMAGE:-docker.hanxi.cc/library/node:22-alpine}
-        NGINX_IMAGE: ${DOCKER_NGINX_IMAGE:-docker.hanxi.cc/library/nginx:1.27-alpine}
+        NODE_IMAGE: ${DOCKER_NODE_IMAGE:-node:22-alpine}
+        NGINX_IMAGE: ${DOCKER_NGINX_IMAGE:-nginx:1.27-alpine}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         APP_VERSION: ${APP_VERSION:-0.2.12}
         VITE_APP_VERSION: ${VITE_APP_VERSION:-0.2.12}
@@ -89,8 +89,8 @@ services:
       context: ./backend/helper
       dockerfile: Dockerfile
       args:
-        NODE_IMAGE: ${DOCKER_NODE_IMAGE:-docker.hanxi.cc/library/node:22-alpine}
-        PYTHON_IMAGE: ${DOCKER_PYTHON_IMAGE:-docker.hanxi.cc/library/python:3.11-slim}
+        NODE_IMAGE: ${DOCKER_NODE_IMAGE:-node:22-alpine}
+        PYTHON_IMAGE: ${DOCKER_PYTHON_IMAGE:-python:3.11-slim}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     environment:

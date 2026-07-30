@@ -52,3 +52,18 @@ test("Docker services define process, resource, shutdown, and log bounds", () =>
   assert.match(dockerfile, /CMD \["node", "dist\/index\.js"\]/);
   assert.doesNotMatch(dockerfile, /CMD \["sh", "-c"/);
 });
+
+test("Docker builds default to official images and keep mirrors configurable", () => {
+  const compose = read("docker-compose.yml");
+  const dockerfiles = [
+    read("backend/Dockerfile"),
+    read("frontend/Dockerfile"),
+    read("backend/helper/Dockerfile")
+  ].join("\n");
+
+  assert.match(compose, /\$\{DOCKER_NODE_IMAGE:-node:22-alpine\}/);
+  assert.match(compose, /\$\{DOCKER_NGINX_IMAGE:-nginx:1\.27-alpine\}/);
+  assert.match(compose, /\$\{DOCKER_PYTHON_IMAGE:-python:3\.11-slim\}/);
+  assert.doesNotMatch(compose, /docker\.hanxi\.cc/);
+  assert.doesNotMatch(dockerfiles, /docker\.hanxi\.cc/);
+});

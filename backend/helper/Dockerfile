@@ -1,5 +1,5 @@
-ARG NODE_IMAGE=docker.hanxi.cc/library/node:22-alpine
-ARG PYTHON_IMAGE=docker.hanxi.cc/library/python:3.11-slim
+ARG NODE_IMAGE=node:22-alpine
+ARG PYTHON_IMAGE=python:3.11-slim
 
 FROM ${NODE_IMAGE} AS node-deps
 

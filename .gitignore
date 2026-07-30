@@ -27,6 +27,9 @@ LOGIN_RESEARCH_*.md
 tools/*CAPTURE*.md
 backend/helper/*notes*.md
 docs/*.py
+# Local implementation notes and agent-generated design documents.
+docs/superpowers/
+docs/GITHUB_SETUP.md
 docs/*接入指南*.md
 /lib/
 _debug_*
