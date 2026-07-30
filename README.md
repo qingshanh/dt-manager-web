@@ -180,13 +180,7 @@ docker pull node:22-alpine
 docker pull nginx:1.27-alpine
 ```
 
-如果 VPS 无法访问 Docker Hub，请在 `.env` 中改成该服务器能够访问且可信的镜像源。旧部署若仍配置了 `docker.hanxi.cc`，也必须替换以下三项，否则 `.env` 会覆盖项目的新默认值：
-
-```env
-DOCKER_NODE_IMAGE=你的镜像源/library/node:22-alpine
-DOCKER_NGINX_IMAGE=你的镜像源/library/nginx:1.27-alpine
-DOCKER_PYTHON_IMAGE=你的镜像源/library/python:3.11-slim
-```
+旧部署 `.env` 中的 `DOCKER_NODE_IMAGE`、`DOCKER_NGINX_IMAGE`、`DOCKER_PYTHON_IMAGE` 已不再由 Compose 读取，因此旧的第三方镜像地址不会继续覆盖官方默认值。如果 VPS 无法访问 Docker Hub，请在 Docker daemon 中配置可信的 `registry-mirrors`，不要把公共第三方镜像站写死在项目文件中。
 
 然后重新构建：
 
@@ -206,7 +200,6 @@ docker compose up -d
 - `ENCRYPTION_KEY`：账号密码和 token 入库加密密钥，生产环境必须改
 - `NODE_OPTIONS`：限制 Node.js 最大堆内存，正式默认 `--max-old-space-size=512`；长期采样后可评估下调
 - `DT_ALLOW_APP_FALLBACK`：App/helper/ADB 回退的环境硬门禁；正式部署必须为 `false`，本地逆向测试还需同时打开系统设置
-- `DOCKER_NODE_IMAGE`、`DOCKER_NGINX_IMAGE`、`DOCKER_PYTHON_IMAGE`：Docker 基础镜像地址，Docker Hub 拉取慢时可换成可访问的镜像源
 - `NPM_REGISTRY`、`PIP_INDEX_URL`：Docker 构建时安装 npm / pip 依赖使用的镜像源
 - `DATABASE_URL`：本地开发数据库地址；Docker Compose 默认覆盖为 `file:/app/data/dingtone.db`
 - `CORS_ORIGIN`：前端访问源，多个用英文逗号分隔
