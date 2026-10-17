@@ -152,9 +152,10 @@ export class RealDingtoneGateway implements DingtoneGateway {
 
   async renewPhoneNumber(
     account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: AppVariant },
-    phoneNumber: string
+    phoneNumber: string,
+    phone?: Partial<DingtonePhoneNumber>
   ): Promise<Partial<DingtonePhoneNumber>> {
-    const result = await this.callBridge("renew_phone_number", { account, phoneNumber });
+    const result = await this.callBridge("renew_phone_number", { account, phoneNumber, phone });
     return normalizePhoneNumberPatch(unwrapPayload(result));
   }
 

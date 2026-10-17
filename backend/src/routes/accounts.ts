@@ -41,6 +41,7 @@ import { buildDirectPhoneInventoryIdentity } from "../services/phone-inventory-r
 import { buildPhoneSmsReceptionDiagnostic } from "../services/phone-sms-diagnostics.js";
 import { extractPhoneInventoryMetadata } from "../services/phone-inventory.js";
 import { phoneActionCoordinator } from "../services/phone-action-coordinator.js";
+import { resolvePhoneActionBalanceEvidence } from "../services/phone-action-balance.js";
 import { updatePhoneActionAuditEvidence } from "../services/phone-action-operation.js";
 import {
   hasAdvancedPhoneExpiry,
@@ -1991,13 +1992,10 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
     const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
     const phoneItem = await assertAccountPhoneNumber(account.id, Number(req.params.phoneId));
     const useDirect = await shouldUseDirectAccountFlow(account);
-    if (!useDirect) {
-      throw new AppError("Phone renewal requires a Direct account session and does not use ADB/helper fallback.", 409, 409);
-    }
     const renewalBaseline = parsePhoneExpiry(phoneItem.expiredTime) !== null
       ? phoneItem
       : await getDirectPhoneBaseline(account, phoneItem);
-    const balanceBefore = await resolvePhoneActionBalance(account, true);
+    const balanceBefore = await resolvePhoneActionBalance(account, true, { requireFresh: true });
     if (balanceBefore === null) {
       throw new AppError("Could not establish the account balance before renewal.", 409, 409);
     }
@@ -2025,6 +2023,23 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
         requestPayload: { extensionMonths }
       },
       mutate: async () => {
+        if (!useDirect) {
+          const helperPatch = await dingtoneGateway.renewPhoneNumber(
+            {
+              dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+              token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+              deviceId: account.dtDeviceId,
+              appVariant: account.appVariant
+            },
+            phoneItem.phoneNumber,
+            mapStoredPhoneContext(phoneItem)
+          );
+          responsePatch = helperPatch;
+          return {
+            outcome: "response",
+            payload: helperPatch as Record<string, unknown>
+          };
+        }
         const mutation = await directRefreshGateway.renewPhoneNumberMutation(
           {
             dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
@@ -5140,26 +5155,37 @@ async function resolvePhoneActionBalance(
     dtDeviceId: string;
     appVariant: "dingtone" | "dingdong";
   },
-  useDirect: boolean
+  useDirect: boolean,
+  options: { requireFresh?: boolean } = {}
 ) {
   const cached = (await prisma.accountSnapshot.findUnique({ where: { accountId: account.id }, select: { primaryBalance: true } }))
     ?.primaryBalance ?? null;
   if (!useDirect) return cached;
-  try {
-    const snapshot = await directRefreshGateway.refreshSnapshot({
-      dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
-      token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-      deviceId: account.dtDeviceId,
-      appVariant: account.appVariant
-    });
-    return snapshot.primaryBalance ?? cached;
-  } catch (error) {
-    logger.warn("Phone action could not refresh account balance; using cached balance", {
-      accountId: account.id,
-      error: error instanceof Error ? error.message : String(error)
-    });
-    return cached;
-  }
+  const requireFresh = options.requireFresh === true;
+  return resolvePhoneActionBalanceEvidence({
+    cachedBalance: cached,
+    requireFresh,
+    refresh: async () => {
+      const snapshot = await directRefreshGateway.refreshSnapshot({
+        dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+        token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+        deviceId: account.dtDeviceId,
+        appVariant: account.appVariant
+      });
+      return snapshot.primaryBalance;
+    },
+    onRefreshError: (error) => {
+      logger.warn(
+        requireFresh
+          ? "Phone action could not refresh account balance; refusing cached balance before write"
+          : "Phone action could not refresh account balance; using cached balance",
+        {
+          accountId: account.id,
+          error: error instanceof Error ? error.message : String(error)
+        }
+      );
+    }
+  });
 }
 
 function formatPhoneRenewalExtension(before?: string | null, after?: string | null) {

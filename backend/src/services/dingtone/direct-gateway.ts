@@ -13,10 +13,10 @@ import { derivePhoneSmsReceptionState } from "../../utils/phone-sms-reception.js
 import { getSettingsMap } from "../settings.service.js";
 import { buildTeamMessageEnvelope, parseTeamMessageMeta } from "../team-message-normalizer.js";
 import {
-  resolvePhoneRenewalCommandTag,
   resolvePhoneRenewalExtraChargeMonths,
   resolvePhoneRenewalMonths
 } from "../phone-renewal-confirmation.js";
+import { runPhoneRenewalSession } from "../phone-renewal-session.js";
 import { parseDirectActionTemplate, type DirectActionTemplate, type DirectTemplateParams } from "./direct-template.js";
 import { isOfflineMessageIndexPush, parseSmsPush, type ParsedSmsPush } from "./message-parser.js";
 import {
@@ -1117,8 +1117,16 @@ export class DirectDingtoneGateway implements DingtoneGateway {
       extraChargeMonthsCount: resolvePhoneRenewalExtraChargeMonths(extensionMonths)
     });
     const mutation = await this.withSingleWriteRegisteredSession(runtime, account, (session, markWritten) => {
-      return session.callOrderPrivateNumberJson(query, runtime.ioTimeoutMs, markWritten, {
-        commandTag: resolvePhoneRenewalCommandTag(extensionMonths)
+      const [balanceQuery] = buildGetBalanceQueryAttempts(account, runtime, () => session.nextTrackCode());
+      return runPhoneRenewalSession({
+        refreshBalance: () => session.callCommonRestJson(
+          "renewPhone.getBalance",
+          "billing/user/getBalance",
+          balanceQuery!,
+          DIRECT_REFRESH_ATTEMPT_TIMEOUT_MS
+        ),
+        isBalanceConfirmed: hasPositiveBalancePayload,
+        writeOrder: () => session.callOrderPrivateNumberJson(query, runtime.ioTimeoutMs, markWritten)
       });
     });
     if (mutation.outcome === "unknown_after_write") return mutation;
@@ -1366,12 +1374,7 @@ export class DirectDingtoneGateway implements DingtoneGateway {
         execute: async (host, markWritten) => {
           const session = new DirectSession(runtime, host);
           try {
-            await session.openLink(account);
-            await runPushMaintenanceCalls(session, runtime, account, true);
-            const registration = await runPushLinkRegistration(session, runtime, account);
-            if (!registration.ok) {
-              throw new AppError(registration.error ?? "Direct client link registration failed", 502, 502);
-            }
+            await session.open(account);
             return await handler(session, markWritten);
           } finally {
             await session.close().catch(() => undefined);
@@ -3570,8 +3573,7 @@ class DirectSession {
   async callOrderPrivateNumberJson(
     query: string,
     timeoutMs = this.runtime.ioTimeoutMs,
-    onWritten?: () => void,
-    options?: { commandTag?: number }
+    onWritten?: () => void
   ) {
     const request = buildCommonRestRequestFrame({
       template: TEMPLATES.getPrivateNumber,
@@ -3580,15 +3582,20 @@ class DirectSession {
       status: 0x0102,
       apiName: ORDER_PRIVATE_NUMBER_API_NAME,
       query,
-      rpcContext: encodeOrderPrivateNumberRpcContext({ commandTag: options?.commandTag })
+      rpcContext: encodeOrderPrivateNumberRpcContext()
     });
 
     this.clearJsonQueue();
     this.beginJsonCapture(timeoutMs);
     dumpDirectDebugFrame("orderPrivateNumber", request);
-    onWritten?.();
     await this.write(request);
-    return this.waitForJsonPayload(timeoutMs, "orderPrivateNumber JSON response", isExpectedOrderPrivateNumberPayload);
+    onWritten?.();
+    const expectedPhoneNumber = extractQueryParam(query, "phoneNumber");
+    return this.waitForJsonPayload(
+      timeoutMs,
+      "orderPrivateNumber JSON response",
+      (payload) => isExpectedOrderPrivateNumberPayload(payload, expectedPhoneNumber)
+    );
   }
 
   async callConfiguredActivationTemplate(
@@ -4492,13 +4499,60 @@ export function acceptsCommonRestJsonPayloadForTest(apiName: string, query: stri
   return acceptsCommonRestJsonPayload(apiName, query, payload);
 }
 
-function isExpectedOrderPrivateNumberPayload(payload: ApiResult) {
-  return (
-    hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]) ||
-    hasNestedOwnKey(payload, "phoneNumber") ||
-    hasNestedOwnKey(payload, "payFlag") ||
-    hasNestedOwnKey(payload, "provision")
-  );
+function isExpectedOrderPrivateNumberPayload(payload: ApiResult, expectedPhoneNumber?: string) {
+  const result = payload.Result ?? payload.result;
+  const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode;
+  const success = payload.success ?? payload.ok;
+  if (
+    success === false ||
+    result === 0 ||
+    result === "0" ||
+    (errCode !== undefined && Number(errCode) !== 0)
+  ) {
+    return true;
+  }
+
+  const expectedDigits = stripPhonePrefix(expectedPhoneNumber ?? "");
+  for (const record of collectDirectOrderResponseRecords(payload)) {
+    const responsePhone = pickString(record, ["phoneNumber", "phone_number", "privateNumber", "private_number"]);
+    if (!responsePhone || (expectedDigits && stripPhonePrefix(responsePhone) !== expectedDigits)) {
+      continue;
+    }
+    if (hasAnyOwnKey(record, [
+      "payFlag",
+      "payYears",
+      "gainTime",
+      "payTime",
+      "provision",
+      "payType",
+      "expireTime",
+      "expiredTime",
+      "providerId",
+      "packageServiceId"
+    ])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function collectDirectOrderResponseRecords(payload: ApiResult) {
+  const records: Record<string, unknown>[] = [];
+  const seen = new Set<Record<string, unknown>>();
+  const visit = (candidate: unknown, depth: number) => {
+    if (!isRecord(candidate) || seen.has(candidate) || depth > 3) return;
+    seen.add(candidate);
+    records.push(candidate);
+    for (const key of ["data", "Data", "orderPayload", "order", "phone", "result", "Result"]) {
+      visit(candidate[key], depth + 1);
+    }
+  };
+  visit(payload, 0);
+  return records;
+}
+
+export function isExpectedOrderPrivateNumberPayloadForTest(payload: ApiResult, expectedPhoneNumber?: string) {
+  return isExpectedOrderPrivateNumberPayload(payload, expectedPhoneNumber);
 }
 
 function isExpectedEdgeRestPayload(payload: ApiResult) {
@@ -5177,7 +5231,6 @@ export function buildOrderPrivateNumberRequestFrameForTest(input: {
   session: Buffer;
   route: Buffer;
   query: string;
-  commandTag?: number;
 }) {
   return buildCommonRestRequestFrame({
     template: TEMPLATES.getPrivateNumber,
@@ -5186,7 +5239,7 @@ export function buildOrderPrivateNumberRequestFrameForTest(input: {
     status: 0x0102,
     apiName: ORDER_PRIVATE_NUMBER_API_NAME,
     query: input.query,
-    rpcContext: encodeOrderPrivateNumberRpcContext({ commandTag: input.commandTag })
+    rpcContext: encodeOrderPrivateNumberRpcContext()
   });
 }
 
@@ -6331,6 +6384,9 @@ function shuffleAreaCodes(areaCodes: number[]) {
 }
 
 function resolvePhoneActionApiName(label: DirectPhoneActionLabel, settings: Record<string, string>) {
+  if (label === "renewPhone") {
+    return ORDER_PRIVATE_NUMBER_API_NAME;
+  }
   const mapping = {
     purchasePhone: {
       key: "dt_direct_api_purchase_phone",
@@ -6455,7 +6511,7 @@ function buildOrderPrivateNumberQuery(
   const coupon = pickPhoneString(phone, raw, ["coupon"]) ?? "";
   const callPlanId = pickPhoneNumber(phone, raw, ["callPlanId", "callplanId", "call_plan_id"]) ?? 0;
   const formerPhoneNumber = pickPhoneString(phone, raw, ["formerPhoneNumber", "former_phone_number", "oldPhoneNum", "old_phone_num"]);
-  const simCountryCode = pickPhoneString(phone, raw, ["simCC", "sim_cc"]) ?? "";
+  const simCountryCode = pickPhoneString(phone, raw, ["simCC", "sim_cc"]) ?? "CN";
   const extraChargeMonthsCount = options.extraChargeMonthsCount ?? pickPhoneNumber(phone, raw, ["extraChargeMonthsCount", "extra_charge_months_count"]) ?? 0;
 
   const query = [

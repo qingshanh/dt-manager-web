@@ -10,6 +10,7 @@ import { accountMonitorService } from "./account-monitor.js";
 import { completeAccountVerificationRelogin, requestAccountVerificationRelogin } from "./account-verification-relogin.js";
 import { refreshAccountRuntimeData } from "./account-runtime.js";
 import { phoneActionCoordinator } from "./phone-action-coordinator.js";
+import { resolvePhoneActionBalanceEvidence } from "./phone-action-balance.js";
 import { resolvePhoneRenewalConfirmation, resolvePhoneRenewalMonths } from "./phone-renewal-confirmation.js";
 import { BackgroundLoop } from "./background-loop.js";
 import {
@@ -1510,7 +1511,9 @@ async function phoneActionText(
       return "未找到该号码。";
     }
     const direct = directAccount(account);
-    const balanceBefore = action === "renew" ? await resolveLiveAccountBalance(account, direct) : null;
+    const balanceBefore = action === "renew"
+      ? await resolveLiveAccountBalance(account, direct, { requireFresh: true })
+      : null;
     const renewalBaseline = action === "renew" ? await getBotPhoneBaseline(direct, phone.phoneNumber) : null;
     const quotedPrice = action === "renew" ? getPhoneRenewalCost(mapStoredPhoneContext(phone)) : null;
     const extensionMonths = action === "renew" ? resolvePhoneRenewalMonths(phone) : null;
@@ -1626,19 +1629,27 @@ function directAccount(account: {
 
 async function resolveLiveAccountBalance(
   account: { id: number; snapshot?: { primaryBalance: number | null } | null },
-  direct: ReturnType<typeof directAccount>
+  direct: ReturnType<typeof directAccount>,
+  options: { requireFresh?: boolean } = {}
 ) {
   const cached = account.snapshot?.primaryBalance ?? null;
-  try {
-    const snapshot = await botGateway.refreshSnapshot(direct);
-    return snapshot.primaryBalance ?? cached;
-  } catch (error) {
-    logger.warn("Telegram phone action could not refresh account balance; using cached balance", {
-      accountId: account.id,
-      error: sanitizeTelegramError(errorMessage(error))
-    });
-    return cached;
-  }
+  const requireFresh = options.requireFresh === true;
+  return resolvePhoneActionBalanceEvidence({
+    cachedBalance: cached,
+    requireFresh,
+    refresh: async () => (await botGateway.refreshSnapshot(direct)).primaryBalance,
+    onRefreshError: (error) => {
+      logger.warn(
+        requireFresh
+          ? "Telegram phone action could not refresh account balance; refusing cached balance before write"
+          : "Telegram phone action could not refresh account balance; using cached balance",
+        {
+          accountId: account.id,
+          error: sanitizeTelegramError(errorMessage(error))
+        }
+      );
+    }
+  });
 }
 
 function formatRenewalExtension(before?: string | null, after?: string | null) {

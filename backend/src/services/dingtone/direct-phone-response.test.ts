@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   acceptsCommonRestJsonPayloadForTest,
   isExpectedEdgeOrderPrivateNumberPayloadForTest,
+  isExpectedOrderPrivateNumberPayloadForTest,
   normalizeRenewedPhoneNumberResponse
 } from "./direct-gateway.js";
 
@@ -94,6 +95,58 @@ test("edge phone purchase order accepts business errors", () => {
       ErrCode: 9001,
       Reason: "verification required"
     }),
+    true
+  );
+});
+
+test("renewal ignores an interleaved purchased-number inventory payload", () => {
+  assert.equal(
+    isExpectedOrderPrivateNumberPayloadForTest(
+      {
+        Result: 1,
+        numberExList: [
+          { phoneNumber: "33757934708", expireTime: 1787819224123 },
+          { phoneNumber: "33755547881", expireTime: 1794908270148 }
+        ]
+      },
+      "33757934708"
+    ),
+    false
+  );
+});
+
+test("renewal accepts only a typed order success for the target phone", () => {
+  assert.equal(
+    isExpectedOrderPrivateNumberPayloadForTest(
+      {
+        Result: 1,
+        data: {
+          orderPayload: {
+            phoneNumber: "33757934708",
+            payFlag: 3,
+            expireTime: 1795768024123
+          }
+        }
+      },
+      "33757934708"
+    ),
+    true
+  );
+  assert.equal(
+    isExpectedOrderPrivateNumberPayloadForTest(
+      { Result: 1, phoneNumber: "33755547881", payFlag: 3, expireTime: 1794908270148 },
+      "33757934708"
+    ),
+    false
+  );
+});
+
+test("renewal accepts an explicit business failure without a phone payload", () => {
+  assert.equal(
+    isExpectedOrderPrivateNumberPayloadForTest(
+      { Result: 0, ErrCode: 60009, Reason: "renewal rejected" },
+      "33757934708"
+    ),
     true
   );
 });

@@ -13,6 +13,8 @@ let nativeEncoderCapture = [];
 let captureNativeFramesUntil = 0;
 let registerEmailEncoderHooksInstalled = false;
 
+const MSG_TYPE_EXTEND_PRIVATE_PHONE_SUCCEED = 1048627;
+
 function sendLog(level, message, data) {
   send({
     type: "bridge-log",
@@ -2564,7 +2566,14 @@ async function handleRenewPhoneNumber(request) {
         code: 404
       };
     }
-    PrivatePhoneNumberManager.getInstance().orderPrivatePhoneExtendMonths(freshItem, 12, freshItem.getOrderPrice(), 0, 2);
+    const extensionMonths = resolveHelperPhoneRenewalMonths(input, freshItem);
+    if (extensionMonths === 12) {
+      PrivatePhoneNumberManager.getInstance().orderPrivatePhoneExtendMonths(freshItem, 12, freshItem.getOrderPrice(), MSG_TYPE_EXTEND_PRIVATE_PHONE_SUCCEED, 2);
+      return;
+    }
+    const payType = toNumber(readField(freshItem, "payType"));
+    const specialNumber = payType === 5 || payType === 6;
+    PrivatePhoneNumberManager.getInstance().orderPrivateNumberForNewOrRenew(freshItem, specialNumber, freshItem.getOrderPrice());
   });
   const response = await responsePromise;
   if (response.errCode !== 0) {
@@ -2574,7 +2583,40 @@ async function handleRenewPhoneNumber(request) {
       code: response.errCode || 400
     };
   }
-  return response;
+  const finalExpiry = cleanString(response.expiredTime || response.expireTime || (response.orderPayload && response.orderPayload.expireTime));
+  return {
+    ...response,
+    expiredTime: finalExpiry,
+    expireTime: finalExpiry
+  };
+}
+
+function resolveHelperPhoneRenewalMonths(input, freshItem) {
+  const phone = (input && (input.phone || input.phone_context || input.phoneContext)) || {};
+  let raw = phone.rawJson || phone.raw_json || null;
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch (_error) {
+      raw = null;
+    }
+  }
+  const candidates = [
+    input && (input.extensionMonths || input.extension_months),
+    phone.validPeriodDays,
+    phone.valid_period_days,
+    raw && (raw.validPeriodDays || raw.valid_period_days)
+  ];
+  for (const candidate of candidates) {
+    const value = toNumber(candidate);
+    if (value === 12 || (value !== null && value >= 340 && value <= 372)) {
+      return 12;
+    }
+    if (value !== null && value > 0) {
+      return value;
+    }
+  }
+  return toNumber(readField(freshItem, "usePeriod")) === 4 ? 12 : 3;
 }
 
 async function handleRequestPhoneNumberViaActivity(request) {
@@ -3144,7 +3186,26 @@ function installHooks() {
       const result = this.onOrderPrivateNumberResponse(resp);
       const payload = extractRestResponse(resp);
       payload.phoneNumber = cleanString(tryCall(() => resp.getPhoneNumber(), null));
+      const respExpiry = cleanString(tryCall(() => resp.getExpireTime(), null));
+      if (respExpiry) {
+        payload.expireTime = respExpiry;
+        payload.expiredTime = respExpiry;
+      }
+      const respGain = cleanString(tryCall(() => resp.getGainTime(), null));
+      if (respGain) payload.gainTime = respGain;
+      const respPayFlag = toNumber(tryCall(() => resp.getPayFlag(), null));
+      if (respPayFlag !== null) payload.payFlag = respPayFlag;
+      const respPayYears = toNumber(tryCall(() => resp.getPayYears(), null));
+      if (respPayYears !== null) payload.payYears = respPayYears;
+      const respPayType = toNumber(tryCall(() => resp.getPayType(), null));
+      if (respPayType !== null) payload.payType = respPayType;
+      const respProvision = toNumber(tryCall(() => resp.getProvision(), null));
+      if (respProvision !== null) payload.provision = respProvision;
       payload.orderPayload = buildOwnedPhonePayload(findOwnedPhoneItem(payload.phoneNumber));
+      if (!payload.expireTime && payload.orderPayload && payload.orderPayload.expireTime) {
+        payload.expireTime = payload.orderPayload.expireTime;
+        payload.expiredTime = payload.orderPayload.expireTime;
+      }
       emitEvent("order_private_number", payload);
       return result;
     };
@@ -3183,7 +3244,26 @@ function installHooks() {
       const result = this.onOrderPrivateNumberResponse(resp);
       const payload = extractRestResponse(resp);
       payload.phoneNumber = cleanString(tryCall(() => resp.getPhoneNumber(), null));
+      const respExpiry = cleanString(tryCall(() => resp.getExpireTime(), null));
+      if (respExpiry) {
+        payload.expireTime = respExpiry;
+        payload.expiredTime = respExpiry;
+      }
+      const respGain = cleanString(tryCall(() => resp.getGainTime(), null));
+      if (respGain) payload.gainTime = respGain;
+      const respPayFlag = toNumber(tryCall(() => resp.getPayFlag(), null));
+      if (respPayFlag !== null) payload.payFlag = respPayFlag;
+      const respPayYears = toNumber(tryCall(() => resp.getPayYears(), null));
+      if (respPayYears !== null) payload.payYears = respPayYears;
+      const respPayType = toNumber(tryCall(() => resp.getPayType(), null));
+      if (respPayType !== null) payload.payType = respPayType;
+      const respProvision = toNumber(tryCall(() => resp.getProvision(), null));
+      if (respProvision !== null) payload.provision = respProvision;
       payload.orderPayload = buildOwnedPhonePayload(findOwnedPhoneItem(payload.phoneNumber));
+      if (!payload.expireTime && payload.orderPayload && payload.orderPayload.expireTime) {
+        payload.expireTime = payload.orderPayload.expireTime;
+        payload.expiredTime = payload.orderPayload.expireTime;
+      }
       emitEvent("order_private_number", payload);
       return result;
     };

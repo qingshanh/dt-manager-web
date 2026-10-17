@@ -23,7 +23,7 @@ test("renewal persists exact price and balance evidence before one mutation", ()
     'accountsRouter.put("/:id/phone-numbers/:phoneId/label"'
   );
   assert.match(handler, /resolveStoredRenewalQuote\(phoneItem\)/);
-  assert.match(handler, /balanceBefore = await resolvePhoneActionBalance/);
+  assert.match(handler, /balanceBefore = await resolvePhoneActionBalance\(account, true, \{ requireFresh: true \}\)/);
   assert.match(handler, /phoneActionCoordinator\.execute/);
   assert.match(handler, /renewPhoneNumberMutation/);
   assert.doesNotMatch(handler, /pendingPhoneRenewals|schedulePhoneRenewalReconciliation|executeHelperAction/);

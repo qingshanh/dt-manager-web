@@ -41,6 +41,7 @@ test("uses the App RestCall identities shared by TalkU and Dingdong", () => {
     cancel: 2132
   });
   assert.equal(resolvePhoneActionProtocol("dingtone", "renew").restCallType, 2050);
+  assert.equal(resolvePhoneActionProtocol("dingtone", "renew").apiName, "/pstn/share/orderPrivateNumber");
   assert.equal(resolvePhoneActionProtocol("dingdong", "settings").restCallType, 2052);
   assert.equal(resolvePhoneActionProtocol("dingdong", "cancel").restCallType, 2132);
 });

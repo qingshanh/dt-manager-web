@@ -32,9 +32,32 @@ test("phone renewal uses the native order RPC once on a registered link", () => 
   const renew = methodText("  async renewPhoneNumberMutation(", "  async cancelPhoneNumber(");
 
   assert.match(renew, /this\.withSingleWriteRegisteredSession\(runtime, account,/);
+  assert.match(renew, /runPhoneRenewalSession\(/);
+  assert.match(renew, /billing\/user\/getBalance/);
   assert.match(renew, /session\.callOrderPrivateNumberJson\(/);
   assert.match(renew, /markWritten/);
-  assert.doesNotMatch(renew, /callDirectPhoneAction|callCommonRestJson|dt_direct_template_renew_phone/);
+  assert.doesNotMatch(renew, /callDirectPhoneAction|dt_direct_template_renew_phone/);
+});
+
+test("native renewal marks the write boundary only after the socket write succeeds", () => {
+  const call = methodText("  async callOrderPrivateNumberJson(", "  async callConfiguredActivationTemplate(");
+  const socketWrite = call.indexOf("await this.write(request)");
+  const markWritten = call.indexOf("onWritten?.()");
+
+  assert.ok(socketWrite >= 0);
+  assert.ok(markWritten > socketWrite);
+});
+
+test("single-write phone sessions isolate the mutation on a stable authenticated session", () => {
+  const singleWrite = methodText("  private async withSingleWriteRegisteredSession(", "  private async callSingleWritePhoneAction(");
+  const open = singleWrite.indexOf("await session.open(account)");
+  const mutation = singleWrite.indexOf("return await handler(session, markWritten)");
+
+  assert.ok(open >= 0);
+  assert.ok(mutation > open);
+  assert.doesNotMatch(singleWrite, /callJson\("getPrivateNumber"/);
+  assert.doesNotMatch(singleWrite, /openLink\(|runPushLinkRegistration/);
+  assert.doesNotMatch(singleWrite, /runPushMaintenanceCalls/);
 });
 
 test("does not try another host after a phone mutation write", async () => {

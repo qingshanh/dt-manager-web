@@ -9,6 +9,13 @@ type BotModule = typeof botModule & Record<string, unknown>;
 const bot = botModule as BotModule;
 const source = readFileSync(new URL("./telegram-bot.ts", import.meta.url), "utf8");
 
+test("telegram renewal requires a fresh balance before entering the write coordinator", () => {
+  const start = source.indexOf('const balanceBefore = action === "renew"');
+  const end = source.indexOf("let responsePatch", start);
+  const renewalGuard = source.slice(start, end);
+  assert.match(renewalGuard, /resolveLiveAccountBalance\(account, direct, \{ requireFresh: true \}\)/);
+});
+
 test("telegram panel stats exclude system messages and count purchased phones", async () => {
   const load = bot.loadTelegramPanelStats;
   assert.equal(typeof load, "function");

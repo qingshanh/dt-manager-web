@@ -12,7 +12,10 @@ const source = readFileSync(new URL("./direct-gateway.ts", import.meta.url), "ut
 function directGatewayMethodBody(name: string) {
   const start = source.indexOf(`async ${name}(`);
   assert.notEqual(start, -1);
-  const nextMethod = source.indexOf("\n  async ", start + 1);
+  const nextMethod = [
+    source.indexOf("\n  async ", start + 1),
+    source.indexOf("\n  private async ", start + 1)
+  ].filter((index) => index >= 0).sort((left, right) => left - right)[0] ?? -1;
   return source.slice(start, nextMethod < 0 ? undefined : nextMethod);
 }
 
@@ -42,7 +45,7 @@ test("builds one native first-purchase orderPrivateNumber query", () => {
   });
 
   assert.deepEqual(queries, [
-    "token=test-token&deviceId=And.test.dttalk&userId=test-user&countryCode=32&areaCode=2&phoneNumber=32470123456&type=2&payFlag=2&payYears=1&coupon=&specialNumber=0&callplanId=0&providerId=2002&packageServiceId=DT03001&simCC=&simu=0&extraChargeMonthsCount=0&apiVersion=4&buyCredit=1"
+    "token=test-token&deviceId=And.test.dttalk&userId=test-user&countryCode=32&areaCode=2&phoneNumber=32470123456&type=2&payFlag=2&payYears=1&coupon=&specialNumber=0&callplanId=0&providerId=2002&packageServiceId=DT03001&simCC=CN&simu=0&extraChargeMonthsCount=0&apiVersion=4&buyCredit=1"
   ]);
   assert.equal(new URLSearchParams(queries[0]).has("productId"), false);
 });
@@ -58,13 +61,14 @@ test("direct purchase sends the App-observed Edge orderPrivateNumber request aft
   assert.doesNotMatch(body, /callOrderPrivateNumberJson/);
 });
 
-test("single-write phone sessions reproduce the App pre-registration private-number prime", () => {
+test("single-write phone sessions isolate the mutation on a stable authenticated session", () => {
   const body = directGatewayMethodBody("withSingleWriteRegisteredSession");
 
   assert.match(
     body,
-    /await runPushMaintenanceCalls\(session, runtime, account, true\);[\s\S]*await runPushLinkRegistration\(session, runtime, account\)/
+    /await session\.open\(account\)[\s\S]*return await handler\(session, markWritten\)/
   );
+  assert.doesNotMatch(body, /callJson\("getPrivateNumber"|openLink\(|runPushMaintenanceCalls|runPushLinkRegistration/);
   assert.match(body, /return await handler\(session, markWritten\)/);
 });
 
@@ -108,7 +112,7 @@ test("matches the App manual three-month renewal fields", () => {
   const dryRunEnd = source.indexOf("\n  private async callDirectPhoneAction", dryRunStart);
   const dryRun = source.slice(dryRunStart, dryRunEnd);
   assert.match(body, /extraChargeMonthsCount: resolvePhoneRenewalExtraChargeMonths\(extensionMonths\)/);
-  assert.match(body, /commandTag: resolvePhoneRenewalCommandTag\(extensionMonths\)/);
+  assert.doesNotMatch(body, /commandTag: resolvePhoneRenewalCommandTag\(extensionMonths\)/);
   assert.match(dryRun, /extraChargeMonthsCount: resolvePhoneRenewalExtraChargeMonths\(resolvePhoneRenewalMonths\(context\)\)/);
 
   const [query] = buildOrderPrivateNumberQueriesForTest({
@@ -138,6 +142,7 @@ test("matches the App manual three-month renewal fields", () => {
 
   assert.equal(params.get("type"), "0");
   assert.equal(params.get("payFlag"), "3");
+  assert.equal(params.get("simCC"), "CN");
   assert.equal(params.get("extraChargeMonthsCount"), "0");
 });
 

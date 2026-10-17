@@ -9,7 +9,7 @@ import {
   nextEdgeRestCallTypesForTest
 } from "./direct-gateway.js";
 
-test("builds an orderPrivateNumber ProxyRest frame with an empty native command context", () => {
+test("builds an orderPrivateNumber ProxyRest frame with the App native proxy cookie", () => {
   const session = Buffer.from("11223344", "hex");
   const route = Buffer.from("0102030405060708", "hex");
   const query = "token=test&phoneNumber=32470123456&apiVersion=4&buyCredit=1";
@@ -22,31 +22,29 @@ test("builds an orderPrivateNumber ProxyRest frame with an empty native command 
   assert.equal(frame.subarray(8, 12).toString("hex"), session.toString("hex"));
   assert.equal(frame.readUInt16BE(16), 0x0102);
   assert.equal(frame.subarray(22, 30).toString("hex"), route.toString("hex"));
-  assert.equal(frame.subarray(30, 38).toString("hex"), "0000000000000000");
+  assert.equal(frame.subarray(30, 38).toString("hex"), "0000000000000001");
   assert.notEqual(frame.indexOf(Buffer.from("/pstn/share/orderPrivateNumber")), -1);
   assert.equal(inflateFirstPayload(frame), query);
 });
 
-test("encodes the App yearly-renewal command tag in the ProxyRest context", () => {
+test("keeps the orderPrivateNumber native proxy cookie for yearly renewal queries", () => {
   const frame = buildOrderPrivateNumberRequestFrameForTest({
     session: Buffer.from("11223344", "hex"),
     route: Buffer.from("0102030405060708", "hex"),
-    query: "payFlag=3&extraChargeMonthsCount=12",
-    commandTag: 2
+    query: "payFlag=3&extraChargeMonthsCount=12"
   });
 
-  assert.equal(frame.subarray(30, 38).toString("hex"), "0000000000000002");
+  assert.equal(frame.subarray(30, 38).toString("hex"), "0000000000000001");
 });
 
-test("encodes the App manual three-month renewal with an empty command context", () => {
+test("keeps the App native proxy cookie for manual three-month renewal queries", () => {
   const frame = buildOrderPrivateNumberRequestFrameForTest({
     session: Buffer.from("11223344", "hex"),
     route: Buffer.from("0102030405060708", "hex"),
-    query: "payFlag=3&extraChargeMonthsCount=3",
-    commandTag: 0
+    query: "payFlag=3&extraChargeMonthsCount=3"
   });
 
-  assert.equal(frame.subarray(30, 38).toString("hex"), "0000000000000000");
+  assert.equal(frame.subarray(30, 38).toString("hex"), "0000000000000001");
 });
 
 test("builds requestPrivateNumber with the App-observed ProxyRest context", () => {

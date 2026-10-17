@@ -70,10 +70,6 @@ export function resolvePhoneRenewalMonths(phone: RenewalPeriodSource): number {
   throw new Error("Could not establish the exact phone renewal period from the latest remote phone record.");
 }
 
-export function resolvePhoneRenewalCommandTag(extensionMonths: number): 0 | 2 {
-  return extensionMonths === 12 ? 2 : 0;
-}
-
 export function resolvePhoneRenewalExtraChargeMonths(extensionMonths: number): 0 | 12 {
   return extensionMonths === 12 ? 12 : 0;
 }

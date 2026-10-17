@@ -1,0 +1,16 @@
+{
+  "name": "dt-manager-web",
+  "version": "0.2.12",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm --prefix backend run build && npm --prefix frontend run build",
+    "all": "npm --prefix backend run build && npm --prefix frontend run build",
+    "build:all": "npm --prefix backend run build && npm --prefix frontend run build",
+    "build:backend": "npm --prefix backend run build",
+    "build:frontend": "npm --prefix frontend run build",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "verify:direct-regression": "npm --prefix backend run verify:direct-regression -- --static-only"
+  }
+}

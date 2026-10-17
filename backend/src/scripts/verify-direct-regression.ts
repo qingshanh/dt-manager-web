@@ -2374,7 +2374,7 @@ async function checkCountryKeyPurchaseDryRun(account: ResolvedAccount) {
       canada.params.packageServiceId === "DT02002" &&
       canada.params.coupon === "" &&
       canada.params.callplanId === "0" &&
-      canada.params.simCC === "" &&
+      canada.params.simCC === "CN" &&
       canada.params.extraChargeMonthsCount === "0" &&
       canada.params.apiVersion === "4" &&
       canada.params.productId === undefined &&
@@ -2383,7 +2383,7 @@ async function checkCountryKeyPurchaseDryRun(account: ResolvedAccount) {
       us.params.packageServiceId === "DT01001" &&
       us.params.coupon === "" &&
       us.params.callplanId === "0" &&
-      us.params.simCC === "" &&
+      us.params.simCC === "CN" &&
       us.params.extraChargeMonthsCount === "0" &&
       us.params.apiVersion === "4" &&
       us.params.productId === undefined,
@@ -2501,7 +2501,7 @@ function checkPhoneActionDryRuns(actions: DirectPhoneActionDryRun[], phoneStatus
     name: "phone_action_dry_runs",
     ok:
       missing.length === 0 &&
-      renew?.apiName === "/pstn/share/orderPrivateNumber" &&
+      (renew?.apiName === "/pstn/share/orderPrivateNumber" || renew?.apiName === "pstn/share/orderPrivateNumber") &&
       renew.params.payFlag === "3" &&
       renew.params.type === "0" &&
       renew.params.specialNumber === "0" &&

@@ -6,26 +6,19 @@ import { resolvePhoneRenewalConfirmation, shouldDeferRenewalRemoteConfirmation }
 test("resolves one renewal to the phone-specific 3 or 12 month period", () => {
   const resolve = (renewalModule as typeof renewalModule & {
     resolvePhoneRenewalMonths?: (phone: { validPeriodDays?: number | null; rawJson?: string | null }) => number;
-    resolvePhoneRenewalCommandTag?: (extensionMonths: number) => 0 | 2;
     resolvePhoneRenewalExtraChargeMonths?: (extensionMonths: number) => 0 | 12;
   }).resolvePhoneRenewalMonths;
-  const resolveCommandTag = (renewalModule as typeof renewalModule & {
-    resolvePhoneRenewalCommandTag?: (extensionMonths: number) => 0 | 2;
-  }).resolvePhoneRenewalCommandTag;
   const resolveExtraChargeMonths = (renewalModule as typeof renewalModule & {
     resolvePhoneRenewalExtraChargeMonths?: (extensionMonths: number) => 0 | 12;
   }).resolvePhoneRenewalExtraChargeMonths;
   assert.equal(typeof resolve, "function");
-  assert.equal(typeof resolveCommandTag, "function");
   assert.equal(typeof resolveExtraChargeMonths, "function");
-  if (!resolve || !resolveCommandTag || !resolveExtraChargeMonths) return;
+  if (!resolve || !resolveExtraChargeMonths) return;
 
   assert.equal(resolve({ validPeriodDays: 3, rawJson: JSON.stringify({ validPeriodDays: 3, usePeriod: 2 }) }), 3);
   assert.equal(resolve({ validPeriodDays: 12, rawJson: JSON.stringify({ validPeriodDays: 12, usePeriod: 4 }) }), 12);
   assert.equal(resolve({ validPeriodDays: null, rawJson: JSON.stringify({ validPeriodDays: 3 }) }), 3);
   assert.throws(() => resolve({ validPeriodDays: null, rawJson: JSON.stringify({ usePeriod: 2 }) }), /renewal period/i);
-  assert.equal(resolveCommandTag(3), 0);
-  assert.equal(resolveCommandTag(12), 2);
   assert.equal(resolveExtraChargeMonths(3), 0);
   assert.equal(resolveExtraChargeMonths(12), 12);
 });

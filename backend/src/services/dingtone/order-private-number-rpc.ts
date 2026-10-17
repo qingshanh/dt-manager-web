@@ -1,23 +1,23 @@
 export const ORDER_PRIVATE_NUMBER_NATIVE_REST_CALL_TYPE = 2050;
 export const ORDER_PRIVATE_NUMBER_API_NAME = "/pstn/share/orderPrivateNumber";
+// TalkU C++ client logs nativeRestCall(2050) as ProxyRestCall cookie 170 (0xAA) internally for dispatch.
+// On the wire, CommonRest requests retain the 8-byte client route context (0000000000000001).
+export const ORDER_PRIVATE_NUMBER_NATIVE_PROXY_COOKIE = 170;
 
 const PROXY_REST_ROUTE_LENGTH = 8;
 const PROXY_REST_CONTEXT_LENGTH = 8;
 
 type OrderPrivateNumberRpcContext = {
   commandCookie?: number;
-  commandTag?: number;
 };
 
 export function encodeOrderPrivateNumberRpcContext(context: OrderPrivateNumberRpcContext = {}) {
   const commandCookie = context.commandCookie ?? 0;
-  const commandTag = context.commandTag ?? 0;
   assertUint32(commandCookie, "commandCookie");
-  assertUint32(commandTag, "commandTag");
 
   const encoded = Buffer.alloc(PROXY_REST_CONTEXT_LENGTH);
   encoded.writeUInt32BE(commandCookie, 0);
-  encoded.writeUInt32BE(commandTag, 4);
+  encoded.writeUInt32BE(1, 4);
   return encoded;
 }
 
