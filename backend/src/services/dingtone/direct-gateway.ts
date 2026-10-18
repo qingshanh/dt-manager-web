@@ -1156,7 +1156,7 @@ export class DirectDingtoneGateway implements DingtoneGateway {
       "cancelPhone",
       account,
       "cancel",
-      buildDeletePrivateNumberQuery(account, phoneNumber)
+      (session) => buildDeletePrivateNumberQuery(account, phoneNumber, session.nextTrackCode())
     );
   }
 
@@ -1388,11 +1388,12 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     label: DirectPhoneActionLabel,
     account: DirectSessionAccount,
     protocolKind: PhoneActionProtocolKind,
-    query: string
+    queryOrFactory: string | ((session: DirectSession) => string)
   ): Promise<DingtonePhoneMutationResult<ApiResult>> {
     const runtime = await getDirectRuntimeConfig();
     const protocol = resolvePhoneActionProtocol(account.appVariant ?? "dingtone", protocolKind);
     const mutation = await this.withSingleWriteRegisteredSession(runtime, account, (session, markWritten) => {
+      const query = typeof queryOrFactory === "function" ? queryOrFactory(session) : queryOrFactory;
       return session.callCommonRestJson(
         label,
         protocol.apiName,
@@ -4483,6 +4484,9 @@ function isExpectedCommonRestJsonPayload(apiName: string, payload: ApiResult) {
   if (normalized.includes("checkactivated") || normalized.includes("checkuseractivate")) {
     return hasActivatedUserPayload(payload) || hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode"]);
   }
+  if (normalized.includes("deletephonenumber") || normalized.includes("deleteprivatenumber")) {
+    return hasCommonRestResult(payload) || hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode", "status"]);
+  }
   return true;
 }
 
@@ -4655,6 +4659,9 @@ function hasStrongExpectedCommonRestShape(apiName: string, payload: ApiResult) {
   }
   if (normalized.includes("checkactivated") || normalized.includes("checkuseractivate")) {
     return hasActivatedUserPayload(payload);
+  }
+  if (normalized.includes("deletephonenumber") || normalized.includes("deleteprivatenumber")) {
+    return hasCommonRestResult(payload) || hasAnyOwnKey(payload, ["Result", "result", "ErrCode", "errCode", "errorCode", "status"]);
   }
   return false;
 }
@@ -6681,16 +6688,21 @@ function resolveRenewSpecialNumberType(payType: number | undefined) {
 
 function buildDeletePrivateNumberQuery(
   account: DirectSessionAccount,
-  phoneNumber: string
+  phoneNumber: string,
+  trackCode?: string
 ) {
   const strippedPhoneNumber = stripPhonePrefix(phoneNumber);
-  return [
+  const parts = [
     queryPair("token", account.token),
     queryPair("deviceId", accountDeviceId(account)),
     queryPair("userId", account.dtUserId),
     queryPair("phoneNumber", strippedPhoneNumber),
     queryPair("privateNumber", strippedPhoneNumber)
-  ].join("&");
+  ];
+  if (trackCode) {
+    parts.push(queryPair("TrackCode", trackCode));
+  }
+  return parts.join("&");
 }
 
 function buildReactivateGoogleVoiceNumberQuery(

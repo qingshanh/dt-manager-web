@@ -31,14 +31,17 @@ import {
   sendPhoneTelegramNotification
 } from "./telegram-notifier.js";
 import { telegramService, type TelegramUpdate } from "./telegram.js";
-import { parseTelegramCallback, type TelegramPanelCallback } from "./telegram-bot-callbacks.js";
+import { paginateTelegramItems, parseTelegramCallback, type TelegramPanelCallback } from "./telegram-bot-callbacks.js";
 import {
   accountActionKeyboard,
   accountListKeyboard,
   escapeTelegramHtml,
+  expiringPhoneDetailKeyboard,
+  expiringPhonesKeyboard,
   formatAccountCard,
   formatAccountListCard,
   formatCommandHelp,
+  formatExpiringPhonesCard,
   formatPanelStatusCard,
   formatPhoneAccountListCard,
   formatPhoneCard,
@@ -207,6 +210,11 @@ export class TelegramBotService {
         return;
       case "/panel":
         await this.reply(settings, chatId, await rootPanelReply());
+        return;
+      case "/expiring_phones":
+      case "/expiring":
+      case "/expiring_phone":
+        await this.reply(settings, chatId, await expiringPhonesReply(Number(args[0]) || 1));
         return;
       case "/accounts":
         await this.reply(settings, chatId, await accountListReply(1));
@@ -416,6 +424,7 @@ async function ensureBotCommands(botToken: string, apiBaseUrl?: string | null) {
         { command: "panel", description: "打开机器人控制面板" },
         { command: "accounts", description: "查看账户列表" },
         { command: "account", description: "查看账户详情：/account 3" },
+        { command: "expiring_phones", description: "查看临期手机号（7天内到期）" },
         { command: "phones", description: "查看手机号：/phones 3" },
         { command: "messages", description: "查看最近消息：/messages 3" },
         { command: "countries", description: "查看可选号国家：/countries 3" },
@@ -567,6 +576,13 @@ export async function loadTelegramAccountDetail(accountId: number, db: TelegramB
       monitorEnabled: true,
       telegramNotify: true,
       lastError: true,
+      snapshot: {
+        select: {
+          primaryBalance: true,
+          validPoint: true,
+          updatedAt: true
+        }
+      },
       _count: {
         select: {
           phoneNumbers: true,
@@ -584,12 +600,35 @@ export async function loadTelegramAccountDetail(accountId: number, db: TelegramB
 }
 
 export async function loadTelegramPhoneDetail(accountId: number, phoneId: number, db: TelegramBotDb = prisma) {
-  const phone = await db.phoneNumber.findFirst({ where: { id: phoneId, accountId } });
+  const phone = await db.phoneNumber.findFirst({
+    where: { id: phoneId, accountId },
+    include: {
+      account: {
+        select: {
+          id: true,
+          nickname: true,
+          email: true,
+          phone: true,
+          appVariant: true,
+          snapshot: {
+            select: {
+              primaryBalance: true,
+              validPoint: true
+            }
+          }
+        }
+      }
+    }
+  });
   if (!phone) return null;
   const { allow_receive_sms: allowReceiveSms } = serializePhoneNumber(phone);
   return {
     id: phone.id,
     accountId: phone.accountId,
+    accountName: accountName(phone.account),
+    accountPhone: phone.account.phone,
+    balance: phone.account.snapshot?.primaryBalance ?? null,
+    currency: phoneCurrencyLabel(phone.account.appVariant),
     phoneNumber: phone.phoneNumber,
     displayName: phone.displayName,
     status: phone.status,
@@ -643,6 +682,9 @@ async function accountDetailReply(accountId: number): Promise<BotReply> {
     text: formatAccountCard({
       id: account.id,
       name: accountName(account),
+      phone: account.phone,
+      balance: account.snapshot?.primaryBalance ?? null,
+      currency: phoneCurrencyLabel(account.appVariant),
       appVariant: String(account.appVariant),
       status: String(account.status),
       monitorEnabled: account.monitorEnabled,
@@ -668,10 +710,14 @@ async function accountPhoneListReply(accountId: number, page: number): Promise<B
   };
 }
 
-async function phoneDetailReply(accountId: number, phoneId: number): Promise<BotReply> {
+async function phoneDetailReply(accountId: number, phoneId: number, fromExpiring = false): Promise<BotReply> {
   const phone = await loadTelegramPhoneDetail(accountId, phoneId);
   if (!phone) return htmlNotice("号码不存在。");
-  return { text: formatPhoneCard(phone), replyMarkup: phoneDetailKeyboard(accountId, phoneId), parseMode: "HTML" };
+  return {
+    text: formatPhoneCard(phone),
+    replyMarkup: fromExpiring ? expiringPhoneDetailKeyboard(accountId, phoneId) : phoneDetailKeyboard(accountId, phoneId),
+    parseMode: "HTML"
+  };
 }
 
 async function recentMessagesReply(accountId?: number, limitInput?: number): Promise<BotReply> {
@@ -694,10 +740,124 @@ async function recentMessagesReply(accountId?: number, limitInput?: number): Pro
   };
 }
 
+
+const TELEGRAM_EXPIRING_PAGE_SIZE = 6;
+
+async function loadTelegramExpiringPhones(page: number, db: TelegramBotDb = prisma) {
+  const allPhones = await db.phoneNumber.findMany({
+    where: {
+      status: { not: PhoneStatus.cancelled },
+      expiredTime: { not: null }
+    },
+    include: {
+      account: {
+        select: {
+          id: true,
+          nickname: true,
+          email: true,
+          phone: true,
+          appVariant: true,
+          snapshot: {
+            select: {
+              primaryBalance: true,
+              validPoint: true
+            }
+          }
+        }
+      }
+    }
+  });
+
+  const now = Date.now();
+  const sevenDaysLater = now + 7 * 24 * 60 * 60 * 1000;
+
+  const expiring = allPhones.filter((p) => {
+    if (!p.expiredTime) return false;
+    const raw = Number(p.expiredTime);
+    const ms = Number.isFinite(raw) && raw > 0
+      ? (raw > 1_000_000_000_000 ? raw : raw * 1000)
+      : new Date(p.expiredTime).getTime();
+    return Number.isFinite(ms) && ms <= sevenDaysLater;
+  });
+
+  expiring.sort((a, b) => {
+    const rawA = Number(a.expiredTime);
+    const msA = Number.isFinite(rawA) && rawA > 0 ? (rawA > 1_000_000_000_000 ? rawA : rawA * 1000) : new Date(a.expiredTime!).getTime();
+    const rawB = Number(b.expiredTime);
+    const msB = Number.isFinite(rawB) && rawB > 0 ? (rawB > 1_000_000_000_000 ? rawB : rawB * 1000) : new Date(b.expiredTime!).getTime();
+    return msA - msB;
+  });
+
+  return paginateTelegramItems(expiring, page, TELEGRAM_EXPIRING_PAGE_SIZE);
+}
+
+async function expiringPhonesReply(page = 1): Promise<BotReply> {
+  const result = await loadTelegramExpiringPhones(page);
+  const now = Date.now();
+
+  type ExpiringPhoneItem = (typeof result.items)[number];
+  const cardItems = result.items.map((p: ExpiringPhoneItem) => {
+    const raw = Number(p.expiredTime);
+    const ms = Number.isFinite(raw) && raw > 0
+      ? (raw > 1_000_000_000_000 ? raw : raw * 1000)
+      : new Date(p.expiredTime!).getTime();
+    const diffMs = ms - now;
+    const diffDays = diffMs / (24 * 60 * 60 * 1000);
+    const currency = phoneCurrencyLabel(p.account.appVariant);
+    const balanceText = p.account.snapshot?.primaryBalance !== undefined && p.account.snapshot?.primaryBalance !== null
+      ? `${p.account.snapshot.primaryBalance} ${currency}`
+      : "暂未获取";
+
+    let remainingText = "";
+    if (diffMs <= 0) {
+      remainingText = "❌ 已到期";
+    } else if (diffDays <= 1) {
+      remainingText = `🔴 剩 ${Math.max(1, Math.ceil(diffMs / 3600000))} 小时 (急需续期)`;
+    } else if (diffDays <= 3) {
+      remainingText = `🟠 剩 ${Math.ceil(diffDays)} 天 (即将到期)`;
+    } else {
+      remainingText = `🟡 剩 ${Math.ceil(diffDays)} 天 (临期预警)`;
+    }
+
+    return {
+      accountId: p.accountId,
+      accountName: accountName(p.account),
+      accountPhone: p.account.phone,
+      phoneNumber: p.phoneNumber,
+      expiredTime: p.expiredTime,
+      daysRemainingText: remainingText,
+      balanceText
+    };
+  });
+
+  const buttonItems = result.items.map((p: ExpiringPhoneItem) => {
+    const raw = Number(p.expiredTime);
+    const ms = Number.isFinite(raw) && raw > 0
+      ? (raw > 1_000_000_000_000 ? raw : raw * 1000)
+      : new Date(p.expiredTime!).getTime();
+    const diffMs = ms - now;
+    const diffDays = diffMs / (24 * 60 * 60 * 1000);
+    const text = diffMs <= 0 ? "已到期" : diffDays <= 1 ? `${Math.max(1, Math.ceil(diffMs / 3600000))}h` : `${Math.ceil(diffDays)}天`;
+    return {
+      accountId: p.accountId,
+      phoneId: p.id,
+      phoneNumber: p.phoneNumber,
+      daysRemainingText: text
+    };
+  });
+
+  return {
+    text: formatExpiringPhonesCard(cardItems, result.page, result.totalPages),
+    replyMarkup: expiringPhonesKeyboard(buttonItems, result.page, result.totalPages),
+    parseMode: "HTML"
+  };
+}
+
 export async function handleTelegramCallback(callback: TelegramPanelCallback): Promise<BotReply> {
   if (callback.scope === "panel") {
     if (callback.action === "accounts") return accountListReply(callback.page);
     if (callback.action === "phones") return phoneAccountListReply(callback.page);
+    if (callback.action === "expiring") return expiringPhonesReply(callback.page);
     if (callback.action === "messages") return recentMessagesReply();
     if (callback.action === "help") return helpReply();
     if (callback.action === "status") return statusPanelReply();
@@ -705,6 +865,7 @@ export async function handleTelegramCallback(callback: TelegramPanelCallback): P
   }
   if (callback.scope === "phone") {
     if (callback.action === "note") return phoneNoteCommandReply(callback.accountId, callback.phoneId);
+    if (callback.action === "expiring_detail") return phoneDetailReply(callback.accountId, callback.phoneId, true);
     if (callback.action === "renew_request" || callback.action === "cancel_request") {
       return phoneActionConfirmationReply(callback.accountId, callback.phoneId, callback.action === "renew_request" ? "renew" : "cancel");
     }
@@ -716,7 +877,7 @@ export async function handleTelegramCallback(callback: TelegramPanelCallback): P
         callback.version
       );
     }
-    return phoneDetailReply(callback.accountId, callback.phoneId);
+    return phoneDetailReply(callback.accountId, callback.phoneId, false);
   }
   if (callback.action === "detail") return accountDetailReply(callback.accountId);
   if (callback.action === "messages") return recentMessagesReply(callback.accountId, 5);
@@ -1575,14 +1736,43 @@ async function phoneActionText(
                 }
               : null;
           }
-        : undefined
+        : action === "cancel"
+          ? (payload) => {
+              const result = payload.Result ?? payload.result;
+              const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode;
+              const success = payload.success ?? payload.ok;
+              if (
+                result === 1 ||
+                result === "1" ||
+                result === true ||
+                errCode === 0 ||
+                errCode === "0" ||
+                success === true ||
+                payload.status === "cancelled"
+              ) {
+                return {
+                  confirmationSource: "direct_response",
+                  responseClass: "response_confirmed",
+                  evidenceAt: new Date()
+                };
+              }
+              return null;
+            }
+          : undefined
     });
 
-    if (envelope.operation.state === "confirmed" && responsePatch) {
-      await prisma.phoneNumber.update({
-        where: { id: phone.id },
-        data: mapPhoneNumber(responsePatch)
-      });
+    if (envelope.operation.state === "confirmed") {
+      if (action === "cancel") {
+        await prisma.phoneNumber.update({
+          where: { id: phone.id },
+          data: { status: PhoneStatus.cancelled }
+        });
+      } else if (responsePatch) {
+        await prisma.phoneNumber.update({
+          where: { id: phone.id },
+          data: mapPhoneNumber(responsePatch)
+        });
+      }
     }
     if (envelope.operation.state === "confirmed") {
       return `${action === "renew" ? "续费" : action === "cancel" ? "取消" : action === "pause" ? "暂停" : "恢复"}已确认。`;

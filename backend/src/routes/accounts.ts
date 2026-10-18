@@ -2149,9 +2149,6 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/cancel", async (req, res, next)
     const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
     const phoneItem = await assertAccountPhoneNumber(account.id, Number(req.params.phoneId));
     const useDirect = await shouldUseDirectAccountFlow(account);
-    if (!useDirect) {
-      throw new AppError("Phone cancellation requires a Direct account session and does not use ADB/helper fallback.", 409, 409);
-    }
     const envelope = await phoneActionCoordinator.execute({
       operation: {
         accountId: account.id,
@@ -2164,20 +2161,67 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/cancel", async (req, res, next)
         requestFingerprint: `cancel:${phoneItem.id}`,
         requestPayload: { status: "cancelled" }
       },
-      mutate: () => directRefreshGateway.cancelPhoneNumberMutation(
-        {
-          dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
-          token: requireString(decryptText(account.dtToken), "Missing dt_token"),
-          deviceId: account.dtDeviceId,
-          appVariant: account.appVariant
-        },
-        phoneItem.phoneNumber,
-        mapStoredPhoneContext(phoneItem)
-      )
+      mutate: async () => {
+        if (!useDirect) {
+          await dingtoneGateway.cancelPhoneNumber(
+            {
+              dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+              token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+              deviceId: account.dtDeviceId,
+              appVariant: account.appVariant
+            },
+            phoneItem.phoneNumber
+          );
+          return {
+            outcome: "response",
+            payload: { Result: 1, status: "cancelled" }
+          };
+        }
+        return directRefreshGateway.cancelPhoneNumberMutation(
+          {
+            dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+            token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+            deviceId: account.dtDeviceId,
+            appVariant: account.appVariant
+          },
+          phoneItem.phoneNumber,
+          mapStoredPhoneContext(phoneItem)
+        );
+      },
+      classifyResponse: (payload) => {
+        const result = payload.Result ?? payload.result;
+        const errCode = payload.ErrCode ?? payload.errCode ?? payload.errorCode;
+        const success = payload.success ?? payload.ok;
+        if (
+          result === 1 ||
+          result === "1" ||
+          result === true ||
+          errCode === 0 ||
+          errCode === "0" ||
+          success === true ||
+          payload.status === "cancelled"
+        ) {
+          return {
+            confirmationSource: useDirect ? "direct_response" : "helper_response",
+            responseClass: "response_confirmed",
+            evidenceAt: new Date()
+          };
+        }
+        return null;
+      }
     });
+
+    let updated = phoneItem;
+    if (envelope.operation.state === "confirmed") {
+      updated = await prisma.phoneNumber.update({
+        where: { id: phoneItem.id },
+        data: { status: PhoneStatus.cancelled }
+      });
+    }
+
     ok(res, {
       operation: serializePhoneActionOperation(envelope.operation),
-      phone: serializePhoneNumber(phoneItem),
+      phone: serializePhoneNumber(updated),
       reused: envelope.reused
     });
   } catch (error) {

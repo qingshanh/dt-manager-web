@@ -11,6 +11,64 @@ export type TelegramInlineKeyboardMarkup = {
 
 const TELEGRAM_TRUNCATION_SUFFIX = "\n…内容已截断";
 
+export function chunkAdaptiveButtons(
+  buttons: TelegramInlineKeyboardButton[],
+  maxCharsPerRow = 24,
+  maxCols = 2
+): TelegramInlineKeyboardButton[][] {
+  const rows: TelegramInlineKeyboardButton[][] = [];
+  let currentRow: TelegramInlineKeyboardButton[] = [];
+  let currentChars = 0;
+
+  for (const btn of buttons) {
+    const btnLength = Array.from(btn.text).length;
+    if (currentRow.length > 0 && (currentChars + btnLength > maxCharsPerRow || currentRow.length >= maxCols)) {
+      rows.push(currentRow);
+      currentRow = [];
+      currentChars = 0;
+    }
+    currentRow.push(btn);
+    currentChars += btnLength;
+  }
+  if (currentRow.length > 0) {
+    rows.push(currentRow);
+  }
+  return rows;
+}
+
+export function formatPhoneExpiryDisplay(value: string | null | undefined): string {
+  if (!value) return "未知";
+  const num = Number(value);
+  let date: Date;
+  if (Number.isFinite(num) && num > 0) {
+    date = new Date(num > 1_000_000_000_000 ? num : num * 1000);
+  } else {
+    date = new Date(value);
+  }
+  if (Number.isNaN(date.getTime())) return String(value);
+
+  const now = Date.now();
+  const diffMs = date.getTime() - now;
+  const diffDays = diffMs / (24 * 60 * 60 * 1000);
+  const formatted = date.toISOString().replace("T", " ").slice(0, 16);
+
+  if (diffMs <= 0) {
+    return `${formatted} (❌ 已到期)`;
+  }
+  if (diffDays <= 1) {
+    const hours = Math.max(1, Math.ceil(diffMs / 3600000));
+    return `${formatted} (🔴 剩余 ${hours} 小时，急需续期)`;
+  }
+  if (diffDays <= 3) {
+    return `${formatted} (🟠 剩余 ${Math.ceil(diffDays)} 天，即将到期)`;
+  }
+  if (diffDays <= 7) {
+    return `${formatted} (🟡 剩余 ${Math.ceil(diffDays)} 天，临期)`;
+  }
+  return `${formatted} (🟢 剩余 ${Math.floor(diffDays)} 天)`;
+}
+
+
 export function escapeTelegramHtml(value: unknown) {
   return String(value ?? "-")
     .replaceAll("&", "&amp;")
@@ -29,13 +87,14 @@ export function formatPanelStatusCard(input: {
 }) {
   return [
     "<b>🤖 dt-manager 控制面板</b>",
+    "━━━━━━━━━━━━━━━━━━",
     `账户：${input.accountCount}（在线 ${input.onlineCount}）`,
     `监听中：${input.monitorCount}`,
     `Telegram 通知：${input.telegramCount}`,
     `已购手机号：${input.phoneCount}`,
     `未读短信：${input.unreadCount}`,
-    "",
-    "请选择下面的安全操作。"
+    "━━━━━━━━━━━━━━━━━━",
+    "👇 请选择下方的安全操作面板："
   ].join("\n");
 }
 
@@ -74,17 +133,29 @@ export function formatAccountCard(input: {
   phoneCount: number;
   unreadCount: number;
   lastError: string | null;
+  balance?: number | null;
+  currency?: string;
+  phone?: string | null;
 }) {
+  const currency = input.currency ?? (input.appVariant === "dingdong" ? "说道币" : "叮咚币");
+  const balanceText = input.balance !== undefined && input.balance !== null
+    ? `${input.balance} ${currency}`
+    : "暂未获取（可点击下方刷新资料）";
+
   return [
     `<b>👤 ${escapeTelegramHtml(input.name)}</b>`,
-    `面板账户：<code>#${input.id}</code>`,
-    `应用：${escapeTelegramHtml(input.appVariant)}`,
-    `状态：${escapeTelegramHtml(input.status)}`,
-    `监听：${input.monitorEnabled ? "✅ 已开启" : "⏸ 已停止"}`,
-    `Telegram：${input.telegramNotify ? "✅ 已开启" : "🔕 已关闭"}`,
-    `手机号：${input.phoneCount}`,
-    `未读短信：${input.unreadCount}`,
-    `最近错误：${escapeTelegramHtml(input.lastError ?? "-")}`
+    "━━━━━━━━━━━━━━━━━━",
+    `🆔 面板账户：<code>#${input.id}</code>`,
+    `📱 绑定手机：<code>${escapeTelegramHtml(input.phone ?? "-")}</code>`,
+    `📦 应用：${escapeTelegramHtml(input.appVariant)}`,
+    `💰 账户余额：<b>${escapeTelegramHtml(balanceText)}</b>`,
+    `⚡ 状态：${escapeTelegramHtml(input.status)}`,
+    `📡 监听：${input.monitorEnabled ? "✅ 已开启" : "⏸ 已停止"}`,
+    `🔔 Telegram：${input.telegramNotify ? "✅ 已开启" : "🔕 已关闭"}`,
+    `📞 手机号：${input.phoneCount} 个`,
+    `💬 未读短信：${input.unreadCount} 条`,
+    `⚠️ 最近错误：${escapeTelegramHtml(input.lastError ?? "-")}`,
+    "━━━━━━━━━━━━━━━━━━"
   ].join("\n");
 }
 
@@ -104,6 +175,10 @@ export function formatPhoneListCard(
 
 export function formatPhoneCard(input: {
   accountId: number;
+  accountName?: string;
+  accountPhone?: string | null;
+  balance?: number | null;
+  currency?: string;
   id: number;
   phoneNumber: string;
   displayName: string | null;
@@ -114,17 +189,28 @@ export function formatPhoneCard(input: {
   autoRenew: boolean;
   allowReceiveSms: boolean | null;
 }) {
+  const currency = input.currency ?? "说道币/叮咚币";
+  const balanceText = input.balance !== undefined && input.balance !== null
+    ? `${input.balance} ${currency}`
+    : "暂未获取";
+  const expiryDisplay = formatPhoneExpiryDisplay(input.expiredTime);
+
   return [
     "<b>📱 手机号详情</b>",
-    `号码：<code>${escapeTelegramHtml(input.phoneNumber)}</code>`,
-    `备注：${escapeTelegramHtml(input.displayName ?? "-")}`,
-    `状态：${escapeTelegramHtml(input.status)}`,
-    `国家码：${input.countryCode ? `+${input.countryCode}` : "-"}`,
-    `Provider：${input.providerId ?? "-"}`,
-    `到期时间：${escapeTelegramHtml(input.expiredTime ?? "-")}`,
-    `自动续费：${input.autoRenew ? "是" : "否"}`,
-    `短信接收：${input.allowReceiveSms === null ? "未知" : input.allowReceiveSms ? "已开启" : "已关闭"}`,
-    "",
+    "━━━━━━━━━━━━━━━━━━",
+    `📞 手机号码：<code>${escapeTelegramHtml(input.phoneNumber)}</code>`,
+    `🏷️ 号码备注：${escapeTelegramHtml(input.displayName ?? "-")}`,
+    `👤 所属账户：${escapeTelegramHtml(input.accountName ?? `#${input.accountId}`)} <code>#${input.accountId}</code>`,
+    `📱 账户手机：<code>${escapeTelegramHtml(input.accountPhone ?? "-")}</code>`,
+    `💰 账户余额：<b>${escapeTelegramHtml(balanceText)}</b>`,
+    `⚡ 号码状态：${escapeTelegramHtml(input.status)}`,
+    `⏳ 到期时间：${escapeTelegramHtml(input.expiredTime ?? "-")}`,
+    `📊 到期状态：<b>${expiryDisplay}</b>`,
+    `🌐 国家码：${input.countryCode ? `+${input.countryCode}` : "-"}`,
+    `📶 Provider：${input.providerId ?? "-"}`,
+    `🔄 自动续费：${input.autoRenew ? "✅ 是" : "❌ 否"}`,
+    `📩 短信接收：${input.allowReceiveSms === null ? "未知" : input.allowReceiveSms ? "✅ 已开启" : "❌ 已关闭"}`,
+    "━━━━━━━━━━━━━━━━━━",
     `修改备注：<code>/set_phone_note ${input.accountId} ${input.id} 新备注</code>`
   ].join("\n");
 }
@@ -213,10 +299,13 @@ export function mainPanelKeyboard(): TelegramInlineKeyboardMarkup {
         panelButton("📱 手机号管理", "phones", 1)
       ],
       [
-        panelButton("💬 最近短信", "messages"),
-        panelButton("📊 运行状态", "status")
+        panelButton("⚠️ 临期手机号", "expiring", 1),
+        panelButton("💬 最近短信", "messages")
       ],
-      [panelButton("📖 命令帮助", "help")]
+      [
+        panelButton("📊 运行状态", "status"),
+        panelButton("📖 命令帮助", "help")
+      ]
     ]
   };
 }
@@ -226,13 +315,14 @@ export function accountListKeyboard(
   page: number,
   totalPages: number
 ): TelegramInlineKeyboardMarkup {
-  const rows = accounts.map((account) => [
+  const buttons = accounts.map((account) =>
     callbackButton(truncateButtonText(`#${account.id} ${account.name}`), {
       scope: "account",
       action: "detail",
       accountId: account.id
     })
-  ]);
+  );
+  const rows = chunkAdaptiveButtons(buttons, 24, 2);
   const pagination = panelPaginationRow("accounts", page, totalPages);
   if (pagination.length > 0) rows.push(pagination);
   rows.push([panelButton("⬅️ 返回主面板", "root")]);
@@ -244,14 +334,15 @@ export function phoneAccountKeyboard(
   page: number,
   totalPages: number
 ): TelegramInlineKeyboardMarkup {
-  const rows = accounts.map((account) => [
-    callbackButton(truncateButtonText(`#${account.id} ${account.name} · ${account.phoneCount}`), {
+  const buttons = accounts.map((account) =>
+    callbackButton(truncateButtonText(`#${account.id} ${account.name} · ${account.phoneCount}号`), {
       scope: "account",
       action: "phones",
       accountId: account.id,
       page: 1
     })
-  ]);
+  );
+  const rows = chunkAdaptiveButtons(buttons, 24, 2);
   const pagination = panelPaginationRow("phones", page, totalPages);
   if (pagination.length > 0) rows.push(pagination);
   rows.push([panelButton("⬅️ 返回主面板", "root")]);
@@ -324,14 +415,15 @@ export function phoneListKeyboard(
   page: number,
   totalPages: number
 ): TelegramInlineKeyboardMarkup {
-  const rows = phones.map((phone) => [
+  const buttons = phones.map((phone) =>
     callbackButton(truncateButtonText(phone.phoneNumber), {
       scope: "phone",
       action: "detail",
       accountId,
       phoneId: phone.id
     })
-  ]);
+  );
+  const rows = chunkAdaptiveButtons(buttons, 26, 2);
   const pagination = accountPhonePaginationRow(accountId, page, totalPages);
   if (pagination.length > 0) rows.push(pagination);
   rows.push([panelButton("⬅️ 返回手机号账户", "phones", 1)]);
@@ -376,12 +468,88 @@ export function phoneActionConfirmationKeyboard(
   };
 }
 
+
+export function formatExpiringPhonesCard(
+  phones: Array<{
+    accountId: number;
+    accountName: string;
+    accountPhone: string | null;
+    phoneNumber: string;
+    expiredTime: string | null;
+    daysRemainingText: string;
+    balanceText: string;
+  }>,
+  page: number,
+  totalPages: number
+) {
+  if (phones.length === 0) {
+    return [
+      "<b>⚠️ 临期手机号查询</b>",
+      "━━━━━━━━━━━━━━━━━━",
+      "🎉 当前暂无 7 天内即将到期的手机号，所有号码运行正常！",
+      "━━━━━━━━━━━━━━━━━━"
+    ].join("\n");
+  }
+
+  const lines = [
+    `<b>⚠️ 临期手机号清单（7天内到期）</b> · 第 ${page}/${totalPages} 页`,
+    "━━━━━━━━━━━━━━━━━━"
+  ];
+
+  for (const p of phones) {
+    lines.push(
+      `📞 <code>${escapeTelegramHtml(p.phoneNumber)}</code> · <b>${escapeTelegramHtml(p.daysRemainingText)}</b>`,
+      `   👤 账户：${escapeTelegramHtml(p.accountName)} (<code>#${p.accountId}</code>)`,
+      `   📱 账户手机：<code>${escapeTelegramHtml(p.accountPhone ?? "-")}</code>`,
+      `   💰 账户余额：${escapeTelegramHtml(p.balanceText)}`,
+      ""
+    );
+  }
+  lines.push("👇 点击下方对应号码按钮，可查看详情、续期或取消号码：");
+  return lines.join("\n");
+}
+
+export function expiringPhonesKeyboard(
+  phones: Array<{ accountId: number; phoneId: number; phoneNumber: string; daysRemainingText: string }>,
+  page: number,
+  totalPages: number
+): TelegramInlineKeyboardMarkup {
+  const buttons = phones.map((phone) =>
+    callbackButton(truncateButtonText(`${phone.phoneNumber} (${phone.daysRemainingText})`), {
+      scope: "phone",
+      action: "expiring_detail",
+      accountId: phone.accountId,
+      phoneId: phone.phoneId
+    })
+  );
+  const rows = chunkAdaptiveButtons(buttons, 26, 2);
+  const pagination = panelPaginationRow("expiring", page, totalPages);
+  if (pagination.length > 0) rows.push(pagination);
+  rows.push([panelButton("⬅️ 返回主面板", "root")]);
+  return { inline_keyboard: rows };
+}
+
+export function expiringPhoneDetailKeyboard(accountId: number, phoneId: number): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [
+        callbackButton("🔄 续期号码", { scope: "phone", action: "renew_request", accountId, phoneId }),
+        callbackButton("🗑️ 取消号码", { scope: "phone", action: "cancel_request", accountId, phoneId })
+      ],
+      [
+        callbackButton("✏️ 修改备注命令", { scope: "phone", action: "note", accountId, phoneId }),
+        panelButton("⬅️ 返回临期列表", "expiring", 1)
+      ]
+    ]
+  };
+}
+
 function panelButton(
   text: string,
-  action: "root" | "status" | "messages" | "help" | "accounts" | "phones",
+  action: "root" | "status" | "messages" | "help" | "accounts" | "phones" | "expiring",
   page?: number
 ) {
-  if (action === "accounts" || action === "phones") {
+  if (action === "accounts" || action === "phones" || action === "expiring") {
     return callbackButton(text, { scope: "panel", action, page: page ?? 1 });
   }
   return callbackButton(text, { scope: "panel", action });
@@ -395,7 +563,7 @@ function callbackButton(
 }
 
 function panelPaginationRow(
-  action: "accounts" | "phones",
+  action: "accounts" | "phones" | "expiring",
   page: number,
   totalPages: number
 ): TelegramInlineKeyboardButton[] {

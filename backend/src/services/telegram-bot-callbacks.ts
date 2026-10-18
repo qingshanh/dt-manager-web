@@ -1,6 +1,6 @@
 export type TelegramPanelCallback =
   | { scope: "panel"; action: "root" | "status" | "messages" | "help" }
-  | { scope: "panel"; action: "accounts" | "phones"; page: number }
+  | { scope: "panel"; action: "accounts" | "phones" | "expiring"; page: number }
   | {
       scope: "account";
       action:
@@ -18,7 +18,7 @@ export type TelegramPanelCallback =
   | { scope: "account"; action: "phones"; accountId: number; page: number }
   | {
       scope: "phone";
-      action: "detail" | "note" | "renew_request" | "cancel_request";
+      action: "detail" | "note" | "renew_request" | "cancel_request" | "expiring_detail";
       accountId: number;
       phoneId: number;
     }
@@ -36,7 +36,8 @@ const PANEL_CODES = {
   messages: "m",
   help: "h",
   accounts: "a",
-  phones: "n"
+  phones: "n",
+  expiring: "x"
 } as const;
 
 const ACCOUNT_CODES = {
@@ -58,7 +59,8 @@ const PHONE_CODES = {
   renew_request: "rr",
   cancel_request: "cr",
   renew_confirm: "rx",
-  cancel_confirm: "cx"
+  cancel_confirm: "cx",
+  expiring_detail: "xd"
 } as const;
 
 export function encodeTelegramCallback(callback: TelegramPanelCallback) {
@@ -88,7 +90,7 @@ export function parseTelegramCallback(value: string | undefined): TelegramPanelC
   if (parts[0] === "p") {
     const action = panelAction(parts[1]);
     if (!action) return null;
-    if (action === "accounts" || action === "phones") {
+    if (action === "accounts" || action === "phones" || action === "expiring") {
       const page = parsePositiveInteger(parts[2]);
       return parts.length === 3 && page ? { scope: "panel", action, page } : null;
     }
@@ -164,6 +166,7 @@ function panelAction(value: string | undefined) {
   if (value === PANEL_CODES.help) return "help" as const;
   if (value === PANEL_CODES.accounts) return "accounts" as const;
   if (value === PANEL_CODES.phones) return "phones" as const;
+  if (value === PANEL_CODES.expiring) return "expiring" as const;
   return null;
 }
 
@@ -188,5 +191,6 @@ function phoneAction(value: string | undefined) {
   if (value === PHONE_CODES.cancel_request) return "cancel_request" as const;
   if (value === PHONE_CODES.renew_confirm) return "renew_confirm" as const;
   if (value === PHONE_CODES.cancel_confirm) return "cancel_confirm" as const;
+  if (value === PHONE_CODES.expiring_detail) return "expiring_detail" as const;
   return null;
 }

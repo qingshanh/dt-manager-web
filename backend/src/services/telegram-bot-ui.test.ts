@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parseTelegramCallback, type TelegramPanelCallback } from "./telegram-bot-callbacks.js";
 import {
+  chunkAdaptiveButtons,
+  formatExpiringPhonesCard,
+  expiringPhonesKeyboard,
   accountActionKeyboard,
   accountListKeyboard,
   escapeTelegramHtml,
@@ -248,3 +251,46 @@ function assertBalancedTelegramHtml(value: string) {
   }
   assert.deepEqual(stack, [], value);
 }
+
+test("chunkAdaptiveButtons layouts short buttons into multiple columns and long buttons alone", () => {
+  const btn1 = { text: "#1 账号A", callback_data: "a:1:d" };
+  const btn2 = { text: "#2 账号B", callback_data: "a:2:d" };
+  const btn3 = { text: "#3 超长账号名称演示", callback_data: "a:3:d" };
+
+  const rows = chunkAdaptiveButtons([btn1, btn2, btn3], 24, 2);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[0], [btn1, btn2]);
+  assert.deepEqual(rows[1], [btn3]);
+});
+
+test("expiring phones card and keyboard format correctly", () => {
+  const card = formatExpiringPhonesCard(
+    [
+      {
+        accountId: 1,
+        accountName: "测试账户",
+        accountPhone: "+123456",
+        phoneNumber: "+1987654321",
+        expiredTime: "1790000000000",
+        daysRemainingText: "剩 2 天",
+        balanceText: "500 说道币"
+      }
+    ],
+    1,
+    1
+  );
+  assert.match(card, /临期手机号清单/);
+  assert.match(card, /测试账户/);
+  assert.match(card, /500 说道币/);
+  assert.match(card, /剩 2 天/);
+
+  const kb = expiringPhonesKeyboard(
+    [
+      { accountId: 1, phoneId: 99, phoneNumber: "+1987654321", daysRemainingText: "2天" }
+    ],
+    1,
+    1
+  );
+  assert.equal(kb.inline_keyboard.length, 2);
+  assert.equal(kb.inline_keyboard[0]?.[0]?.text, "+1987654321 (2天)");
+});

@@ -35,6 +35,7 @@ import {
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
+import { PhoneExpiryBadge } from '../components/PhoneExpiryBadge';
 import {
   CACHE_TTL_MS,
   cacheKeys,
@@ -2375,8 +2376,8 @@ export default function AccountDetail() {
     {
       title: '到期时间',
       dataIndex: 'expired_time',
-      width: 170,
-      render: (value) => formatEpochTime(value),
+      width: 220,
+      render: (value) => <PhoneExpiryBadge value={value} />,
     },
     {
       title: '购买日期',

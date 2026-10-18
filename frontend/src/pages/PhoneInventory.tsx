@@ -1,3 +1,4 @@
+import { PhoneExpiryBadge } from '../components/PhoneExpiryBadge';
 import {
   CopyOutlined,
   EditOutlined,
@@ -360,7 +361,7 @@ export default function PhoneInventory() {
                             <Descriptions.Item label="国家">{formatCountry(phone)}</Descriptions.Item>
                             <Descriptions.Item label="Provider">{phone.provider_id ?? '-'}</Descriptions.Item>
                             <Descriptions.Item label="获得时间">{formatDate(phone.gain_time)}</Descriptions.Item>
-                            <Descriptions.Item label="到期时间">{formatDate(phone.expired_time)}</Descriptions.Item>
+                            <Descriptions.Item label="到期时间"><PhoneExpiryBadge value={phone.expired_time} /></Descriptions.Item>
                           </Descriptions>
                           <Space wrap>
                             <Button size="small" icon={<CopyOutlined />} onClick={() => void copyPhone(phone.phone_number)}>复制</Button>
@@ -450,7 +451,7 @@ function PhoneDetails({ phone }: { phone: PhoneInventoryPhone }) {
       <Descriptions.Item label="城市">{phone.city_name || '-'}</Descriptions.Item>
       <Descriptions.Item label="州/省">{phone.state_name || '-'}</Descriptions.Item>
       <Descriptions.Item label="获得时间">{formatDate(phone.gain_time)}</Descriptions.Item>
-      <Descriptions.Item label="到期时间">{formatDate(phone.expired_time)}</Descriptions.Item>
+      <Descriptions.Item label="到期时间"><PhoneExpiryBadge value={phone.expired_time} /></Descriptions.Item>
       <Descriptions.Item label="有效期天数">{phone.valid_period_days ?? '-'}</Descriptions.Item>
       <Descriptions.Item label="购买类型">{phone.purchase_type ?? '-'}</Descriptions.Item>
       <Descriptions.Item label="支付类型">{phone.pay_type ?? '-'}</Descriptions.Item>

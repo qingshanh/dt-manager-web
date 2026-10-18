@@ -172,3 +172,30 @@ test("renewal response extracts expiry from a nested native order payload", () =
   assert.equal(normalized.gainTime, "1730179465945");
   assert.equal(normalized.payType, 2);
 });
+
+test("accepts deletePhoneNumber success response with or without TrackCode", () => {
+  assert.equal(
+    acceptsCommonRestJsonPayloadForTest(
+      "/pstn/share/deletePhoneNumber",
+      "phoneNumber=32470123456&TrackCode=40051185300000003",
+      { Result: 1 }
+    ),
+    true
+  );
+  assert.equal(
+    acceptsCommonRestJsonPayloadForTest(
+      "/pstn/share/deletePhoneNumber",
+      "phoneNumber=32470123456",
+      { Result: 1 }
+    ),
+    true
+  );
+  assert.equal(
+    acceptsCommonRestJsonPayloadForTest(
+      "/pstn/share/deletePrivateNumber",
+      "phoneNumber=32470123456",
+      { Result: 1, status: "cancelled" }
+    ),
+    true
+  );
+});
