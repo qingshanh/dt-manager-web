@@ -309,7 +309,7 @@ const MAX_DIRECT_JSON_QUEUE = 256;
 const MAX_DIRECT_JSON_QUEUE_BYTES = 8 * 1024 * 1024;
 const PHONE_PURCHASE_LOCK_API_NAME = "/number/lock";
 const PHONE_PURCHASE_UNLOCK_API_NAME = "/number/unlock";
-const PHONE_PURCHASE_ORDER_EDGE_API_NAME = "pstn/share/orderPrivateNumber";
+const PHONE_PURCHASE_ORDER_EDGE_API_NAME = "/pstn/share/orderPrivateNumber";
 const PHONE_PURCHASE_EDGE_REST_CALL_TYPES = [10000, 10001] as const;
 const PHONE_PURCHASE_LOCK_REST_CALL_TYPE = PHONE_PURCHASE_EDGE_REST_CALL_TYPES[0];
 const PHONE_PURCHASE_ORDER_REST_CALL_TYPE = PHONE_PURCHASE_EDGE_REST_CALL_TYPES[1];
@@ -3553,7 +3553,6 @@ class DirectSession {
   }
 
   async callEdgeOrderPrivateNumberJson(query: string, timeoutMs = this.runtime.ioTimeoutMs) {
-    const restCallType = this.nextEdgeRestCallType();
     const request = buildCommonRestRequestFrame({
       template: TEMPLATES.getPrivateNumber,
       session: this.sessionId,
@@ -3561,7 +3560,7 @@ class DirectSession {
       status: 0x0102,
       apiName: PHONE_PURCHASE_ORDER_EDGE_API_NAME,
       query,
-      rpcContext: encodeEdgeRestRpcContext(restCallType)
+      rpcContext: encodeOrderPrivateNumberRpcContext()
     });
 
     this.clearJsonQueue();
@@ -4577,8 +4576,13 @@ function isExpectedEdgeOrderPrivateNumberPayload(payload: ApiResult) {
     hasNestedOwnKey(payload, "payType") ||
     hasNestedOwnKey(payload, "provision") ||
     hasNestedOwnKey(payload, "expireTime") ||
-    hasNestedOwnKey(payload, "gainTime");
+    hasNestedOwnKey(payload, "gainTime") ||
+    hasNestedOwnKey(payload, "orderPayload") ||
+    hasNestedOwnKey(payload, "numberExList");
   if (hasTypedOrderShape) {
+    return true;
+  }
+  if ((result === 1 || result === "1" || success === true) && (payload.data || payload.orderPayload || payload.phoneNumber || payload.number)) {
     return true;
   }
   return (
@@ -8373,6 +8377,7 @@ function mergeCandidateFallbackPrice(
   return {
     ...candidate,
     price: fallback.price,
+    productId: candidate.productId ?? "DTIP_CASH_PHONE_NEW_2399",
     rawJson: safeJsonStringify({
       ...(raw ?? {}),
       price: fallback.price,

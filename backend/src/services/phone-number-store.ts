@@ -90,8 +90,29 @@ export async function syncPhoneNumbers(accountId: number, phoneNumbers: Dingtone
     phoneNumbers,
     prisma.phoneNumber as unknown as PhoneNumberStore
   );
+  if (phoneNumbers.length > 0) {
+    const remoteNumbers = phoneNumbers.map((p) => p.phoneNumber).filter(Boolean);
+    if (remoteNumbers.length > 0) {
+      const updated = await prisma.phoneNumber.updateMany({
+        where: {
+          accountId,
+          phoneNumber: { notIn: remoteNumbers },
+          status: { not: PhoneStatus.cancelled }
+        },
+        data: {
+          status: PhoneStatus.cancelled
+        }
+      });
+      if (updated.count > 0) {
+        logger.info("Updated omitted local phone records to cancelled status", {
+          accountId,
+          cancelledCount: updated.count
+        });
+      }
+    }
+  }
   if (result.missingLocalCount > 0) {
-    logger.warn("Remote phone sync omitted local phone records; keeping local rows instead of deleting them", {
+    logger.warn("Remote phone sync omitted local phone records; marked as cancelled instead of deleting them", {
       accountId,
       missingCount: result.missingLocalCount
     });

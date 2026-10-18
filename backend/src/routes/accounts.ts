@@ -1375,7 +1375,7 @@ accountsRouter.post("/:id/refresh", async (req, res, next) => {
     const useDirect = await shouldUseDirectAccountFlow(account);
     const gateway = useDirect ? directRefreshGateway : dingtoneGateway;
     const refresh = () => refreshAccountRuntimeData(accountId, gateway, {
-      includePhoneNumbers: false,
+      includePhoneNumbers: true,
       allowHelperSnapshot: false,
       allowAdbPoint: false,
       includePublicEnrichment: false,
@@ -1893,9 +1893,7 @@ accountsRouter.post("/:id/phone-numbers/purchase", async (req, res, next) => {
     if (requiresPhonePurchaseConfirm(body)) {
       throw new AppError("Purchasing a phone number requires confirm=true", 400, 400);
     }
-    if (!(await shouldUseDirectAccountFlow(account))) {
-      throw new AppError("Phone purchases require a valid direct account session.", 503, 503);
-    }
+    const useDirect = await shouldUseDirectAccountFlow(account);
     const directAccount = {
       dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
       token: requireString(decryptText(account.dtToken), "Missing dt_token"),
@@ -1903,15 +1901,25 @@ accountsRouter.post("/:id/phone-numbers/purchase", async (req, res, next) => {
       appVariant: account.appVariant
     };
     const purchaseCandidate = mapPurchaseCandidate(body.candidate);
-    const remote = await directRefreshGateway.purchasePhoneNumber(
-      directAccount,
-      {
-        countryCode: body.country_code,
-        isoCountryCode: body.iso_country_code ?? body.candidate.iso_country_code,
-        countryKey: body.country_key,
-        candidate: purchaseCandidate
-      }
-    );
+    const remote = useDirect
+      ? await directRefreshGateway.purchasePhoneNumber(
+          directAccount,
+          {
+            countryCode: body.country_code,
+            isoCountryCode: body.iso_country_code ?? body.candidate.iso_country_code,
+            countryKey: body.country_key,
+            candidate: purchaseCandidate
+          }
+        )
+      : await dingtoneGateway.purchasePhoneNumber(
+          directAccount,
+          {
+            countryCode: body.country_code,
+            isoCountryCode: body.iso_country_code ?? body.candidate.iso_country_code,
+            countryKey: body.country_key,
+            candidate: purchaseCandidate
+          }
+        );
     const confirmation: PurchaseConfirmation = await confirmPurchasedPhone(directAccount, remote).catch((error) => {
       logger.warn("Direct purchase was not confirmed; local phone data was not changed", {
         accountId: account.id,

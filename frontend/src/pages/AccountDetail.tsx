@@ -1753,10 +1753,11 @@ export default function AccountDetail() {
       const result = await refreshAccount(accountId);
       setAccount((current) => (current ? { ...current, snapshot: result.snapshot } : current));
       void fetchAccount({ force: true });
+      void fetchPhones();
       if (result.refresh_error || result.cached) {
         message.warning(result.refresh_error || '本次未确认远端更新，当前显示缓存资料');
       } else {
-        message.success('基本资料已从远端刷新');
+        message.success('基本资料与手机号已从远端刷新');
       }
     } catch (err) {
       message.error(err instanceof Error ? err.message : '刷新失败');
