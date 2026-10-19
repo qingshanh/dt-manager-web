@@ -1493,3 +1493,43 @@ test("repairs mojibake sender labels recovered from direct SMS content", async (
   assert.equal(runtime.messages[0]?.fromNumber, "\u7845\u57fa\u6d41\u52a8");
   assert.equal(runtime.messages[0]?.content, "[\u7845\u57fa\u6d41\u52a8]Verification code is: 306497");
 });
+
+test("renders and stores reward credit arrivals with k5Flag 531 for checkin and video bonuses", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    adminId: 1,
+    appVariant: "dingtone",
+    nickname: null,
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: false
+  });
+
+  const imported = await storeHelperSmsMessages(1, [
+    {
+      conversationType: 4,
+      conversationId: "10000",
+      type: 3300,
+      senderId: "TalkU Team",
+      msgId: "checkin-reward-1",
+      content: JSON.stringify({
+        msgTitle: "Daily check-in",
+        msgContent: "You got 2.00 credits",
+        msgMeta: JSON.stringify({ credits: 2, type: 1 })
+      })
+    }
+  ], {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  });
+
+  assert.equal(imported, 1);
+  assert.equal(runtime.messages[0]?.fromNumber, "说道团队");
+  assert.equal(runtime.messages[0]?.content, "每日签到，获得 2.00 说道币");
+  assert.equal(runtime.messages[0]?.k5Flag, 531);
+  assert.equal(runtime.messages[0]?.msgType, MessageType.system);
+});

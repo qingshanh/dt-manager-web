@@ -116,13 +116,13 @@ export function parseTeamMessageMeta(...sources: unknown[]): ParsedTeamMessageMe
   });
   let credits: number | null = null;
   let rawRecord: JsonRecord | null = null;
+  const CREDIT_FIELD_KEYS = ["credits", "bc", "credit", "amount", "rewardCredits", "reward_credits", "rewardAmount", "reward_amount", "point", "points", "coins"];
   for (const { record } of ordered) {
-    const hasCredits = Object.prototype.hasOwnProperty.call(record, "credits");
-    const hasBalanceCredits = Object.prototype.hasOwnProperty.call(record, "bc");
-    if (!hasCredits && !hasBalanceCredits) {
+    const key = CREDIT_FIELD_KEYS.find((k) => Object.prototype.hasOwnProperty.call(record, k));
+    if (!key) {
       continue;
     }
-    const rawCredits = hasCredits ? record.credits : record.bc;
+    const rawCredits = record[key];
     if (rawCredits === undefined || rawCredits === null || (typeof rawCredits === "string" && !rawCredits.trim())) {
       continue;
     }
@@ -130,8 +130,24 @@ export function parseTeamMessageMeta(...sources: unknown[]): ParsedTeamMessageMe
     if (parsedCredits !== null && parsedCredits >= 0 && parsedCredits <= MAX_TEAM_CREDITS) {
       credits = parsedCredits;
       rawRecord = record;
+      break;
     }
-    break;
+  }
+
+  // 如果未能从 JSON 中解析，尝试从纯文本字符串中提取数值
+  if (credits === null) {
+    for (const source of sources) {
+      if (typeof source === "string") {
+        const textMatch = source.match(/(?:获得|到账|earned|received|reward(?:ed)?)\s*([0-9]+(?:\.[0-9]+)?)\s*(?:说道币|叮咚币|credits?|points?)/i);
+        if (textMatch && textMatch[1]) {
+          const parsed = toFiniteNumber(textMatch[1]);
+          if (parsed !== null && parsed >= 0 && parsed <= MAX_TEAM_CREDITS) {
+            credits = parsed;
+            break;
+          }
+        }
+      }
+    }
   }
   const expiryDays = pickNumber((record) => toFiniteNumber(record.ex));
 
@@ -180,6 +196,12 @@ export function renderTeamMessageContent(
   }
   if (meta.actionType === 34) {
     return `兑换成功，${amount} ${coin}已到账`;
+  }
+  if (meta.actionType === 1 || meta.actionType === 2) {
+    return `每日签到，获得 ${amount} ${coin}`;
+  }
+  if (meta.actionType === 10) {
+    return `观看视频，获得 ${amount} ${coin}`;
   }
   return `获得 ${amount} ${coin}`;
 }

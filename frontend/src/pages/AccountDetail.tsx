@@ -44,6 +44,7 @@ import {
   deleteMessage,
   deletePhoneNumber,
   enablePhoneSmsReception,
+  forceEnablePhoneSms,
   getAccount,
   getAccountMessage,
   getAccountMessages,
@@ -1178,6 +1179,23 @@ export default function AccountDetail() {
   const [phoneCountries, setPhoneCountries] = useState<PhoneCountryOption[]>([]);
   const [phoneLoading, setPhoneLoading] = useState(false);
   const [phoneActionLoadingKey, setPhoneActionLoadingKey] = useState<string | null>(null);
+  const [enablingSmsPhoneId, setEnablingSmsPhoneId] = useState<number | null>(null);
+
+  const handleEnableSinglePhoneSms = async (phoneId: number) => {
+    setEnablingSmsPhoneId(phoneId);
+    try {
+      const result = await forceEnablePhoneSms(accountId, phoneId);
+      if (result.phone) {
+        setPhones((current) => current.map((p) => (p.id === phoneId ? { ...p, ...result.phone } : p)));
+      }
+      await fetchPhones({ force: true });
+      message.success("已向远端成功开启该号码的短信接收！");
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : "开启短信接收失败");
+    } finally {
+      setEnablingSmsPhoneId(null);
+    }
+  };
   const [directSessionImportOpen, setDirectSessionImportOpen] = useState(false);
   const [verificationReloginOpen, setVerificationReloginOpen] = useState(false);
   const [directSessionImportLoading, setDirectSessionImportLoading] = useState(false);
@@ -2306,7 +2324,7 @@ export default function AccountDetail() {
                 {displayPhone}
               </Tag>
             </Tooltip>
-            <Tooltip title="这是 App 的来信拦截/语音信箱过滤字段，不等同于服务商短信通道状态。">
+            <Tooltip title="官方App防骚扰来信设置：显示未返回代表远端默认未配置，可点击右侧【开启短信接收】按钮向远端显式开启。">
               {record.allow_receive_sms === false ? (
                 <Tag color="red">短信过滤拦截</Tag>
               ) : record.allow_receive_sms === true ? (
@@ -2427,6 +2445,21 @@ export default function AccountDetail() {
             <Button size="small" disabled={actionBlocked} onClick={() => handleEditPhoneLabel(record)}>
               备注
             </Button>
+            {status === 'active' && record.allow_receive_sms !== true && (
+              <Popconfirm
+                title="确认向远端开启该号码的短信接收？这会显式设置 App 允许接收短信。"
+                onConfirm={() => handleEnableSinglePhoneSms(record.id)}
+              >
+                <Button
+                  size="small"
+                  disabled={actionBlocked}
+                  loading={enablingSmsPhoneId === record.id}
+                  style={{ color: '#1677ff', borderColor: '#91caff' }}
+                >
+                  开启短信接收
+                </Button>
+              </Popconfirm>
+            )}
             {(status === 'active' || status === 'expired') && (
               <Popconfirm title="确认续费这个号码？续费会扣除账户余额。" onConfirm={() => phoneAction(record.id, 'renew')}>
                 <Button size="small" type="primary" disabled={actionBlocked} loading={phoneActionLoadingKey === `${record.id}:renew`}>

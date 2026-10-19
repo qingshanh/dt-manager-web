@@ -593,6 +593,16 @@ export async function enablePhoneSmsReception(accountId: number) {
   return res.data.data;
 }
 
+export async function forceEnablePhoneSms(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
+  const res = await api.post<ApiResponse<PhoneActionResult>>(
+    `/accounts/${accountId}/phone-numbers/${phoneId}/force-enable-sms`,
+    { confirm: true, request_id: requestId },
+    { timeout: 20_000 }
+  );
+  invalidateAccountCaches(accountId);
+  return res.data.data;
+}
+
 export async function cancelPhoneNumber(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/cancel`, {
     confirm: true,
