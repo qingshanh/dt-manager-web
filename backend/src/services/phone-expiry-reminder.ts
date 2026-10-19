@@ -51,7 +51,13 @@ class PhoneExpiryReminderService {
               phoneNumbers: {
                 where: { status: { not: PhoneStatus.cancelled } },
                 orderBy: { id: "asc" },
-                select: { phoneNumber: true }
+                select: {
+                  phoneNumber: true,
+                  displayName: true,
+                  countryCode: true,
+                  expiredTime: true,
+                  status: true
+                }
               },
               snapshot: { select: { primaryBalance: true } }
             }
@@ -90,6 +96,13 @@ class PhoneExpiryReminderService {
             rawJson: phone.rawJson ?? undefined
           },
           balance,
+          ownedPhoneDetails: phone.account.phoneNumbers.map((item) => ({
+            phoneNumber: item.phoneNumber,
+            displayName: item.displayName,
+            countryCode: item.countryCode,
+            expiredTime: item.expiredTime,
+            status: item.status
+          })),
           ownedPhoneNumbers: phone.account.phoneNumbers.map((item) => item.phoneNumber),
           remainingText: formatRemaining(remainingMs),
           expiresAt: new Date(expiresAt).toISOString(),

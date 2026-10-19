@@ -2104,7 +2104,12 @@ export default function AccountDetail() {
               confirm: true,
             });
             await Promise.all([fetchAccount(), fetchPhones()]);
-            message.success(`已成功获取号码 ${formatPhoneWithCountryCode(result.phone.phone_number, result.phone.country_code)}${formatPhoneVerificationSuffix(result.verification)}`);
+            const audit = (result as any)?.balance_audit;
+            let auditSuffix = '';
+            if (audit && audit.deducted !== null && audit.deducted !== undefined) {
+              auditSuffix = `（实扣 ${audit.deducted} ${audit.currency}，${audit.is_match ? '扣费一致' : '存在差异'}，当前余额：${audit.balance_after} ${audit.currency}）`;
+            }
+            message.success(`已成功获取号码 ${formatPhoneWithCountryCode(result.phone.phone_number, result.phone.country_code)}${formatPhoneVerificationSuffix(result.verification)}${auditSuffix}`);
           },
         });
       },
@@ -2138,7 +2143,12 @@ export default function AccountDetail() {
       void fetchAccount({ force: true });
       const actionText = phoneActionLabel(action);
       if (result?.operation.state === 'confirmed') {
-        message.success(`${actionText}已确认`);
+        const audit = (result as any)?.balance_audit;
+        let auditSuffix = '';
+        if (action === 'renew' && audit && audit.deducted !== null && audit.deducted !== undefined) {
+          auditSuffix = `（实扣 ${audit.deducted} ${audit.currency}，${audit.is_match ? '扣费一致' : '存在差异'}，当前余额：${audit.balance_after} ${audit.currency}）`;
+        }
+        message.success(`${actionText}已确认${auditSuffix}`);
         void fetchPhones({ force: true });
       } else if (result?.operation.state === 'failed_before_write') {
         message.error(result.operation.error_summary || `${actionText}未提交`);

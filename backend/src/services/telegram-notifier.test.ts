@@ -223,3 +223,41 @@ test("static phone notification regression accepts only the current Chinese HTML
   assert.doesNotMatch(regressionSource, /ok:\s*currentNotificationCopyOk\s*\|\|/);
   assert.doesNotMatch(regressionSource, /鏂版墜鏈哄彿|鎵嬫満鍙凤細|鍙风爜鐘舵€?/);
 });
+
+test("expiry notification with ownedPhoneDetails displays remark or country region with number and short expiry", () => {
+  const text = notifierModule.buildPhoneExpiryTelegramNotificationText({
+    account: { ...account, appVariant: "dingdong" },
+    phone: {
+      phoneNumber: "19177898818",
+      displayName: "usa-no-whatsup",
+      status: "active",
+      validPeriodDays: 365,
+      rawJson: JSON.stringify({ price: 1200 })
+    },
+    balance: 24237.96,
+    ownedPhoneDetails: [
+      {
+        phoneNumber: "19177898818",
+        displayName: "usa-no-whatsup",
+        countryCode: 1,
+        expiredTime: "1792732747557"
+      },
+      {
+        phoneNumber: "447445516160",
+        displayName: "",
+        countryCode: 44,
+        expiredTime: "1793251465873"
+      }
+    ],
+    remainingText: "还剩 6 天",
+    expiresAt: "2026-10-23T13:19:07.557Z"
+  });
+
+  assert.match(text, /当前账号号码：2 个/);
+  // 有备注的显示备注
+  assert.match(text, /1\. usa-no-whatsup：<code>\+19177898818<\/code>：\d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
+  // 无备注的显示国家地区
+  assert.match(text, /2\. 英国：<code>\+447445516160<\/code>：\d{4}-\d{2}-\d{2} \d{2}:\d{2}/);
+  assert.doesNotMatch(text, /号码 1：/);
+  assert.doesNotMatch(text, /号码 2：/);
+});

@@ -41,6 +41,7 @@ import {
   formatAccountCard,
   formatAccountListCard,
   formatCommandHelp,
+  formatPhoneExpiryDisplay,
   formatExpiringPhonesCard,
   formatPanelStatusCard,
   formatPhoneAccountListCard,
@@ -54,6 +55,14 @@ import {
   phoneDetailKeyboard,
   phoneListKeyboard
 } from "./telegram-bot-ui.js";
+
+async function getFreshAccountBalance(
+  direct: Parameters<typeof botGateway.refreshSnapshot>[0],
+  gateway: DirectDingtoneGateway = botGateway
+): Promise<number | null> {
+  const snapshot = await gateway.refreshSnapshot(direct);
+  return snapshot.primaryBalance ?? null;
+}
 
 const botGateway = new DirectDingtoneGateway();
 let botCommandsCacheKey = "";
@@ -571,6 +580,8 @@ export async function loadTelegramAccountDetail(accountId: number, db: TelegramB
       email: true,
       phone: true,
       dtUserId: true,
+      dtToken: true,
+      dtDeviceId: true,
       appVariant: true,
       status: true,
       monitorEnabled: true,
@@ -676,8 +687,31 @@ async function phoneAccountListReply(page: number): Promise<BotReply> {
 
 async function accountDetailReply(accountId: number): Promise<BotReply> {
   if (!Number.isSafeInteger(accountId) || accountId <= 0) return htmlNotice("用法：/account <账户ID>");
-  const account = await loadTelegramAccountDetail(accountId);
+  let account = await loadTelegramAccountDetail(accountId);
   if (!account) return htmlNotice("账户不存在。");
+
+  // 需求3：查询某账号详情时，实时刷新余额
+  try {
+    const direct = directAccount(account);
+    if (direct.dtUserId && direct.token) {
+      const freshSnap = await botGateway.refreshSnapshot(direct);
+      if (freshSnap.primaryBalance !== undefined && freshSnap.primaryBalance !== null) {
+        await prisma.accountSnapshot.upsert({
+          where: { accountId: account.id },
+          update: { primaryBalance: freshSnap.primaryBalance },
+          create: { accountId: account.id, primaryBalance: freshSnap.primaryBalance }
+        });
+        const reloaded = await loadTelegramAccountDetail(accountId);
+        if (reloaded) account = reloaded;
+      }
+    }
+  } catch (error) {
+    logger.debug("Failed to refresh balance on telegram account detail query", {
+      accountId,
+      error: sanitizeTelegramError(errorMessage(error))
+    });
+  }
+
   return {
     text: formatAccountCard({
       id: account.id,
@@ -1552,6 +1586,8 @@ async function buyNumberText(accountId: number, isoCountryCode: string | undefin
         `确认购买请发送：${confirmCommand}`
       ].join("\n");
     }
+    const currency = phoneCurrencyLabel(account.appVariant);
+    const balanceBefore = await getFreshAccountBalance(direct, botGateway).catch(() => null);
     const ordered = await botGateway.purchasePhoneNumber(direct, {
       countryCode: country.countryCode,
       isoCountryCode: country.isoCountryCode,
@@ -1560,9 +1596,21 @@ async function buyNumberText(accountId: number, isoCountryCode: string | undefin
     });
     const confirmed = await confirmPurchasedPhone(direct, ordered);
     const saved = await savePurchasedPhone(accountId, confirmed);
+
+    const balanceAfter = await getFreshAccountBalance(direct, botGateway).catch(() => null);
+    const expectedPrice = candidateForPurchase.price ?? 0;
+    const deducted = balanceBefore !== null && balanceAfter !== null ? Number((balanceBefore - balanceAfter).toFixed(2)) : null;
+    const isMatch = deducted !== null ? Math.abs(deducted - expectedPrice) <= 0.05 : null;
+
     await sendPhoneTelegramNotification({
       account,
       phone: confirmed,
+      action: "purchase",
+      balanceBefore,
+      balanceAfter,
+      expectedCost: expectedPrice,
+      deducted,
+      balanceMatch: isMatch,
       verificationSource: "remote_phone_list",
       verificationNote: "Purchase was confirmed by polling the remote purchased phone list before writing local data."
     }).catch((error) => {
@@ -1572,10 +1620,21 @@ async function buyNumberText(accountId: number, isoCountryCode: string | undefin
         error: sanitizeTelegramError(errorMessage(error))
       });
     });
+
+    const auditLines = deducted !== null
+      ? [
+          `购号前${currency}: ${balanceBefore}`,
+          `购号后${currency}: ${balanceAfter}`,
+          `实扣${currency}: ${deducted} (预期价格: ${expectedPrice})`,
+          `余额核对: ${isMatch ? "✅ 扣费一致" : "⚠️ 存在差异"}`
+        ]
+      : [];
+
     return [
       `已获取新号码: ${saved.phoneNumber}`,
       `国家: ${country.label}`,
       `状态: ${saved.status}`,
+      ...auditLines,
       `远端确认: 已在已购号码列表中确认`,
       `收费: ${formatPhoneCost(confirmed)}`
     ].join("\n");
@@ -1775,7 +1834,40 @@ async function phoneActionText(
       }
     }
     if (envelope.operation.state === "confirmed") {
-      return `${action === "renew" ? "续费" : action === "cancel" ? "取消" : action === "pause" ? "暂停" : "恢复"}已确认。`;
+      if (action === "renew") {
+        const currency = phoneCurrencyLabel(account.appVariant);
+        const patch = responsePatch as Partial<DingtonePhoneNumber> | null;
+        let balanceAfter: number | null = null;
+        let balanceDeducted: number | null = null;
+        let balanceMatch: boolean | null = null;
+        try {
+          balanceAfter = await getFreshAccountBalance(direct, botGateway);
+          if (balanceBefore !== undefined && balanceBefore !== null && balanceAfter !== null) {
+            balanceDeducted = Number((balanceBefore - balanceAfter).toFixed(2));
+            if (quotedPrice !== undefined && quotedPrice !== null) {
+              balanceMatch = Math.abs(balanceDeducted - quotedPrice) <= 0.05;
+            }
+          }
+        } catch {
+          // ignore
+        }
+        const auditLines = balanceDeducted !== null
+          ? [
+              `💰 续费前${currency}：${balanceBefore ?? "-"}`,
+              `💰 续费后${currency}：${balanceAfter ?? "-"}`,
+              `💵 实扣${currency}：${balanceDeducted}（预期所需：${quotedPrice ?? "-"})`,
+              `⚖️ 余额核对：${balanceMatch ? "✅ 扣费一致" : "⚠️ 存在差异"}`
+            ]
+          : [];
+        return [
+          "<b>✅ 续费已确认</b>",
+          "━━━━━━━━━━━━━━━━━━",
+          `📞 手机号：<code>${escapeTelegramHtml(phone.phoneNumber)}</code>`,
+          ...auditLines,
+          `⏳ 新到期时间：${formatPhoneExpiryDisplay(patch?.expiredTime ?? phone.expiredTime)}`
+        ].join("\n");
+      }
+      return `${action === "cancel" ? "取消" : action === "pause" ? "暂停" : "恢复"}已确认。`;
     }
     if (envelope.operation.state === "failed_before_write") {
       return `操作未提交：${envelope.operation.errorSummary ?? "写入前失败"}`;

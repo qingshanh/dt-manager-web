@@ -1901,6 +1901,15 @@ accountsRouter.post("/:id/phone-numbers/purchase", async (req, res, next) => {
       appVariant: account.appVariant
     };
     const purchaseCandidate = mapPurchaseCandidate(body.candidate);
+    const expectedPrice = purchaseCandidate.price ?? 0;
+    let balanceBefore: number | null = null;
+    try {
+      const snap = await directRefreshGateway.refreshSnapshot(directAccount);
+      balanceBefore = snap.primaryBalance ?? null;
+    } catch {
+      const cachedSnap = await prisma.accountSnapshot.findUnique({ where: { accountId: account.id } });
+      balanceBefore = cachedSnap?.primaryBalance ?? null;
+    }
     const remote = useDirect
       ? await directRefreshGateway.purchasePhoneNumber(
           directAccount,
@@ -1930,6 +1939,25 @@ accountsRouter.post("/:id/phone-numbers/purchase", async (req, res, next) => {
       throw error;
     });
     const confirmedRemote = confirmation.phone;
+
+    let balanceAfter: number | null = null;
+    let balanceDeducted: number | null = null;
+    let balanceMatch: boolean | null = null;
+    try {
+      const freshSnap = await directRefreshGateway.refreshSnapshot(directAccount);
+      if (freshSnap.primaryBalance !== undefined && freshSnap.primaryBalance !== null) {
+        balanceAfter = freshSnap.primaryBalance;
+        if (balanceBefore !== null) {
+          balanceDeducted = Number((balanceBefore - balanceAfter).toFixed(2));
+          balanceMatch = Math.abs(balanceDeducted - expectedPrice) <= 0.05;
+        }
+      }
+    } catch (e) {
+      logger.warn("Failed to query fresh balance after purchase for audit", {
+        accountId: account.id,
+        error: e instanceof Error ? e.message : String(e)
+      });
+    }
 
     await prisma.phoneNumber.upsert({
       where: {
@@ -1963,6 +1991,12 @@ accountsRouter.post("/:id/phone-numbers/purchase", async (req, res, next) => {
     await sendPhoneTelegramNotification({
       account,
       phone: confirmedRemote,
+      action: "purchase",
+      balanceBefore,
+      balanceAfter,
+      expectedCost: expectedPrice,
+      deducted: balanceDeducted,
+      balanceMatch,
       verificationSource: confirmation.source,
       verificationNote: confirmation.note
     }).catch((error) => {
@@ -2080,25 +2114,57 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
     });
 
     let updated = phoneItem;
-    if (envelope.operation.state === "confirmed" && responsePatch) {
-      updated = await prisma.phoneNumber.update({
-        where: { id: phoneItem.id },
-        data: mapPhoneNumberPatch(responsePatch)
-      });
-      void completeConfirmedRenewalAudit({
-        operationId: envelope.operation.id,
-        account,
-        phone: updated,
-        baseline: renewalBaseline,
-        balanceBefore,
-        extensionMonths
-      });
+    let balanceAfter: number | null = null;
+    let balanceDeducted: number | null = null;
+    let balanceMatch: boolean | null = null;
+
+    if (envelope.operation.state === "confirmed") {
+      if (responsePatch) {
+        updated = await prisma.phoneNumber.update({
+          where: { id: phoneItem.id },
+          data: mapPhoneNumberPatch(responsePatch)
+        });
+        void completeConfirmedRenewalAudit({
+          operationId: envelope.operation.id,
+          account,
+          phone: updated,
+          baseline: renewalBaseline,
+          balanceBefore,
+          extensionMonths
+        });
+      }
+      try {
+        const freshSnapshot = await directRefreshGateway.refreshSnapshot({
+          dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
+          token: requireString(decryptText(account.dtToken), "Missing dt_token"),
+          deviceId: account.dtDeviceId,
+          appVariant: account.appVariant
+        });
+        if (freshSnapshot.primaryBalance !== undefined && freshSnapshot.primaryBalance !== null) {
+          balanceAfter = freshSnapshot.primaryBalance;
+          balanceDeducted = Number((balanceBefore - balanceAfter).toFixed(2));
+          balanceMatch = Math.abs(balanceDeducted - quotedPrice) <= 0.05;
+        }
+      } catch (error) {
+        logger.warn("Failed to query fresh balance after renewal for audit", {
+          accountId: account.id,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
     }
 
     ok(res, {
       operation: serializePhoneActionOperation(envelope.operation),
       phone: serializePhoneNumber(updated),
-      reused: envelope.reused
+      reused: envelope.reused,
+      balance_audit: {
+        balance_before: balanceBefore,
+        balance_after: balanceAfter,
+        expected_cost: quotedPrice,
+        deducted: balanceDeducted,
+        is_match: balanceMatch,
+        currency: account.appVariant === "dingdong" ? "说道币" : "叮咚币"
+      }
     });
   } catch (error) {
     next(error);
