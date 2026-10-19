@@ -229,15 +229,27 @@ export class TelegramBotService {
         await this.reply(settings, chatId, await accountListReply(1));
         return;
       case "/account":
+        if (!args[0] || !Number.isSafeInteger(Number(args[0])) || Number(args[0]) <= 0) {
+          await this.reply(settings, chatId, await accountSelectionReply("请选择要查看详情的账户："));
+          return;
+        }
         await this.reply(settings, chatId, await accountDetailReply(Number(args[0])));
         return;
       case "/phones":
+        if (!args[0] || !Number.isSafeInteger(Number(args[0])) || Number(args[0]) <= 0) {
+          await this.reply(settings, chatId, await phoneAccountListReply(1));
+          return;
+        }
         await this.reply(settings, chatId, await accountPhoneListReply(Number(args[0]), 1));
         return;
       case "/messages":
         await this.reply(settings, chatId, await recentMessagesReply(Number(args[0]), Number(args[1])));
         return;
       case "/countries":
+        if (!args[0] || !Number.isSafeInteger(Number(args[0])) || Number(args[0]) <= 0) {
+          await this.reply(settings, chatId, await accountSelectionReply("请选择要查看可选号国家的账户："));
+          return;
+        }
         await this.reply(settings, chatId, await countryListText(Number(args[0])));
         return;
       case "/preview_number":
@@ -430,33 +442,17 @@ async function ensureBotCommands(botToken: string, apiBaseUrl?: string | null) {
       botToken,
       apiBaseUrl,
       commands: [
-        { command: "panel", description: "打开机器人控制面板" },
-        { command: "accounts", description: "查看账户列表" },
-        { command: "account", description: "查看账户详情：/account 3" },
-        { command: "expiring_phones", description: "查看临期手机号（7天内到期）" },
-        { command: "phones", description: "查看手机号：/phones 3" },
-        { command: "messages", description: "查看最近消息：/messages 3" },
-        { command: "countries", description: "查看可选号国家：/countries 3" },
-        { command: "preview_number", description: "预览号码：/preview_number 3 FR" },
-        { command: "buy_number", description: "购买号码：/buy_number 3 FR confirm 75" },
-        { command: "code", description: "直连收取验证码：/code 3" },
-        { command: "trace_access_code", description: "验证码登录追踪：默认 dry-run" },
-        { command: "start_monitor", description: "启动监听：/start_monitor 3 或 all" },
-        { command: "stop_monitor", description: "停止监听：/stop_monitor 3 或 all" },
-        { command: "notify", description: "开关账户通知：/notify 3 on" },
-        { command: "login_code", description: "提交重登验证码：/login_code 3 1234" },
-        { command: "set_note", description: "修改账户备注：/set_note 3 备注" },
-        { command: "clear_note", description: "清空账户备注：/clear_note 3" },
-        { command: "set_phone_note", description: "修改号码备注：/set_phone_note 3 121 备注" },
-        { command: "clear_phone_note", description: "清空号码备注：/clear_phone_note 3 121" },
-        { command: "status", description: "查看面板运行概览" },
-        { command: "refresh_account", description: "刷新账户资料：/refresh_account 3" },
-        { command: "refresh_phones", description: "刷新已购号码：/refresh_phones 3" },
-        { command: "renew_phone", description: "续费号码：/renew_phone 3 121 confirm" },
-        { command: "pause_phone", description: "暂停号码：/pause_phone 3 121 confirm" },
-        { command: "resume_phone", description: "恢复号码：/resume_phone 3 121 confirm" },
-        { command: "cancel_phone", description: "取消号码：/cancel_phone 3 121 confirm" },
-        { command: "help", description: "查看帮助" }
+        { command: "panel", description: "🎛 控制面板（图形化按钮入口）" },
+        { command: "accounts", description: "👥 账户列表（查看全部账户）" },
+        { command: "account", description: "👤 账户详情（点选账户查看最新余额）" },
+        { command: "expiring_phones", description: "⚠️ 临期号码（7天内到期与快捷续费）" },
+        { command: "phones", description: "📱 手机号码（查看名下已购号码）" },
+        { command: "messages", description: "💬 最新短信（接收验证码与消息）" },
+        { command: "code", description: "🔑 收验证码（快速提取最新验证码）" },
+        { command: "countries", description: "🌐 可选国家（查看支持购买的国家）" },
+        { command: "preview_number", description: "🔍 候选预览（预览可购手机号与价格）" },
+        { command: "status", description: "📊 运行状态（系统监控与统计概览）" },
+        { command: "help", description: "📖 功能帮助（查看详细使用说明）" }
       ]
     })
     .then(() => {
@@ -685,8 +681,33 @@ async function phoneAccountListReply(page: number): Promise<BotReply> {
   };
 }
 
+
+async function accountSelectionReply(title = "请选择要查看详情的账户：", page = 1): Promise<BotReply> {
+  const result = await loadTelegramAccountPage(page);
+  const items = result.items.map((item) => ({
+    id: item.id,
+    name: accountName(item),
+    status: String(item.status),
+    phoneCount: item._count.phoneNumbers
+  }));
+  return {
+    text: [
+      `<b>👤 ${escapeTelegramHtml(title)}</b> · 第 ${result.page}/${result.totalPages} 页`,
+      "━━━━━━━━━━━━━━━━━━",
+      "👇 点击下方对应账户按钮，直接查看账户详情与余额：",
+      "",
+      ...items.map(
+        (acc) => `• <b>#${acc.id} ${escapeTelegramHtml(acc.name)}</b> (${acc.status === "online" ? "🟢在线" : "⚪离线"} · ${acc.phoneCount}个号码)`
+      ),
+      "━━━━━━━━━━━━━━━━━━"
+    ].join("\n"),
+    replyMarkup: accountListKeyboard(items, result.page, result.totalPages),
+    parseMode: "HTML"
+  };
+}
+
 async function accountDetailReply(accountId: number): Promise<BotReply> {
-  if (!Number.isSafeInteger(accountId) || accountId <= 0) return htmlNotice("用法：/account <账户ID>");
+  if (!Number.isSafeInteger(accountId) || accountId <= 0) return accountSelectionReply("请选择要查看详情的账户：");
   let account = await loadTelegramAccountDetail(accountId);
   if (!account) return htmlNotice("账户不存在。");
 

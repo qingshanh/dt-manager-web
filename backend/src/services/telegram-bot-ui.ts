@@ -240,17 +240,31 @@ export function formatRecentMessagesCard(
 
 export function formatCommandHelp() {
   return [
-    "<b>📖 命令帮助</b>",
-    "",
+    "<b>📖 机器人功能与命令指南</b>",
+    "━━━━━━━━━━━━━━━━━━",
     "<b>查看类</b>",
-    "<code>/panel</code> <code>/accounts</code> <code>/account</code> <code>/phones</code> <code>/messages</code> <code>/status</code> <code>/countries</code> <code>/preview_number</code>",
+    "• <code>/panel</code> - 🎛 控制面板（图形化按钮入口，推荐日常使用）",
+    "• <code>/accounts</code> - 👥 账户列表（查看全部账户）",
+    "• <code>/account</code> [账户ID] - 👤 账户详情（点选账户查看最新余额）",
+    "• <code>/phones</code> [账户ID] - 📱 手机号码（查看账户名下号码）",
+    "• <code>/messages</code> [账户ID] - 💬 最新短信（接收验证码与消息）",
+    "• <code>/status</code> - 📊 运行状态（系统监控与概览）",
+    "• <code>/countries</code> [账户ID] - 🌐 可选国家（查看支持购买的国家）",
+    "• <code>/preview_number</code> [账户ID] [国家ISO] - 🔍 候选预览（预览可购号码与价格）",
     "",
     "<b>安全操作</b>",
     "<code>/start_monitor</code> <code>/stop_monitor</code> <code>/notify</code> <code>/login_code</code> <code>/set_note</code> <code>/clear_note</code> <code>/set_phone_note</code> <code>/clear_phone_note</code> <code>/refresh_account</code> <code>/refresh_phones</code> <code>/code</code>",
+    "• <code>/code</code> [账户ID] [手机号] - 🔑 提取短信验证码",
+    "• <code>/start_monitor</code> / <code>/stop_monitor</code> - 开关消息监听",
+    "• <code>/notify</code> [账户ID] [on|off] - 开关通知",
+    "• <code>/set_note</code> / <code>/set_phone_note</code> - 修改备注",
+    "• <code>/refresh_account</code> / <code>/refresh_phones</code> - 刷新账户或手机号",
     "",
     "<b>高级危险操作</b>",
     "<code>/buy_number</code> <code>/renew_phone</code> <code>/pause_phone</code> <code>/resume_phone</code> <code>/cancel_phone</code> <code>/trace_access_code</code>",
-    "以上危险操作必须按命令说明提供 <code>confirm</code>。"
+    "以上危险操作必须按命令说明提供 <code>confirm</code>。",
+    "━━━━━━━━━━━━━━━━━━",
+    "💡 <b>提示</b>：无需死记编号，直接输入 <code>/panel</code> 或 <code>/account</code> 即可按钮点选！"
   ].join("\n");
 }
 
