@@ -1063,6 +1063,10 @@ export function telegramUserErrorText(error: unknown) {
   if (/账户.*不存在|account.*not found/i.test(raw)) return "账户不存在，请刷新列表后重试。";
   if (/号码.*不存在|未找到.*号码|phone.*not found/i.test(raw)) return "号码不存在，请刷新号码列表后重试。";
   if (/参数|用法|格式错误|invalid.*(?:argument|parameter|format)|must be/i.test(raw)) return "参数错误，请检查命令格式。";
+  if (/余额不足|balance.*(?:not enough|low|insufficient)|扣费失败/i.test(raw)) return "账户余额不足以完成此操作，请先充值。";
+  if (/无法确认.*(?:余额|价格)|无法建立.*余额/i.test(raw)) return "无法确认当前余额或续费价格，请先使用 /account 刷新资料后重试。";
+  if (/已取消号码不能续期/i.test(raw)) return "已取消号码不能续期。";
+  if (/concurrency.*limit|并发|会话正在使用/i.test(raw)) return "账户会话正在忙碌，请稍候 10 秒后重试。";
   return telegramSafeFailureText(error);
 }
 
@@ -1772,10 +1776,11 @@ async function phoneActionText(
       : null;
     const quotedPrice = action === "renew" ? getPhoneRenewalCost(mapStoredPhoneContext(phone)) : null;
     const extensionMonths = action === "renew" ? resolvePhoneRenewalMonths(phone) : null;
-    if (action === "renew" && (balanceBefore === null || quotedPrice === null)) {
+    const verifiedBalanceBefore = balanceBefore ?? account.snapshot?.primaryBalance ?? null;
+    if (action === "renew" && (verifiedBalanceBefore === null || quotedPrice === null)) {
       throw new Error("续费前无法确认当前余额或精确续费价格，请先刷新号码与余额。");
     }
-    if (action === "renew" && balanceBefore! < quotedPrice!) {
+    if (action === "renew" && verifiedBalanceBefore! < quotedPrice!) {
       throw new Error("当前余额不足以支付本次续费。");
     }
 
