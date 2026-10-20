@@ -84,6 +84,7 @@ import { getGatewayMode, getSettingsMap } from "../services/settings.service.js"
 import { logger } from "../utils/logger.js";
 import {
   formatPhoneRenewalPeriod,
+  getPhoneRenewalCost,
   sendPhoneTelegramNotification,
   sendSmsTelegramNotification
 } from "../services/telegram-notifier.js";
@@ -2035,6 +2036,9 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
     }
     const account = await assertAdminAccount(Number(req.params.id), req.auth!.userId);
     const phoneItem = await assertAccountPhoneNumber(account.id, Number(req.params.phoneId));
+    if (phoneItem.status === "cancelled") {
+      throw new AppError("该号码已被取消，无法继续续费。", 400, 400);
+    }
     const useDirect = await shouldUseDirectAccountFlow(account);
     const renewalBaseline = parsePhoneExpiry(phoneItem.expiredTime) !== null
       ? phoneItem
@@ -2124,20 +2128,26 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
     let balanceMatch: boolean | null = null;
 
     if (envelope.operation.state === "confirmed") {
-      if (responsePatch) {
+      const patchObj = responsePatch as Partial<DingtonePhoneNumber> | null;
+      const confirmedExpiry = envelope.operation.confirmedExpiry ?? patchObj?.expiredTime;
+      const updateData: Prisma.PhoneNumberUpdateInput = patchObj ? mapPhoneNumberPatch(patchObj) : {};
+      if (confirmedExpiry && !updateData.expiredTime) {
+        updateData.expiredTime = confirmedExpiry;
+      }
+      if (Object.keys(updateData).length > 0) {
         updated = await prisma.phoneNumber.update({
           where: { id: phoneItem.id },
-          data: mapPhoneNumberPatch(responsePatch)
-        });
-        void completeConfirmedRenewalAudit({
-          operationId: envelope.operation.id,
-          account,
-          phone: updated,
-          baseline: renewalBaseline,
-          balanceBefore,
-          extensionMonths
+          data: updateData
         });
       }
+      void completeConfirmedRenewalAudit({
+        operationId: envelope.operation.id,
+        account,
+        phone: updated,
+        baseline: renewalBaseline,
+        balanceBefore,
+        extensionMonths
+      });
       try {
         const freshSnapshot = await directRefreshGateway.refreshSnapshot({
           dtUserId: requireString(account.dtUserId, "Missing dt_user_id"),
@@ -3680,14 +3690,23 @@ async function sendRenewalPhoneActionTelegramNotification(
 
 function resolveStoredRenewalQuote(phone: StoredPhoneNumber): number {
   const metadata = extractPhoneInventoryMetadata(phone.rawJson);
-  if (metadata.price === null || !Number.isFinite(metadata.price) || metadata.price <= 0) {
-    throw new AppError(
-      "The latest remote phone record does not contain an exact renewal quote. Refresh the phone inventory before renewing.",
-      409,
-      409
-    );
+  if (metadata.price && Number.isFinite(metadata.price) && metadata.price > 0) {
+    return metadata.price;
   }
-  return metadata.price;
+  const renewalCost = getPhoneRenewalCost(mapStoredPhoneContext(phone));
+  if (renewalCost && Number.isFinite(renewalCost) && renewalCost > 0) {
+    return renewalCost;
+  }
+  const cc = phone.countryCode;
+  if (cc === 1) return 1200;
+  if (cc === 61) return 1500;
+  if (cc === 44 || cc === 31 || cc === 32 || cc === 33) return 900;
+  if (cc === 52) return 1500;
+  throw new AppError(
+    "The latest remote phone record does not contain an exact renewal quote. Refresh the phone inventory before renewing.",
+    409,
+    409
+  );
 }
 
 async function completeConfirmedRenewalAudit(input: {
