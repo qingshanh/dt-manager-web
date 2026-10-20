@@ -2039,7 +2039,10 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
     const renewalBaseline = parsePhoneExpiry(phoneItem.expiredTime) !== null
       ? phoneItem
       : await getDirectPhoneBaseline(account, phoneItem);
-    const balanceBefore = await resolvePhoneActionBalance(account, true, { requireFresh: true });
+    const liveBalanceBefore = await resolvePhoneActionBalance(account, true, { requireFresh: false });
+    const balanceBefore = liveBalanceBefore
+      ?? (await prisma.accountSnapshot.findUnique({ where: { accountId: account.id } }))?.primaryBalance
+      ?? null;
     if (balanceBefore === null) {
       throw new AppError("Could not establish the account balance before renewal.", 409, 409);
     }
