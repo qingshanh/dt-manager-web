@@ -289,7 +289,7 @@ export async function refreshAccount(id: number) {
   }>>(
     `/accounts/${id}/refresh`,
     undefined,
-    { timeout: 20_000 },
+    { timeout: 45_000 },
   );
   invalidateAccountCaches(id);
   return res.data.data;

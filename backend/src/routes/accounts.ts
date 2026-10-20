@@ -1381,33 +1381,11 @@ accountsRouter.post("/:id/refresh", async (req, res, next) => {
       allowAdbPoint: false,
       includePublicEnrichment: false,
       persistCachedSnapshot: false,
-      gatewaySnapshotWaitMs: 8_000
+      gatewaySnapshotWaitMs: 8_000,
+      phoneListWaitMs: 8_000
     });
     const result = useDirect
-      ? await accountMonitorService.withMaintenance(accountId, async () => {
-          const res = await refresh();
-          if (account.dtUserId && account.dtToken) {
-            const directAccount = {
-              dtUserId: account.dtUserId,
-              token: decryptText(account.dtToken) ?? "",
-              deviceId: normalizeVerificationDeviceId(account.dtDeviceId, account.appVariant, account.loginType),
-              email: account.email,
-              phone: account.phone,
-              appVariant: account.appVariant
-            };
-            await fetchDirectWebOfflineMessages(directAccount).then(async (offlineMsgs) => {
-              if (offlineMsgs.length > 0) {
-                await storeHelperSmsMessages(accountId, offlineMsgs, { sendTelegram: false });
-              }
-            }).catch((err) => {
-              logger.warn("Account refresh offline team messages catch-up failed", {
-                accountId,
-                error: err instanceof Error ? err.message : String(err)
-              });
-            });
-          }
-          return res;
-        })
+      ? await accountMonitorService.withMaintenance(accountId, refresh)
       : await refresh();
     const freshness = !result.assetSignals.gatewaySnapshotResolved
       ? "cached"
@@ -4674,13 +4652,7 @@ async function refreshMessagesFromRemote(accountId: number, limit: number, direc
       .map((item: DirectProbePushResult) => item.sms)
       .filter((item): item is NonNullable<typeof item> => Boolean(item));
     const directTraceSummary = pushes ? summarizeDirectPushTrace(pushes) : null;
-    let directImported = smsPushes.length > 0 ? await storeParsedSmsPushes(accountId, smsPushes) : 0;
-    await fetchDirectWebOfflineMessages(directSessionAccount).then(async (offlineMsgs) => {
-      if (offlineMsgs.length > 0) {
-        const importedOffline = await storeHelperSmsMessages(accountId, offlineMsgs, { sendTelegram: false }).catch(() => 0);
-        directImported += importedOffline;
-      }
-    }).catch(() => undefined);
+    const directImported = smsPushes.length > 0 ? await storeParsedSmsPushes(accountId, smsPushes) : 0;
     diagnostics.push({
       source: "direct-push",
       scanned: directTraceSummary?.rawPushFrames ?? smsPushes.length,
