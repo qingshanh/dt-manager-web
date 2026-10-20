@@ -1074,10 +1074,17 @@ function isSlowTelegramCallback(callback: TelegramPanelCallback) {
 }
 
 async function phoneActionConfirmationReply(accountId: number, phoneId: number, action: "renew" | "cancel"): Promise<BotReply> {
-  const phone = await prisma.phoneNumber.findFirst({
+  let phone = await prisma.phoneNumber.findFirst({
     where: { id: phoneId, accountId },
     include: { account: { include: { snapshot: true } } }
   });
+  if (!phone) {
+    const all = await prisma.phoneNumber.findMany({
+      where: { accountId },
+      include: { account: { include: { snapshot: true } } }
+    });
+    phone = all.find((p) => p.id === phoneId) ?? null;
+  }
   if (!phone) return htmlNotice("号码不存在，请刷新号码列表后重试。");
   if (action === "renew" && phone.status === PhoneStatus.cancelled) return htmlNotice("已取消号码不能续期。");
   if (action === "cancel" && (phone.status === PhoneStatus.cancelled || phone.status === PhoneStatus.expired)) {
@@ -1132,8 +1139,11 @@ async function executeConfirmedPhoneCallback(
       action,
       `telegram:${accountId}:${phoneId}:${action}:${expectedVersion}`
     );
+    const displayText = result.startsWith("<b>")
+      ? result
+      : `<b>${action === "renew" ? "续期处理结果" : "取消处理结果"}</b>\n${escapeTelegramHtml(result)}`;
     return {
-      text: `<b>${action === "renew" ? "续期处理结果" : "取消处理结果"}</b>\n${escapeTelegramHtml(result)}`,
+      text: displayText,
       replyMarkup: phoneDetailKeyboard(accountId, phoneId),
       parseMode: "HTML"
     };
@@ -1755,7 +1765,11 @@ async function phoneActionText(
     const balanceBefore = action === "renew"
       ? await resolveLiveAccountBalance(account, direct, { requireFresh: true })
       : null;
-    const renewalBaseline = action === "renew" ? await getBotPhoneBaseline(direct, phone.phoneNumber) : null;
+    const renewalBaseline = action === "renew"
+      ? (parseBotPhoneExpiry(phone.expiredTime) !== null
+          ? phone
+          : await getBotPhoneBaseline(direct, phone.phoneNumber).catch(() => phone))
+      : null;
     const quotedPrice = action === "renew" ? getPhoneRenewalCost(mapStoredPhoneContext(phone)) : null;
     const extensionMonths = action === "renew" ? resolvePhoneRenewalMonths(phone) : null;
     if (action === "renew" && (balanceBefore === null || quotedPrice === null)) {
@@ -1994,19 +2008,24 @@ async function findCountry(account: DtAccount, isoCountryCode: string) {
 }
 
 async function findStoredPhone(accountId: number, phoneRef: string) {
-  const id = Number(phoneRef);
-  if (Number.isInteger(id)) {
+  const cleanRef = phoneRef.trim();
+  const digits = normalizePhoneDigits(cleanRef);
+  // 若传入的是长度>=7位的纯数字手机号，优先按手机号匹配
+  if (digits && digits.length >= 7) {
+    const phones = await prisma.phoneNumber.findMany({ where: { accountId } });
+    const byDigits = phones.find((item) => normalizePhoneDigits(item.phoneNumber) === digits);
+    if (byDigits) return byDigits;
+  }
+  const id = Number(cleanRef);
+  if (Number.isInteger(id) && id > 0) {
     const byId = await prisma.phoneNumber.findFirst({ where: { id, accountId } });
-    if (byId) {
-      return byId;
-    }
+    if (byId) return byId;
   }
-  const digits = normalizePhoneDigits(phoneRef);
-  if (!digits) {
-    return null;
+  if (digits) {
+    const phones = await prisma.phoneNumber.findMany({ where: { accountId } });
+    return phones.find((item) => normalizePhoneDigits(item.phoneNumber) === digits) ?? null;
   }
-  const phones = await prisma.phoneNumber.findMany({ where: { accountId } });
-  return phones.find((item) => normalizePhoneDigits(item.phoneNumber) === digits) ?? null;
+  return null;
 }
 
 async function findDefaultStoredPhone(accountId: number) {
