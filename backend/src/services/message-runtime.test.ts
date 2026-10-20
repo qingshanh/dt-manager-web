@@ -1533,3 +1533,39 @@ test("renders and stores reward credit arrivals with k5Flag 531 for checkin and 
   assert.equal(runtime.messages[0]?.k5Flag, 531);
   assert.equal(runtime.messages[0]?.msgType, MessageType.system);
 });
+
+test("downgrades marketing push notices without credit rewards from type 531 to 3300", async () => {
+  const runtime = createMessageRuntimeDb();
+  runtime.accounts.set(1, {
+    id: 1,
+    adminId: 1,
+    appVariant: "dingdong",
+    nickname: null,
+    email: "owner@example.com",
+    phone: null,
+    dtUserId: "u1",
+    telegramNotify: false
+  });
+
+  const imported = await storeHelperSmsMessages(1, [
+    {
+      conversationType: 4,
+      conversationId: "10000",
+      type: 531,
+      senderId: "叮咚团队",
+      msgId: "marketing-notice-1",
+      content: "You have 20 chances to play! Play games now to win 100 credits!"
+    }
+  ], {
+    db: runtime.db as any,
+    emitEvents: false,
+    sendTelegram: false,
+    collectTeamMessages: true
+  });
+
+  assert.equal(imported, 1);
+  assert.equal(runtime.messages[0]?.fromNumber, "叮咚团队");
+  assert.equal(runtime.messages[0]?.content, "You have 20 chances to play! Play games now to win 100 credits!");
+  assert.equal(runtime.messages[0]?.k5Flag, 3300);
+  assert.equal(runtime.messages[0]?.msgType, MessageType.system);
+});

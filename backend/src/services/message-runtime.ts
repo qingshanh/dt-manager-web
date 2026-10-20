@@ -205,11 +205,9 @@ async function storeHelperSmsMessage(accountId: number, row: HelperSmsMessageRec
   const namedTeamName = resolveHelperTeamName(normalizedRow, account.appVariant);
   const trustedTeamContext = hasTrustedHelperTeamContext(normalizedRow, namedTeamName);
   const effectiveTeamType =
-    parsedTeamMeta.k1 === 531 || parsedTeamMeta.k1 === 532
-      ? parsedTeamMeta.k1
-      : hasTeamCreditMeta
-        ? (parsedTeamMeta.actionType === 5 ? 532 : 531)
-        : normalizedRow.type;
+    hasTeamCreditMeta
+      ? (parsedTeamMeta.k1 === 532 || parsedTeamMeta.actionType === 5 ? 532 : 531)
+      : (normalizedRow.type === 531 || normalizedRow.type === 532 ? 3300 : normalizedRow.type);
   const teamName =
     namedTeamName ??
     (trustedTeamContext && hasTeamCreditMeta ? (appVariant === "dingdong" ? "叮咚团队" : "说道团队") : null);

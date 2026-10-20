@@ -1029,12 +1029,12 @@ export class DirectDingtoneGateway implements DingtoneGateway {
       countryCode: payload.countryCode,
       isoCountryCode: payload.isoCountryCode ?? payload.candidate.isoCountryCode,
       countryKey: payload.countryKey
-    });
+    }, account);
     const query = buildEdgeOrderPrivateNumberQuery(payload.candidate, {
       countryCode: payload.countryCode,
       isoCountryCode: payload.isoCountryCode ?? payload.candidate.isoCountryCode,
       countryKey: payload.countryKey
-    });
+    }, account);
     const result = await this.withRegisteredSession(runtime, account, async (session) => {
       const lock = await session.callEdgeRestJson("phone purchase lock", PHONE_PURCHASE_LOCK_API_NAME, lockQuery);
       assertPhonePurchaseLockSuccess(lock);
@@ -1069,7 +1069,7 @@ export class DirectDingtoneGateway implements DingtoneGateway {
       countryCode: payload.countryCode,
       isoCountryCode: payload.isoCountryCode ?? payload.candidate.isoCountryCode,
       countryKey: payload.countryKey
-    });
+    }, account);
     return this.withRegisteredSession(runtime, account, async (session) => {
       let locked = false;
       try {
@@ -4707,14 +4707,16 @@ export function normalizeDirectWebOfflineMessages(payload: unknown, appVariant?:
       { k1: messageType }
     );
     const hasCreditMeta =
-      (parsedMeta.k1 === 531 || parsedMeta.k1 === 532) &&
-      parsedMeta.credits !== null;
+      parsedMeta.credits !== null && parsedMeta.credits > 0;
     const teamName =
       resolveDirectWebOfflineTeamName(messageType, title, originalSenderId, appVariant) ??
       (hasCreditMeta ? (appVariant === "dingdong" ? "叮咚团队" : "说道团队") : null);
     const body = commonEvent?.content ?? extractDirectOfflineMessageText(rawBody) ?? rawBody;
     const plainContent = teamName && title && body && title !== body ? `${title}\n${body}` : body ?? title;
-    const content = hasCreditMeta || (!plainContent && parsedMeta.raw)
+    const envelopeEligible =
+      ((parsedMeta.k1 === 531 || parsedMeta.k1 === 532) && parsedMeta.credits !== null) ||
+      (!plainContent && parsedMeta.raw);
+    const content = envelopeEligible
       ? buildTeamMessageEnvelope({ title, body, meta: parsedMeta.raw })
       : plainContent;
     if (!content || (!teamName && !originalSenderId)) {
@@ -4723,7 +4725,9 @@ export function normalizeDirectWebOfflineMessages(payload: unknown, appVariant?:
     const msgId = pickString(record, ["msgId", "messageId", "id"]) ?? null;
     const timestamp = pickNumber(record, ["msgTimeStamp", "timestamp", "time", "createdAt"]) ?? null;
     const meta = parsedMeta.raw ?? normalizeDirectWebOfflineMeta(record.msgMeta ?? record.meta ?? record.data2 ?? commonEvent?.args);
-    const effectiveType = parsedMeta.k1 ?? messageType;
+    const effectiveType = hasCreditMeta
+      ? (parsedMeta.k1 === 532 || parsedMeta.actionType === 5 ? 532 : 531)
+      : (messageType === 531 || messageType === 532 ? 3300 : (parsedMeta.k1 ?? messageType));
     const senderId = teamName ?? originalSenderId;
     const conversationType = teamName
       ? 4
@@ -4774,7 +4778,7 @@ function resolveDirectWebOfflineTeamName(
   senderId: string | null | undefined,
   appVariant?: "dingtone" | "dingdong"
 ) {
-  if (messageType === 3300 || senderId === "2684354560") {
+  if (messageType === 3300 || senderId === "2684354560" || senderId === "10000") {
     return appVariant === "dingdong" ? "叮咚团队" : "说道团队";
   }
   for (const value of [title, senderId]) {
@@ -6552,7 +6556,8 @@ function buildOrderPrivateNumberQuery(
 
 function buildPhonePurchaseLockQuery(
   phone: DirectPhoneActionContext,
-  options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null }
+  options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null },
+  account?: { dtUserId: string; token: string; deviceId?: string | null }
 ) {
   const raw = collectPhoneActionRecords(phone);
   const candidateCountryCode = options.countryCode ?? pickPhoneNumber(phone, raw, ["countryCode", "country_code"]) ?? 1;
@@ -6565,6 +6570,13 @@ function buildPhonePurchaseLockQuery(
     requestConfig.countryKey
   );
   return [
+    ...(account
+      ? [
+          queryPair("token", account.token),
+          queryPair("deviceId", accountDeviceId(account)),
+          queryPair("userId", account.dtUserId)
+        ]
+      : []),
     queryPair("phoneNumber", stripPhonePrefix(phone.phoneNumber ?? "")),
     queryPair("countryCode", requestConfig.countryCode),
     queryPair("providerId", providerId)
@@ -6573,7 +6585,8 @@ function buildPhonePurchaseLockQuery(
 
 function buildEdgeOrderPrivateNumberQuery(
   phone: DirectPhoneActionContext,
-  options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null }
+  options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null },
+  account?: { dtUserId: string; token: string; deviceId?: string | null }
 ) {
   const raw = collectPhoneActionRecords(phone);
   const candidateCountryCode = options.countryCode ?? pickPhoneNumber(phone, raw, ["countryCode", "country_code"]) ?? 1;
@@ -6601,6 +6614,13 @@ function buildEdgeOrderPrivateNumberQuery(
   }
   const simCountryCode = pickPhoneString(phone, raw, ["simCC", "sim_cc"]) ?? "CN";
   return [
+    ...(account
+      ? [
+          queryPair("token", account.token),
+          queryPair("deviceId", accountDeviceId(account)),
+          queryPair("userId", account.dtUserId)
+        ]
+      : []),
     queryPair("countryCode", countryCode),
     queryPair("areaCode", areaCode),
     queryPair("phoneNumber", stripPhonePrefix(phone.phoneNumber ?? "")),
@@ -6654,10 +6674,11 @@ export function buildPhonePurchaseLockQueryForTest(input: {
 }
 
 export function buildEdgeOrderPrivateNumberQueryForTest(input: {
+  account?: { dtUserId: string; token: string; deviceId?: string | null };
   phone: DirectPhoneActionContext;
   options: { countryCode?: number; isoCountryCode?: string | null; countryKey?: string | null };
 }) {
-  return buildEdgeOrderPrivateNumberQuery(input.phone, input.options);
+  return buildEdgeOrderPrivateNumberQuery(input.phone, input.options, input.account);
 }
 
 function uniqueStrings(values: string[]) {

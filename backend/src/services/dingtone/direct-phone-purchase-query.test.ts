@@ -293,3 +293,38 @@ test("rejects App-shaped credit purchase order params without product id", () =>
     /productId/
   );
 });
+
+test("builds authenticated Edge credit purchase order params with token, deviceId, and userId when account is provided", () => {
+  const query = buildEdgeOrderPrivateNumberQueryForTest({
+    account: {
+      dtUserId: "user-455",
+      token: "secret-token",
+      deviceId: "And.device.id"
+    },
+    phone: {
+      phoneNumber: "+61488896087",
+      countryCode: 61,
+      isoCountryCode: "AU",
+      areaCode: 48,
+      providerId: 2008,
+      packageServiceId: "DT03007",
+      productId: "DTIP_CASH_PHONE_NEW_2999",
+      rawJson: JSON.stringify({ type: 2, category: 0 })
+    },
+    options: {
+      countryCode: 61,
+      isoCountryCode: "AU",
+      countryKey: "AU"
+    }
+  });
+  const params = new URLSearchParams(query);
+
+  assert.equal(params.get("token"), "secret-token");
+  assert.equal(params.get("deviceId"), "And.device.id");
+  assert.equal(params.get("userId"), "user-455");
+  assert.equal(params.get("countryCode"), "61");
+  assert.equal(params.get("phoneNumber"), "61488896087");
+  assert.equal(params.get("productId"), "DTIP_CASH_PHONE_NEW_2999");
+  assert.equal(params.get("payFlag"), "2");
+  assert.equal(params.get("buyCredit"), "1");
+});
