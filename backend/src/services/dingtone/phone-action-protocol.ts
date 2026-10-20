@@ -72,23 +72,40 @@ export function buildPrivateNumberSettingPayload(
   const slientFlag = requireBoolean(records, ["slientFlag", "silentFlag", "slient_flag", "silent_flag"], "slientFlag", missingFields);
   const suspendFlag = requireBoolean(records, ["suspendFlag", "suspend_flag"], "suspendFlag", missingFields);
   const callForwardFlag = requireBoolean(records, ["callForwardFlag", "call_forward_flag"], "callForwardFlag", missingFields);
-  const forwardNumber = requireString(records, ["forwardNumber", "forward_number"], "forwardNumber", missingFields, true);
-  const forwardCountryCode = requireNumber(records, ["forwardCountryCode", "forward_country_code"], "forwardCountryCode", missingFields);
-  const forwardDestCode = requireNumber(records, ["forwardDestCode", "forward_dest_code"], "forwardDestCode", missingFields);
-  const autoSMSReply = requireNumber(records, ["autoSMSReply", "auto_sms_reply"], "autoSMSReply", missingFields);
-  const useVoicemail = requireNumber(records, ["useVoicemail", "use_voicemail"], "useVoicemail", missingFields);
-  const voicemailId = requireString(records, ["voicemailId", "voicemail_id"], "voicemailId", missingFields, true);
-  const autoSMSContent = requireString(records, ["autoSMSContent", "auto_sms_content"], "autoSMSContent", missingFields, true);
-  const defaultGreetings = requireNumber(records, ["defaultGreetings", "default_greetings"], "defaultGreetings", missingFields);
+  const callForwardRequired = Boolean(callForwardFlag);
+  const forwardNumber =
+    requireString(records, ["forwardNumber", "forward_number"], "forwardNumber", callForwardRequired ? missingFields : [], true) ?? "";
+  const forwardCountryCode =
+    requireNumber(records, ["forwardCountryCode", "forward_country_code"], "forwardCountryCode", callForwardRequired ? missingFields : []) ?? 0;
+  const forwardDestCode =
+    requireNumber(records, ["forwardDestCode", "forward_dest_code"], "forwardDestCode", callForwardRequired ? missingFields : []) ?? 0;
+
+  const autoSMSReply = requireNumber(records, ["autoSMSReply", "auto_sms_reply"], "autoSMSReply", []) ?? 0;
+  const autoSMSRequired = Boolean(autoSMSReply);
+  const autoSMSContent =
+    requireString(records, ["autoSMSContent", "auto_sms_content"], "autoSMSContent", autoSMSRequired ? missingFields : [], true) ?? "";
+
+  const useVoicemail = requireNumber(records, ["useVoicemail", "use_voicemail"], "useVoicemail", []) ?? 0;
+  const voicemailRequired = Boolean(useVoicemail);
+  const voicemailId =
+    requireString(records, ["voicemailId", "voicemail_id"], "voicemailId", voicemailRequired ? missingFields : [], true) ?? "";
+  const defaultGreetings =
+    requireNumber(records, ["defaultGreetings", "default_greetings"], "defaultGreetings", voicemailRequired ? missingFields : []) ?? 0;
+
   const autoRenew = requireBoolean(records, ["autoRenew", "auto_renew"], "autoRenew", missingFields);
-  const filterSetting = requireFilterSetting(records, missingFields);
+  const rawFilterSetting = requireFilterSetting(records, patch.allowReceiveSms !== undefined ? [] : missingFields);
+  const filterSetting =
+    rawFilterSetting ??
+    (patch.allowReceiveSms !== undefined
+      ? { callBlockSetting: 0, useBlock: 0, allowReceiveSMS: patch.allowReceiveSms, callBlockHandle: 0 }
+      : undefined);
 
   if (missingFields.length > 0) {
     throw new UnsafePhoneSettingSourceError(missingFields);
   }
 
   const nextSuspend = patch.suspendFlag ?? suspendFlag!;
-  const nextFilterSetting = { ...filterSetting! };
+  const nextFilterSetting = { ...(filterSetting ?? { callBlockSetting: 0, useBlock: 0, allowReceiveSMS: true, callBlockHandle: 0 }) };
   if (patch.allowReceiveSms !== undefined) {
     nextFilterSetting.allowReceiveSMS = patch.allowReceiveSms;
   }

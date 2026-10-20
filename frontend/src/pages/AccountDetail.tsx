@@ -558,6 +558,34 @@ function formatPointPriceZh(value: number | null | undefined) {
   return `${value.toFixed(2)} 积分`;
 }
 
+function resolveDefaultCandidatePeriodMonths(candidate: PhonePurchaseCandidate, raw: Record<string, unknown> | null): number {
+  const priceQuote = (raw?.priceQuote ?? raw?.price_quote) as Record<string, unknown> | undefined;
+  const quoteData = priceQuote?.data && typeof priceQuote.data === 'object' ? (priceQuote.data as Record<string, unknown>) : priceQuote;
+  const oncePayList = quoteData?.oncePayPrice;
+  if (Array.isArray(oncePayList) && oncePayList.length > 0) {
+    const type = oncePayList[0]?.type;
+    if (type === 2) return 12;
+    if (type === 1) return 1;
+    if (type === 3) return 3;
+  }
+
+  const extraMonths = pickNumber(raw ?? {}, ['extraChargeMonthsCount', 'extra_charge_months_count']);
+  if (extraMonths && extraMonths > 0) {
+    return extraMonths;
+  }
+
+  const cc = candidate.country_code ?? pickNumber(raw ?? {}, ['countryCode', 'country_code']);
+  const iso = String(candidate.iso_country_code ?? raw?.isoCountryCode ?? raw?.isoCC ?? '').toUpperCase();
+
+  // 北美（加拿大 CA、美国 US）和澳大利亚 AU 基础购买周期均为 1 年（12个月）
+  if (cc === 1 || iso === 'US' || iso === 'CA' || cc === 61 || iso === 'AU') {
+    return 12;
+  }
+
+  // 默认欧洲及其他国家为 3 个月（季度）
+  return 3;
+}
+
 function formatPhonePrice(candidate: PhonePurchaseCandidate) {
   const raw = parseJsonRecord(candidate.raw_json);
   const rawPrice = pickNumber(raw ?? {}, [
@@ -590,7 +618,8 @@ function formatPhonePrice(candidate: PhonePurchaseCandidate) {
         ? `，$${yearDollarPrice}/年`
         : '';
   const rawPeriod = pickNumber(raw ?? {}, ['usePeriod', 'use_period', 'validPeriodDays', 'valid_period_days']);
-  const periodText = rawPeriod === null ? '3个月' : rawPeriod <= 12 ? `${rawPeriod}个月` : `${rawPeriod}天`;
+  const periodMonths = rawPeriod !== null ? rawPeriod : resolveDefaultCandidatePeriodMonths(candidate, raw);
+  const periodText = periodMonths <= 12 ? `${periodMonths}个月` : `${periodMonths}天`;
   if (price !== null && price !== undefined && !Number.isNaN(price)) {
     const packageText =
       extraChargeMonthsPrice !== null && extraChargeMonthsPrice !== undefined && !Number.isNaN(extraChargeMonthsPrice)

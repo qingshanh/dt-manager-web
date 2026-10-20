@@ -8549,7 +8549,19 @@ function extractPhoneProductIdFromQuote(value: unknown) {
 
 function flattenPriceQuote(value: unknown) {
   const record = collectNestedRecords(value)[0] ?? {};
+  const records = collectNestedRecords(value);
+  let usePeriod: number | null = null;
+  for (const r of records) {
+    if (Array.isArray(r.oncePayPrice) && r.oncePayPrice.length > 0) {
+      const type = r.oncePayPrice[0]?.type;
+      if (type === 2) usePeriod = 12;
+      else if (type === 1) usePeriod = 1;
+      else if (type === 3) usePeriod = 3;
+      break;
+    }
+  }
   return {
+    ...(usePeriod ? { usePeriod } : {}),
     monthDollarPrice: pickNumber(record, ["monthDollarPrice", "month_dollar_price"]),
     yearDollarPrice: pickNumber(record, ["yearDollarPrice", "year_dollar_price"]),
     extraChargeMonthsCount: pickNumber(record, ["extraChargeMonthsCount", "extra_charge_months_count"]),

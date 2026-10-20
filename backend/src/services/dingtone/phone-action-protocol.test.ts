@@ -78,3 +78,33 @@ test("rejects an incomplete source before building a setting write", () => {
     UnsafePhoneSettingSourceError
   );
 });
+
+test("allows enabling SMS reception with safe defaults when remote record omits optional forwarding and filterSetting", () => {
+  const minimalRemoteRecord = {
+    phoneNumber: "3197010201002",
+    countryCode: 31,
+    areaCode: 97,
+    providerId: 2006,
+    autoRenew: 1,
+    callForwardFlag: 0,
+    faxEnabled: 0,
+    slientFlag: 0,
+    suspendFlag: 0,
+    primaryFlag: 0,
+    displayName: "",
+    autoSMSReply: 0,
+    useVoicemail: 0
+  };
+
+  const payload = buildPrivateNumberSettingPayload(minimalRemoteRecord, { allowReceiveSms: true });
+
+  assert.equal(payload.phoneNumber, "3197010201002");
+  assert.equal(payload.filterSetting.allowReceiveSMS, true);
+  assert.equal(payload.callForwardFlag, 0);
+  assert.equal(payload.forwardNumber, "");
+  assert.equal(payload.useVoicemail, 0);
+  assert.equal(payload.voicemailId, "");
+  assert.equal(payload.autoSMSReply, 0);
+  assert.equal(payload.autoSMSContent, "");
+  assert.equal(payload.autoRenew, 1);
+});
