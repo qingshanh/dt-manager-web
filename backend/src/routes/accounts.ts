@@ -1381,8 +1381,8 @@ accountsRouter.post("/:id/refresh", async (req, res, next) => {
       allowAdbPoint: false,
       includePublicEnrichment: false,
       persistCachedSnapshot: false,
-      gatewaySnapshotWaitMs: 8_000,
-      phoneListWaitMs: 8_000
+      gatewaySnapshotWaitMs: 20_000,
+      phoneListWaitMs: 15_000
     });
     const result = useDirect
       ? await accountMonitorService.withMaintenance(accountId, refresh)
