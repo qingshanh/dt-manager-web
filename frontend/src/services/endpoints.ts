@@ -1,4 +1,5 @@
 import api from './api';
+import { generateUUID } from '../utils/uuid';
 import { fetchCachedData, invalidateCachedData, isCachedDataFresh, makeCacheKey, readCachedData } from './client-cache';
 import type {
   ApiResponse,
@@ -565,7 +566,7 @@ export async function refreshPointStoreOrder(accountId: number, orderId: number)
   return res.data.data;
 }
 
-export async function renewPhoneNumber(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
+export async function renewPhoneNumber(accountId: number, phoneId: number, requestId = generateUUID()) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/renew`, {
     confirm: true,
     request_id: requestId,
@@ -577,7 +578,7 @@ export async function renewPhoneNumber(accountId: number, phoneId: number, reque
 export async function updatePhoneNumberLabel(accountId: number, phoneId: number, data: UpdatePhoneLabelBody) {
   const res = await api.put<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/label`, {
     ...data,
-    request_id: data.request_id ?? crypto.randomUUID(),
+    request_id: data.request_id ?? generateUUID(),
   }, { timeout: 20_000 });
   invalidateAccountCaches(accountId);
   return res.data.data;
@@ -586,14 +587,14 @@ export async function updatePhoneNumberLabel(accountId: number, phoneId: number,
 export async function enablePhoneSmsReception(accountId: number) {
   const res = await api.post<ApiResponse<PhoneSmsReceptionRepairResult>>(
     `/accounts/${accountId}/phone-numbers/enable-sms-reception`,
-    { confirm: true, request_id: crypto.randomUUID() },
+    { confirm: true, request_id: generateUUID() },
     { timeout: 20_000 },
   );
   invalidateAccountCaches(accountId);
   return res.data.data;
 }
 
-export async function forceEnablePhoneSms(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
+export async function forceEnablePhoneSms(accountId: number, phoneId: number, requestId = generateUUID()) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(
     `/accounts/${accountId}/phone-numbers/${phoneId}/force-enable-sms`,
     { confirm: true, request_id: requestId },
@@ -603,7 +604,7 @@ export async function forceEnablePhoneSms(accountId: number, phoneId: number, re
   return res.data.data;
 }
 
-export async function cancelPhoneNumber(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
+export async function cancelPhoneNumber(accountId: number, phoneId: number, requestId = generateUUID()) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/cancel`, {
     confirm: true,
     request_id: requestId,
@@ -612,7 +613,7 @@ export async function cancelPhoneNumber(accountId: number, phoneId: number, requ
   return res.data.data;
 }
 
-export async function pausePhoneNumber(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
+export async function pausePhoneNumber(accountId: number, phoneId: number, requestId = generateUUID()) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/pause`, {
     confirm: true,
     request_id: requestId,
@@ -621,7 +622,7 @@ export async function pausePhoneNumber(accountId: number, phoneId: number, reque
   return res.data.data;
 }
 
-export async function resumePhoneNumber(accountId: number, phoneId: number, requestId = crypto.randomUUID()) {
+export async function resumePhoneNumber(accountId: number, phoneId: number, requestId = generateUUID()) {
   const res = await api.post<ApiResponse<PhoneActionResult>>(`/accounts/${accountId}/phone-numbers/${phoneId}/resume`, {
     confirm: true,
     request_id: requestId,
@@ -650,6 +651,14 @@ export async function deletePhoneNumber(accountId: number, phoneId: number) {
   });
   invalidateAccountCaches(accountId);
   return res.data;
+}
+
+export async function clearPhoneOperation(accountId: number, phoneId: number) {
+  const res = await api.post<ApiResponse<{ cleared: boolean; phone: PhoneNumber | null }>>(
+    `/accounts/${accountId}/phone-numbers/${phoneId}/clear-operation`
+  );
+  invalidateAccountCaches(accountId);
+  return res.data.data;
 }
 
 // 鈹€鈹€ 璁剧疆 鈹€鈹€

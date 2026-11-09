@@ -1,7 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { AccountStatus, AppVariant, LoginType, MessageDirection, MessageType, PhoneActionType, PhoneStatus, Prisma, type PhoneNumber as StoredPhoneNumber } from "@prisma/client";
+import { AccountStatus, AppVariant, LoginType, MessageDirection, MessageType, PhoneActionState, PhoneActionType, PhoneStatus, Prisma, type PhoneNumber as StoredPhoneNumber } from "@prisma/client";
 import { Router } from "express";
 import { MonitorStatus } from "@prisma/client";
 import { z } from "zod";
@@ -43,7 +43,7 @@ import { buildPhoneSmsReceptionDiagnostic } from "../services/phone-sms-diagnost
 import { extractPhoneInventoryMetadata } from "../services/phone-inventory.js";
 import { phoneActionCoordinator } from "../services/phone-action-coordinator.js";
 import { resolvePhoneActionBalanceEvidence } from "../services/phone-action-balance.js";
-import { updatePhoneActionAuditEvidence } from "../services/phone-action-operation.js";
+import { markPhoneActionConfirmed, updatePhoneActionAuditEvidence } from "../services/phone-action-operation.js";
 import {
   hasAdvancedPhoneExpiry,
   parsePhoneExpiry,
@@ -1683,6 +1683,53 @@ accountsRouter.get("/:id/phone-numbers/:phoneId/operations/active", async (req, 
     await assertAccountPhoneNumber(accountId, phoneId);
     const operation = await phoneActionCoordinator.getActiveOperation(accountId, phoneId);
     ok(res, { operation: operation ? serializePhoneActionOperation(operation) : null });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.post("/:id/phone-numbers/:phoneId/clear-operation", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const phoneId = Number(req.params.phoneId);
+    await assertAdminAccount(accountId, req.auth!.userId);
+    await assertAccountPhoneNumber(accountId, phoneId);
+
+    const activeOps = await prisma.phoneActionOperation.findMany({
+      where: {
+        accountId,
+        phoneId,
+        OR: [
+          { activeLockKey: { not: null } },
+          { state: PhoneActionState.manual_review },
+          { state: PhoneActionState.awaiting_confirmation }
+        ]
+      }
+    });
+
+    for (const op of activeOps) {
+      await prisma.phoneActionOperation.update({
+        where: { id: op.id },
+        data: {
+          state: PhoneActionState.confirmed_no_effect,
+          activeLockKey: null,
+          responseClass: "manual_dismissed",
+          errorSummary: "人工复核已手动解除",
+          confirmedAt: new Date()
+        }
+      });
+    }
+
+    await prisma.phoneActionOperation.updateMany({
+      where: { accountId, phoneId, activeLockKey: { not: null } },
+      data: { activeLockKey: null }
+    });
+
+    const phoneItem = await prisma.phoneNumber.findUnique({ where: { id: phoneId } });
+    ok(res, {
+      cleared: true,
+      phone: phoneItem ? serializePhoneNumber(phoneItem) : null
+    });
   } catch (error) {
     next(error);
   }
@@ -3355,6 +3402,42 @@ async function performPhoneNumberSyncFromRemote(accountId: number) {
   return accountMonitorService.withMaintenance(accountId, async () => {
     const phoneNumbers = await directRefreshGateway.listPhoneNumbers(directAccount);
     await syncPhoneNumbers(accountId, phoneNumbers);
+
+    const pendingOps = await prisma.phoneActionOperation.findMany({
+      where: {
+        accountId,
+        OR: [
+          { state: PhoneActionState.awaiting_confirmation },
+          { state: PhoneActionState.manual_review },
+          { activeLockKey: { not: null } }
+        ]
+      },
+      include: { phone: true }
+    });
+
+    for (const op of pendingOps) {
+      const remote = phoneNumbers.find((p) => normalizePhoneDigits(p.phoneNumber) === normalizePhoneDigits(op.phone.phoneNumber));
+      if (op.action === PhoneActionType.renew && remote?.expiredTime && op.baselineExpiry) {
+        const baseline = parsePhoneEpochValue(op.baselineExpiry);
+        const current = parsePhoneEpochValue(remote.expiredTime);
+        if (baseline !== null && current !== null && current > baseline) {
+          await markPhoneActionConfirmed(op.id, {
+            confirmationSource: "remote_phone_list",
+            responseClass: "read_only_confirmed",
+            confirmedExpiry: remote.expiredTime,
+            extensionMonths: op.extensionMonths,
+            evidenceAt: new Date()
+          }).catch(() => null);
+        }
+      } else if (op.action === PhoneActionType.cancel && !remote) {
+        await markPhoneActionConfirmed(op.id, {
+          confirmationSource: "remote_phone_list",
+          responseClass: "read_only_confirmed",
+          evidenceAt: new Date()
+        }).catch(() => null);
+      }
+    }
+
     return loadCachedPhoneNumbers(accountId);
   });
 }
@@ -5116,7 +5199,7 @@ type VerificationSendFastAckResult =
   | { pending: false; result: VerificationSendResult }
   | { pending: true; result?: undefined };
 
-const VERIFICATION_SEND_FAST_ACK_MS = 8_000;
+const VERIFICATION_SEND_FAST_ACK_MS = 12_000;
 
 async function sendVerificationCodeWithFastAck(input: {
   accountId: number;

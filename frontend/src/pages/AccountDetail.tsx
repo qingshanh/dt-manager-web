@@ -36,11 +36,13 @@ import {
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
 import { PhoneExpiryBadge } from '../components/PhoneExpiryBadge';
+import { generateUUID } from '../utils/uuid';
 import {
   CACHE_TTL_MS,
   cacheKeys,
   captureSession,
   cancelPhoneNumber,
+  clearPhoneOperation,
   deleteMessage,
   deletePhoneNumber,
   enablePhoneSmsReception,
@@ -743,7 +745,7 @@ function phoneOperationStateTag(operation?: PhoneActionOperation | null) {
 }
 
 function isPhoneOperationBlocking(operation?: PhoneActionOperation | null) {
-  return Boolean(operation && !['confirmed', 'failed_before_write'].includes(operation.state));
+  return Boolean(operation && ['prepared', 'writing', 'awaiting_confirmation'].includes(operation.state));
 }
 
 function phoneSmsDeliveryTag(diagnostic?: PhoneSmsReceptionDiagnostic) {
@@ -1223,6 +1225,21 @@ export default function AccountDetail() {
       message.error(err instanceof Error ? err.message : "开启短信接收失败");
     } finally {
       setEnablingSmsPhoneId(null);
+    }
+  };
+
+  const handleClearPhoneOperation = async (phoneId: number) => {
+    try {
+      await clearPhoneOperation(accountId, phoneId);
+      message.success("已成功解除复核锁定！");
+      setPhoneOperations((current) => {
+        const next = { ...current };
+        delete next[phoneId];
+        return next;
+      });
+      await fetchPhones({ force: true });
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : "解除锁定失败");
     }
   };
   const [directSessionImportOpen, setDirectSessionImportOpen] = useState(false);
@@ -2165,7 +2182,7 @@ export default function AccountDetail() {
 
   const phoneAction = async (phoneId: number, action: 'renew' | 'cancel' | 'pause' | 'resume') => {
     const loadingKey = `${phoneId}:${action}`;
-    const requestId = crypto.randomUUID();
+    const requestId = generateUUID();
     setPhoneActionLoadingKey(loadingKey);
     try {
       let result: PhoneActionResult | null = null;
@@ -2239,7 +2256,7 @@ export default function AccountDetail() {
       onOk: async () => {
         const result = await updatePhoneNumberLabel(accountId, phone.id, {
           display_name: nextLabel.trim(),
-          request_id: crypto.randomUUID(),
+          request_id: generateUUID(),
         });
         setPhoneOperations((current) => ({ ...current, [phone.id]: result.operation }));
         setPhones((current) => current.map((item) => (
@@ -2471,7 +2488,17 @@ export default function AccountDetail() {
         return (
           <Space size="small" wrap>
             {phoneOperationStateTag(operation)}
-            <Button size="small" disabled={actionBlocked} onClick={() => handleEditPhoneLabel(record)}>
+            {operation?.state === 'manual_review' && (
+              <Popconfirm
+                title="确认解除该号码的复核锁定状态？解除后可恢复正常操作。"
+                onConfirm={() => handleClearPhoneOperation(record.id)}
+              >
+                <Button size="small" danger>
+                  解除锁定
+                </Button>
+              </Popconfirm>
+            )}
+            <Button size="small" onClick={() => handleEditPhoneLabel(record)}>
               备注
             </Button>
             {status === 'active' && record.allow_receive_sms !== true && (

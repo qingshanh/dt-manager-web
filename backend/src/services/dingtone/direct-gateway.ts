@@ -3707,13 +3707,14 @@ class DirectSession {
       }
     });
 
+    const activationTimeoutMs = Math.min(this.runtime.ioTimeoutMs, 7_000);
     this.clearJsonQueue();
-    this.beginJsonCapture(this.runtime.ioTimeoutMs);
+    this.beginJsonCapture(activationTimeoutMs);
     this.queue = [];
     this.queueBytes = 0;
     dumpDirectDebugFrame(label, frame);
     await this.write(frame);
-    return this.waitForJsonPayload(this.runtime.ioTimeoutMs, `${label} native activation response`, (payload) => {
+    return this.waitForJsonPayload(activationTimeoutMs, `${label} native activation response`, (payload) => {
       return isExpectedActivationPayload(label, payload);
     });
   }
@@ -7135,10 +7136,12 @@ function directActivationRuntimeForApi(
 }
 
 function directActivationHostCandidates(runtime: DirectRuntimeConfig, identity: DirectActivationIdentity) {
-  if (typeof identity !== "string" && identity.appVariant === "dingtone") {
-    return uniqueStrings([runtime.backupHost, runtime.primaryHost]);
-  }
-  return uniqueStrings([runtime.primaryHost, runtime.backupHost]);
+  const isDingtone = typeof identity !== "string" && identity.appVariant === "dingtone";
+  const preferred = isDingtone
+    ? [runtime.backupHost, runtime.primaryHost]
+    : [runtime.primaryHost, runtime.backupHost];
+  const globalEdgeHosts = ["44.198.131.100", "20.97.117.109", "206.189.228.89"];
+  return uniqueStrings([...preferred, ...globalEdgeHosts]);
 }
 
 function activationDeviceId(identity: DirectActivationIdentity) {
