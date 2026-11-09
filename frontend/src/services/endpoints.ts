@@ -686,3 +686,86 @@ export async function mockMessage(account_id: number, content: string, from_numb
   invalidateAccountCaches(account_id);
   return res.data.data;
 }
+
+// ── 游戏与宠物福利 ──
+
+export interface AccountGameSummary {
+  accountId: number;
+  dtUserId: string | null;
+  appVariant: string;
+  appType: number;
+  gameAppId: number;
+  pet?: {
+    petId: number | null;
+    petName: string | null;
+    petLevel: number | null;
+    fishNum: number | null;
+    growthValue: number | null;
+    nextLevelRequiredGrowthValue: number | null;
+    nextFeedRemainingTime: number | null;
+    treasureHuntStatus: number | null;
+    treasureHuntEndRemainingTime: number | null;
+    nextTreasureHuntRemainingTime: number | null;
+  } | null;
+  fruit?: {
+    nutritiveNumber: number | null;
+    plantFruitList: Array<{
+      fruitId: number;
+      name: string;
+      completionRate: number;
+      type: number;
+    }>;
+  } | null;
+  mathGame?: {
+    uid: string | null;
+    validPoint: number | null;
+    expirePoint: number | null;
+    chanceLeft: number | null;
+    watchAdsAddChanceFrequency: number | null;
+    record: number | null;
+    shortUuid: string | null;
+  } | null;
+}
+
+export interface GameTaskLog {
+  time: string;
+  module: 'pet' | 'fruit' | 'knife' | 'math' | 'checkin' | 'system';
+  level: 'info' | 'success' | 'warn' | 'error';
+  message: string;
+}
+
+export interface GameExecutionResult {
+  accountId: number;
+  success: boolean;
+  logs: GameTaskLog[];
+}
+
+export async function getAccountGameSummary(accountId: number): Promise<AccountGameSummary> {
+  const res = await api.get<ApiResponse<AccountGameSummary>>(`/accounts/${accountId}/games/summary`);
+  return res.data.data;
+}
+
+export async function runAccountGameDaily(accountId: number): Promise<GameExecutionResult> {
+  const res = await api.post<ApiResponse<GameExecutionResult>>(`/accounts/${accountId}/games/daily`);
+  return res.data.data;
+}
+
+export async function feedAccountPet(accountId: number): Promise<{ success: boolean; logs: GameTaskLog[] }> {
+  const res = await api.post<ApiResponse<{ success: boolean; logs: GameTaskLog[] }>>(`/accounts/${accountId}/games/pet/feed`);
+  return res.data.data;
+}
+
+export async function waterAccountFruit(accountId: number): Promise<{ success: boolean; logs: GameTaskLog[] }> {
+  const res = await api.post<ApiResponse<{ success: boolean; logs: GameTaskLog[] }>>(`/accounts/${accountId}/games/fruit/water`);
+  return res.data.data;
+}
+
+export async function boostAccountGameShare(accountId: number): Promise<{ count: number; logs: string[] }> {
+  const res = await api.post<ApiResponse<{ count: number; logs: string[] }>>(`/accounts/${accountId}/games/boost`);
+  return res.data.data;
+}
+
+export async function runAllAccountsGameDaily(): Promise<{ total: number; results: GameExecutionResult[] }> {
+  const res = await api.post<ApiResponse<{ total: number; results: GameExecutionResult[] }>>(`/games/daily-all`);
+  return res.data.data;
+}

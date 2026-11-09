@@ -103,6 +103,7 @@ import DirectSessionImportModal, {
   type DirectSessionImportValues,
 } from '../components/accounts/DirectSessionImportModal';
 import VerificationReloginModal from '../components/accounts/VerificationReloginModal';
+import AccountGameRewards from '../components/accounts/AccountGameRewards';
 
 type SnapshotExtras = {
   dtDingtoneId: string | null;
@@ -2896,6 +2897,11 @@ export default function AccountDetail() {
               </div>
             ),
           },
+            {
+              key: 'games',
+              label: '游戏与福利',
+              children: <AccountGameRewards accountId={accountId} />,
+            },
         ]}
       />
       <DirectSessionImportModal
