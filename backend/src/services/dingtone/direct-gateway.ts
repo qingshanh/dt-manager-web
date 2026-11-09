@@ -7453,17 +7453,6 @@ async function callDirectEmailVerificationSequence(
         });
       }
 
-      if (activatedUser?.appType !== null && activatedUser?.appType !== undefined) {
-        const expectedVariant = activatedUser.appType === 3 ? "dingdong" : "dingtone";
-        if (expectedVariant !== input.appVariant) {
-          throw new AppError(
-            `user exist in other app: account belongs to ${expectedVariant} (AppType ${activatedUser.appType}), but request was for ${input.appVariant}`,
-            400,
-            400
-          );
-        }
-      }
-
       const payload = await session.callConfiguredRegisterEmailTemplate(
         "registerEmail",
         activationDeviceId(identity),
@@ -7476,6 +7465,10 @@ async function callDirectEmailVerificationSequence(
       lastError = error;
       if (error instanceof AppError && /user exist in other app/i.test(error.message)) {
         throw error;
+      }
+      const isTimeout = error instanceof Error && /Timed out waiting for registerEmail/i.test(error.message);
+      if (isTimeout) {
+        break;
       }
       logger.warn("Direct email verification sequence failed", {
         host,

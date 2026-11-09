@@ -231,7 +231,7 @@ test("checkActivatedUser and registerEmail share one activation session", async 
   assert.equal(result.payload.Result, 1);
   assert.equal(result.activatedUser?.dtUserId, "123");
 });
-test("detects variant mismatch from checkActivatedUser AppType and fails fast with user exist in other app", async () => {
+test("registerEmail timeout breaks out of candidate host loop fast to enable variant fallback", async () => {
   const calls: string[] = [];
   const runtime = {
     primaryHost: "primary.example",
@@ -246,20 +246,11 @@ test("detects variant mismatch from checkActivatedUser AppType and fails fast wi
     async openActivation() {
       calls.push("open");
     },
-    async callCommonRestJson(_label: string, apiName: string) {
-      if (apiName === "clientInfo") {
-        calls.push("clientInfo");
-        return { Result: 1 };
-      }
-      calls.push("check");
-      return {
-        Result: 1,
-        User: [{ UserId: "145138355354993", DingtoneId: "260293632", AppType: 3 }]
-      };
+    async callCommonRestJson() {
+      return { Result: 1 };
     },
     async callConfiguredRegisterEmailTemplate() {
-      calls.push("register");
-      return { Result: 1 };
+      throw new Error("Timed out waiting for registerEmail native activation response");
     },
     async close() {
       calls.push("close");
@@ -279,18 +270,16 @@ test("detects variant mismatch from checkActivatedUser AppType and fails fast wi
         } as any,
         "poll@980999.xyz",
         {
-          hostCandidates: () => ["primary.example", "backup.example"],
+          hostCandidates: () => ["host1.example", "host2.example", "host3.example"],
           createSession: () => session as any
         }
       );
     },
     (err: any) => {
-      assert.match(err.message, /user exist in other app/);
-      assert.match(err.message, /dingdong/);
+      assert.match(err.message, /Timed out waiting for registerEmail/);
       return true;
     }
   );
 
-  assert.deepEqual(calls, ["open", "clientInfo", "check", "close"]);
-  assert.equal(calls.includes("register"), false);
+  assert.deepEqual(calls, ["open", "close"]);
 });
