@@ -2,8 +2,12 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma.js";
 import {
   getAccountGameSummary,
+  getGameRankList,
+  loadFruitHarvestHistory,
+  redeemMathGamePoints,
   runAccountAllDaily,
   runAccountFruitDaily,
+  runAccountKnifeDaily,
   runAccountPetDaily,
   runAccountShareBoost,
   runBatchAllAccountsDaily
@@ -33,6 +37,28 @@ gamesRouter.get("/summary", async (req, res, next) => {
     await assertAccountAccess(accountId, req.auth!.userId);
     const summary = await getAccountGameSummary(accountId);
     ok(res, summary);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/games/rank or /api/accounts/:id/games/rank
+gamesRouter.get("/rank", async (req, res, next) => {
+  try {
+    const appId = Number(req.query.app_id || 66);
+    const rankList = await getGameRankList(appId);
+    ok(res, rankList);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/accounts/:id/games/harvests
+gamesRouter.get("/harvests", async (req, res, next) => {
+  try {
+    const accountId = Number((req.params as any).id || req.query.account_id);
+    const history = loadFruitHarvestHistory(accountId ? Number(accountId) : undefined);
+    ok(res, history);
   } catch (error) {
     next(error);
   }
@@ -74,6 +100,35 @@ gamesRouter.post("/fruit/water", async (req, res, next) => {
     const logs: any[] = [];
     const success = await runAccountFruitDaily(accountId, logs);
     ok(res, { success, logs });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/accounts/:id/games/knife/daily
+gamesRouter.post("/knife/daily", async (req, res, next) => {
+  try {
+    const accountId = Number((req.params as any).id || req.body.account_id);
+    await assertAccountAccess(accountId, req.auth!.userId);
+    const logs: any[] = [];
+    const success = await runAccountKnifeDaily(accountId, logs);
+    ok(res, { success, logs });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/accounts/:id/games/math/redeem
+gamesRouter.post("/math/redeem", async (req, res, next) => {
+  try {
+    const accountId = Number((req.params as any).id || req.body.account_id);
+    const productId = Number(req.body.product_id);
+    if (!productId) {
+      throw new AppError("productId is required for redemption", 400, 400);
+    }
+    await assertAccountAccess(accountId, req.auth!.userId);
+    const result = await redeemMathGamePoints(accountId, productId);
+    ok(res, result);
   } catch (error) {
     next(error);
   }

@@ -689,12 +689,42 @@ export async function mockMessage(account_id: number, content: string, from_numb
 
 // ── 游戏与宠物福利 ──
 
+export interface FruitHarvestRecord {
+  accountId: number;
+  fruitId: number;
+  fruitName: string;
+  creditsWon: number;
+  harvestedAt: string;
+}
+
+export interface TaskItemProgress {
+  taskType: number;
+  taskName: string;
+  completed: number;
+  total: number;
+  rewardDesc?: string;
+  isFinished: boolean;
+}
+
+export interface RankLeaderboardItem {
+  ranking: number;
+  nickname: string;
+  countryName: string;
+  bestScore: number;
+  uid: string;
+  seasonId?: number;
+}
+
 export interface AccountGameSummary {
   accountId: number;
   dtUserId: string | null;
   appVariant: string;
   appType: number;
   gameAppId: number;
+  creditExpiry?: {
+    expireCredit: number;
+    expireDate: string | null;
+  } | null;
   pet?: {
     petId: number | null;
     petName: string | null;
@@ -702,10 +732,14 @@ export interface AccountGameSummary {
     fishNum: number | null;
     growthValue: number | null;
     nextLevelRequiredGrowthValue: number | null;
+    growthRate: number;
     nextFeedRemainingTime: number | null;
     treasureHuntStatus: number | null;
     treasureHuntEndRemainingTime: number | null;
     nextTreasureHuntRemainingTime: number | null;
+    lotteryLeftChance: number;
+    playLeftChance: number;
+    tasks: TaskItemProgress[];
   } | null;
   fruit?: {
     nutritiveNumber: number | null;
@@ -715,6 +749,17 @@ export interface AccountGameSummary {
       completionRate: number;
       type: number;
     }>;
+    tasks: TaskItemProgress[];
+    harvestHistory: FruitHarvestRecord[];
+  } | null;
+  knife?: {
+    remainPlayTimes: number;
+    fruitJuiceAmount: number;
+    watchingGetPlayTimes: number;
+    watchingGetPlayTimesLimit: number;
+    treasureBoxOwned: boolean;
+    treasureBoxOpenTime: number | null;
+    canOpenTreasureBox: boolean;
   } | null;
   mathGame?: {
     uid: string | null;
@@ -724,6 +769,12 @@ export interface AccountGameSummary {
     watchAdsAddChanceFrequency: number | null;
     record: number | null;
     shortUuid: string | null;
+    redeemProducts: Array<{
+      productId: number;
+      productName: string;
+      price: number;
+      stock: number;
+    }>;
   } | null;
 }
 
@@ -757,6 +808,21 @@ export async function feedAccountPet(accountId: number): Promise<{ success: bool
 
 export async function waterAccountFruit(accountId: number): Promise<{ success: boolean; logs: GameTaskLog[] }> {
   const res = await api.post<ApiResponse<{ success: boolean; logs: GameTaskLog[] }>>(`/accounts/${accountId}/games/fruit/water`);
+  return res.data.data;
+}
+
+export async function runAccountKnifeDaily(accountId: number): Promise<{ success: boolean; logs: GameTaskLog[] }> {
+  const res = await api.post<ApiResponse<{ success: boolean; logs: GameTaskLog[] }>>(`/accounts/${accountId}/games/knife/daily`);
+  return res.data.data;
+}
+
+export async function redeemMathGamePoints(accountId: number, productId: number): Promise<{ success: boolean; message: string }> {
+  const res = await api.post<ApiResponse<{ success: boolean; message: string }>>(`/accounts/${accountId}/games/math/redeem`, { product_id: productId });
+  return res.data.data;
+}
+
+export async function getGameRankList(appId = 66): Promise<RankLeaderboardItem[]> {
+  const res = await api.get<ApiResponse<RankLeaderboardItem[]>>(`/games/rank`, { params: { app_id: appId } });
   return res.data.data;
 }
 

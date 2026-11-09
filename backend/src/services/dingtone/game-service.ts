@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { prisma } from "../../lib/prisma.js";
 import { AppError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
@@ -15,12 +17,42 @@ const DEFAULT_HEADERS = {
     "Mozilla/5.0 (Linux; Android 13; M2012K11AC Build/TKQ1.220829.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/122.0.6261.119 Mobile Safari/537.36 TengZhan/3"
 };
 
+export interface FruitHarvestRecord {
+  accountId: number;
+  fruitId: number;
+  fruitName: string;
+  creditsWon: number;
+  harvestedAt: string;
+}
+
+export interface TaskItemProgress {
+  taskType: number;
+  taskName: string;
+  completed: number;
+  total: number;
+  rewardDesc?: string;
+  isFinished: boolean;
+}
+
+export interface RankLeaderboardItem {
+  ranking: number;
+  nickname: string;
+  countryName: string;
+  bestScore: number;
+  uid: string;
+  seasonId?: number;
+}
+
 export interface AccountGameSummary {
   accountId: number;
   dtUserId: string | null;
   appVariant: string;
-  appType: number; // 0 for dingdong, 3 for dingtone/talku
-  gameAppId: number; // 66 for dingdong, 67 for talku
+  appType: number;
+  gameAppId: number;
+  creditExpiry?: {
+    expireCredit: number;
+    expireDate: string | null;
+  } | null;
   pet?: {
     petId: number | null;
     petName: string | null;
@@ -28,10 +60,14 @@ export interface AccountGameSummary {
     fishNum: number | null;
     growthValue: number | null;
     nextLevelRequiredGrowthValue: number | null;
+    growthRate: number;
     nextFeedRemainingTime: number | null;
-    treasureHuntStatus: number | null; // 0: can start, 1: hunting, 2: can claim, 3: cooling down
+    treasureHuntStatus: number | null;
     treasureHuntEndRemainingTime: number | null;
     nextTreasureHuntRemainingTime: number | null;
+    lotteryLeftChance: number;
+    playLeftChance: number;
+    tasks: TaskItemProgress[];
   } | null;
   fruit?: {
     nutritiveNumber: number | null;
@@ -41,6 +77,17 @@ export interface AccountGameSummary {
       completionRate: number;
       type: number;
     }>;
+    tasks: TaskItemProgress[];
+    harvestHistory: FruitHarvestRecord[];
+  } | null;
+  knife?: {
+    remainPlayTimes: number;
+    fruitJuiceAmount: number;
+    watchingGetPlayTimes: number;
+    watchingGetPlayTimesLimit: number;
+    treasureBoxOwned: boolean;
+    treasureBoxOpenTime: number | null;
+    canOpenTreasureBox: boolean;
   } | null;
   mathGame?: {
     uid: string | null;
@@ -50,6 +97,12 @@ export interface AccountGameSummary {
     watchAdsAddChanceFrequency: number | null;
     record: number | null;
     shortUuid: string | null;
+    redeemProducts: Array<{
+      productId: number;
+      productName: string;
+      price: number;
+      stock: number;
+    }>;
   } | null;
 }
 
@@ -143,42 +196,111 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
       appVariant: ctx.account.appVariant,
       appType: ctx.appType,
       gameAppId: ctx.gameAppId,
+      creditExpiry: null,
       pet: null,
       fruit: null,
+      knife: null,
       mathGame: null
     };
   }
 
   const timestamp = Date.now();
 
-  const [petRes, fruitRes, gameRes] = await Promise.all([
+  const [petRes, fruitRes, knifeRes, gameRes, petTaskRes, fruitTaskRes] = await Promise.all([
     requestGameJson(`/pet/homePage?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${timestamp}`).catch(() => null),
     requestGameJson(
       `/campaign/fruit/homepage?userId=${ctx.dtUserId}&appType=${ctx.appType}&dingtoneId=${ctx.dingtoneId}&campaignId=10094&zone=GMT%2B8&timeStamp=${timestamp}`
     ).catch(() => null),
-    requestGameJson(
-      `/game/homePage?userId=${ctx.dtUserId}&appId=${ctx.gameAppId}&zone=-800&timeStamp=${timestamp}`
-    ).catch(() => null)
+    requestGameJson(`/knife/homePage?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${timestamp}`).catch(() => null),
+    requestGameJson(`/game/homePage?userId=${ctx.dtUserId}&appId=${ctx.gameAppId}&zone=-800&timeStamp=${timestamp}`).catch(() => null),
+    requestGameJson(`/pet/task/list?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${timestamp}`).catch(() => null),
+    requestGameJson(`/campaign/fruit/task/list?userId=${ctx.dtUserId}&campaignId=10094&timeStamp=${timestamp}`).catch(() => null)
   ]);
 
+  // Credit Expiration
+  let creditExpiry: AccountGameSummary["creditExpiry"] = null;
+  if (ctx.pointUid) {
+    try {
+      const infoRes = await requestGameJson(`/point/userinfo?uid=${encodeURIComponent(ctx.pointUid)}&zone=800`);
+      if (infoRes?.Result === 1 && infoRes.data) {
+        creditExpiry = {
+          expireCredit: Number(infoRes.data.expirePoint) || 0,
+          expireDate: infoRes.data.expireTime ? String(infoRes.data.expireTime) : null
+        };
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // Pet
   let petData: AccountGameSummary["pet"] = null;
   if (petRes?.Result === 1 && petRes.data) {
+    const p = petRes.data;
+    const gCur = p.growthValue ?? 0;
+    const gNext = p.nextLevelRequiredGrowthValue ?? 1;
+    const growthRate = gCur + gNext > 0 ? Math.round((gCur / (gCur + gNext)) * 100) / 100 : 0;
+
+    const petTasks: TaskItemProgress[] = [];
+    if (petTaskRes?.Result === 1 && Array.isArray(petTaskRes.data?.tasks)) {
+      for (const t of petTaskRes.data.tasks) {
+        petTasks.push({
+          taskType: t.taskType,
+          taskName: t.taskName === "Daily Check-in" ? "每日签到" : t.taskName === "Watch Video" ? "看视频得鱼粮" : t.taskName === "visit friend's cat pet" ? "拜访好友宠物" : t.taskName,
+          completed: t.taskCompletedNum ?? 0,
+          total: t.taskUpperLimit ?? 1,
+          rewardDesc: t.taskRewardDesc,
+          isFinished: t.taskStatus === 3
+        });
+      }
+    }
+
+    let lotteryLeft = 0;
+    let playLeft = 0;
+    try {
+      const lotPage = await requestGameJson(`/pet/lotteryPage?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${Date.now()}`);
+      lotteryLeft = lotPage?.data?.lotteryLeftChance ?? 0;
+      const plPage = await requestGameJson(`/pet/playPage?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${Date.now()}`);
+      playLeft = plPage?.data?.playLeftChance ?? 0;
+    } catch {
+      // ignore
+    }
+
     petData = {
-      petId: petRes.data.petId ?? null,
-      petName: petRes.data.petName ?? null,
-      petLevel: petRes.data.petLevel ?? null,
-      fishNum: petRes.data.fishNum ?? null,
-      growthValue: petRes.data.growthValue ?? null,
-      nextLevelRequiredGrowthValue: petRes.data.nextLevelRequiredGrowthValue ?? null,
-      nextFeedRemainingTime: petRes.data.nextFeedRemainingTime ?? null,
-      treasureHuntStatus: petRes.data.treasureHuntStatus ?? null,
-      treasureHuntEndRemainingTime: petRes.data.treasureHuntEndRemainingTime ?? null,
-      nextTreasureHuntRemainingTime: petRes.data.nextTreasureHuntRemainingTime ?? null
+      petId: p.petId ?? null,
+      petName: p.petName ?? null,
+      petLevel: p.petLevel ?? null,
+      fishNum: p.fishNum ?? null,
+      growthValue: gCur,
+      nextLevelRequiredGrowthValue: gNext,
+      growthRate,
+      nextFeedRemainingTime: p.nextFeedRemainingTime ?? null,
+      treasureHuntStatus: p.treasureHuntStatus ?? null,
+      treasureHuntEndRemainingTime: p.treasureHuntEndRemainingTime ?? null,
+      nextTreasureHuntRemainingTime: p.nextTreasureHuntRemainingTime ?? null,
+      lotteryLeftChance: lotteryLeft,
+      playLeftChance: playLeft,
+      tasks: petTasks
     };
   }
 
+  // Fruit
   let fruitData: AccountGameSummary["fruit"] = null;
   if (fruitRes?.Result === 1 && fruitRes.data) {
+    const fruitTasks: TaskItemProgress[] = [];
+    if (fruitTaskRes?.Result === 1 && Array.isArray(fruitTaskRes.data?.tasks)) {
+      for (const t of fruitTaskRes.data.tasks) {
+        fruitTasks.push({
+          taskType: t.taskType,
+          taskName: t.taskName === "Daily Check-in" ? "每日签到领水滴" : t.taskName === "Feed the cat" ? "投喂猫咪领水滴" : t.taskName.includes("Watch Video") ? "看视频得水滴" : t.taskName.includes("friends") ? "求助好友领水滴" : t.taskName,
+          completed: t.taskCompletedNum ?? 0,
+          total: t.taskUpperLimit ?? 1,
+          rewardDesc: t.taskRewardDesc,
+          isFinished: t.taskStatus === 1
+        });
+      }
+    }
+
     fruitData = {
       nutritiveNumber: fruitRes.data.nutritiveNumber ?? 0,
       plantFruitList: Array.isArray(fruitRes.data.plantFruitList)
@@ -188,24 +310,59 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
             completionRate: f.completionRate ?? 0,
             type: f.type ?? 1
           }))
-        : []
+        : [],
+      tasks: fruitTasks,
+      harvestHistory: loadFruitHarvestHistory(accountId)
     };
   }
 
+  // Knife
+  let knifeData: AccountGameSummary["knife"] = null;
+  if (knifeRes?.Result === 1 && knifeRes.data) {
+    const k = knifeRes.data;
+    const canOpenBox = Boolean(k.treasureBoxOwned && k.treasureBoxOpenTime && k.treasureBoxOpenTime <= Date.now());
+    knifeData = {
+      remainPlayTimes: k.remainPlayTimes ?? 0,
+      fruitJuiceAmount: k.fruitJuiceAmount ?? 0,
+      watchingGetPlayTimes: k.watchingGetPlayTimes ?? 0,
+      watchingGetPlayTimesLimit: k.watchingGetPlayTimesLimit ?? 15,
+      treasureBoxOwned: Boolean(k.treasureBoxOwned),
+      treasureBoxOpenTime: k.treasureBoxOpenTime ?? null,
+      canOpenTreasureBox: canOpenBox
+    };
+  }
+
+  // Math Game
   let mathGameData: AccountGameSummary["mathGame"] = null;
   if (gameRes?.Result === 1 && gameRes.data) {
     const gameUid = gameRes.data.uid || null;
     let shortUuid: string | null = null;
+    const redeemProducts: Array<{ productId: number; productName: string; price: number; stock: number }> = [];
+
     if (gameUid) {
       try {
-        const uuidRes = await requestGameJson(`/game/generateShortUuid?uid=${gameUid}&timeStamp=${Date.now()}`);
+        const [uuidRes, redeemRes] = await Promise.all([
+          requestGameJson(`/game/generateShortUuid?uid=${gameUid}&timeStamp=${Date.now()}`).catch(() => null),
+          requestGameJson(`/game/point/redeemInfo?uid=${gameUid}&timeStamp=${Date.now()}`).catch(() => null)
+        ]);
         if (uuidRes?.Result === 1) {
           shortUuid = uuidRes.data;
+        }
+        if (redeemRes?.Result === 1 && Array.isArray(redeemRes.data?.products)) {
+          for (const item of redeemRes.data.products) {
+            redeemProducts.push({
+              productId: item.productId,
+              productName: item.productName,
+              price: item.price,
+              stock: item.convertibleNum ?? 0
+            });
+          }
         }
       } catch {
         // ignore
       }
     }
+
     mathGameData = {
       uid: gameUid,
       validPoint: gameRes.data.validPoint ?? 0,
@@ -213,7 +370,8 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
       chanceLeft: gameRes.data.chanceLeft ?? 0,
       watchAdsAddChanceFrequency: gameRes.data.watchAdsAddChanceFrequency ?? 0,
       record: gameRes.data.record ?? null,
-      shortUuid
+      shortUuid,
+      redeemProducts
     };
   }
 
@@ -223,8 +381,10 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
     appVariant: ctx.account.appVariant,
     appType: ctx.appType,
     gameAppId: ctx.gameAppId,
+    creditExpiry,
     pet: petData,
     fruit: fruitData,
+    knife: knifeData,
     mathGame: mathGameData
   };
 }
@@ -282,7 +442,6 @@ export async function runAccountPetDaily(accountId: number, logs: GameTaskLog[] 
       }
       await delay(1200);
     } else if (data.treasureHuntStatus === 2) {
-      // 领奖并翻倍
       const prizeType = data.treasureHuntRewardCreditNum ? 2 : 1;
       const prizeName = data.treasureHuntRewardCreditNum ? `${data.treasureHuntRewardCreditNum} 币` : `${data.treasureHuntRewardFishNum || 0} 鱼料`;
       const claimRes = await requestGameJson(
@@ -290,6 +449,13 @@ export async function runAccountPetDaily(accountId: number, logs: GameTaskLog[] 
       );
       if (claimRes?.Result === 1) {
         logs.push(formatLog("pet", "success", `寻宝归来，领奖翻倍成功获得: ${prizeName}`));
+      }
+      await delay(1200);
+      const nextHunt = await requestGameJson(
+        `/pet/treasureHunt?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${Date.now()}`
+      ).catch(() => null);
+      if (nextHunt?.Result === 1) {
+        logs.push(formatLog("pet", "success", "寻宝领奖完毕，已自动开启下一轮寻宝！"));
       }
       await delay(1200);
     }
@@ -437,7 +603,15 @@ export async function runAccountFruitDaily(accountId: number, logs: GameTaskLog[
           `/campaign/fruit/credit/reward?userId=${ctx.dtUserId}&dingtoneId=${ctx.dingtoneId}&campaignId=10094&fruitId=${f.fruitId}&timeStamp=${Date.now()}`
         );
         if (harvest?.Result === 1) {
-          logs.push(formatLog("fruit", "success", `🎉 水果成熟收获成功！获得说道币: ${harvest.data}`));
+          const won = Number(harvest.data) || 7;
+          logs.push(formatLog("fruit", "success", `🎉 水果成熟收获成功！获得 ${won} 个说道币/叮咚币！`));
+          saveFruitHarvestRecord({
+            accountId,
+            fruitId: f.fruitId,
+            fruitName: f.name === "apple" ? "苹果" : f.name,
+            creditsWon: won,
+            harvestedAt: new Date().toISOString()
+          });
         }
         await delay(1200);
       }
@@ -532,20 +706,41 @@ export async function runAccountCheckinDaily(accountId: number, logs: GameTaskLo
 
 export async function runAccountAllDaily(accountId: number): Promise<GameExecutionResult> {
   const logs: GameTaskLog[] = [];
-  logs.push(formatLog("system", "info", `开始执行账户 #${accountId} 游戏与福利每日打卡任务`));
+  logs.push(formatLog("system", "info", `🚀 开始执行账户 #${accountId} 游戏与福利全自动每日打卡任务`));
 
   const petSuccess = await runAccountPetDaily(accountId, logs);
   await delay(1500);
   const fruitSuccess = await runAccountFruitDaily(accountId, logs);
   await delay(1500);
+  const knifeSuccess = await runAccountKnifeDaily(accountId, logs);
+  await delay(1500);
   const checkinSuccess = await runAccountCheckinDaily(accountId, logs);
 
-  const overallSuccess = petSuccess || fruitSuccess || checkinSuccess;
+  // Auto-redeem points if balance >= 1000
+  try {
+    const summary = await getAccountGameSummary(accountId);
+    const validPoint = summary.mathGame?.validPoint ?? 0;
+    const gameUid = summary.mathGame?.uid;
+    if (gameUid && validPoint >= 1000) {
+      const targetProdId = summary.appType === 0 ? (validPoint >= 10000 ? 23 : 22) : (validPoint >= 10000 ? 25 : 24);
+      logs.push(formatLog("math", "info", `当前积分 ${validPoint}，尝试自动兑换说道币/叮咚币...`));
+      const rRes = await redeemMathGamePoints(accountId, targetProdId).catch(() => null);
+      if (rRes?.success) {
+        logs.push(formatLog("math", "success", `🎉 ${rRes.message}`));
+      } else if (rRes?.message) {
+        logs.push(formatLog("math", "info", `自动兑换提示: ${rRes.message}`));
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  const overallSuccess = petSuccess || fruitSuccess || knifeSuccess || checkinSuccess;
   logs.push(
     formatLog(
       "system",
       overallSuccess ? "success" : "warn",
-      `账户 #${accountId} 每日任务执行完毕`
+      `账户 #${accountId} 今日日常任务全部执行完毕！`
     )
   );
 
@@ -660,4 +855,187 @@ function evalMathNumber(fnStr: string): number {
   if (!clean) return 0;
   // eslint-disable-next-line no-new-func
   return Number(Function(`"use strict"; return (${clean})`)());
+}
+
+// ── Persistent Fruit Harvest History ──
+const HARVEST_FILE_PATH = path.resolve(process.cwd(), "_tmp/runtime/fruit_harvests.json");
+
+function ensureHarvestDir() {
+  const dir = path.dirname(HARVEST_FILE_PATH);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+export function loadFruitHarvestHistory(accountId?: number): FruitHarvestRecord[] {
+  try {
+    ensureHarvestDir();
+    if (!fs.existsSync(HARVEST_FILE_PATH)) {
+      return [];
+    }
+    const raw = fs.readFileSync(HARVEST_FILE_PATH, "utf8");
+    const all = JSON.parse(raw) as FruitHarvestRecord[];
+    if (accountId !== undefined) {
+      return all.filter((r) => r.accountId === accountId);
+    }
+    return all;
+  } catch {
+    return [];
+  }
+}
+
+export function saveFruitHarvestRecord(record: FruitHarvestRecord) {
+  try {
+    ensureHarvestDir();
+    const existing = loadFruitHarvestHistory();
+    existing.unshift(record);
+    fs.writeFileSync(HARVEST_FILE_PATH, JSON.stringify(existing.slice(0, 200), null, 2), "utf8");
+  } catch (err) {
+    logger.warn("Failed to persist fruit harvest record", { error: String(err) });
+  }
+}
+
+// ── Knife King Automation ──
+export async function runAccountKnifeDaily(accountId: number, logs: GameTaskLog[] = []): Promise<boolean> {
+  const ctx = await resolveAccountContext(accountId);
+  if (!ctx.dtUserId) {
+    logs.push(formatLog("knife", "warn", "账户尚未激活或缺少 dtUserId，跳过飞刀日常"));
+    return false;
+  }
+
+  try {
+    const home = await requestGameJson(
+      `/knife/homePage?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${Date.now()}`
+    );
+    if (home?.Result !== 1 || !home.data) {
+      logs.push(formatLog("knife", "error", `获取飞刀主页失败: ${home?.Reason || "未知错误"}`));
+      return false;
+    }
+    const data = home.data;
+    logs.push(
+      formatLog(
+        "knife",
+        "info",
+        `🗡️ 飞刀国王: 剩余游戏次数 ${data.remainPlayTimes}，果汁金币 ${data.fruitJuiceAmount}，看广告次数 ${data.watchingGetPlayTimes}/${data.watchingGetPlayTimesLimit}`
+      )
+    );
+
+    // 1. 如果开宝箱时间已到，自动开宝箱
+    if (data.treasureBoxOwned && data.treasureBoxOpenTime && data.treasureBoxOpenTime <= Date.now()) {
+      const boxRes = await requestGameJson(
+        `/knife/openTreasureBox?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${Date.now()}`
+      );
+      if (boxRes?.Result === 1) {
+        logs.push(formatLog("knife", "success", "成功开启飞刀国王宝箱！"));
+      }
+      await delay(1200);
+    }
+
+    // 2. 看广告获取游戏次数
+    if (data.watchingGetPlayTimes < data.watchingGetPlayTimesLimit) {
+      const remainingAds = data.watchingGetPlayTimesLimit - data.watchingGetPlayTimes;
+      logs.push(formatLog("knife", "info", `执行看广告获取飞刀次数 (${remainingAds} 次)...`));
+      for (let i = 0; i < remainingAds; i++) {
+        const adRes = await requestGameJson(
+          `/knife/watchingForPlay?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${Date.now()}`
+        );
+        if (adRes?.Result === 1) {
+          logs.push(formatLog("knife", "success", `第 ${i + 1} 次看广告增加游戏机会成功`));
+        }
+        await delay(1200);
+      }
+    }
+
+    // 3. 玩飞刀游戏并抽奖翻倍
+    const reloaded = await requestGameJson(
+      `/knife/homePage?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${Date.now()}`
+    );
+    let playTimes = reloaded?.data?.remainPlayTimes ?? 0;
+    if (playTimes > 0) {
+      logs.push(formatLog("knife", "info", `开始进行飞刀投掷游戏，共 ${playTimes} 次...`));
+      for (let i = 0; i < Math.min(playTimes, 5); i++) {
+        const playRes = await requestGameJson(
+          `/knife/play?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${Date.now()}`
+        );
+        if (playRes?.Result === 1) {
+          logs.push(formatLog("knife", "success", `第 ${i + 1} 局飞刀游戏完成！当前果汁: ${playRes.data?.fruitJuiceAmount}`));
+          await delay(1500);
+
+          // 抽奖页
+          const ts = Date.now();
+          const firstHash = crypto.createHash("md5").update(`${ctx.dtUserId}-${ctx.appType}-10-${ts}-${KNIFE_SALT}`).digest("hex");
+          const lotPage = await requestGameJson(
+            `/knife/lotteryPage?userId=${ctx.dtUserId}&appType=${ctx.appType}&level=10&md5=${firstHash}&timeStamp=${ts}`
+          );
+          if (lotPage?.Result === 1 && lotPage.data?.lotteryId) {
+            const lotId = lotPage.data.lotteryId;
+            const ts2 = Date.now();
+            const lotHash = crypto.createHash("md5").update(`${ctx.dtUserId}-${ctx.appType}-${lotId}-${ts2}-${KNIFE_SALT}`).digest("hex");
+            const lotRes = await requestGameJson(
+              `/knife/lottery?userId=${ctx.dtUserId}&appType=${ctx.appType}&lotteryId=${lotId}&md5=${lotHash}&timeStamp=${ts2}`
+            );
+            if (lotRes?.Result === 1 && lotRes.data) {
+              logs.push(formatLog("knife", "success", `飞刀抽奖获得: ${lotRes.data.prizeName || "奖品"}`));
+              await delay(1200);
+              // 翻倍
+              if (lotRes.data.prizeType && lotRes.data.totalPrizeCount) {
+                await requestGameJson(
+                  `/knife/doublePrize?userId=${ctx.dtUserId}&appType=${ctx.appType}&prizeType=${lotRes.data.prizeType}&totalPrizeCount=${lotRes.data.totalPrizeCount}&timeStamp=${Date.now()}`
+                ).catch(() => null);
+              }
+            }
+          }
+        }
+        await delay(1500);
+      }
+    }
+
+    return true;
+  } catch (error) {
+    logs.push(formatLog("knife", "error", `飞刀日常执行异常: ${error instanceof Error ? error.message : String(error)}`));
+    return false;
+  }
+}
+
+// ── Math Game Rank & Redeem ──
+export async function getGameRankList(appId = 66): Promise<RankLeaderboardItem[]> {
+  try {
+    const res = await requestGameJson(`/game/rank/list?appId=${appId}&timeStamp=${Date.now()}`);
+    if (res?.Result === 1 && Array.isArray(res.data)) {
+      return res.data.slice(0, 50).map((item: any) => ({
+        ranking: item.ranking,
+        nickname: item.nickname || "神秘玩家",
+        countryName: item.countryName || "-",
+        bestScore: item.bestScore,
+        uid: item.uid,
+        seasonId: item.seasonId
+      }));
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+export async function redeemMathGamePoints(accountId: number, productId: number): Promise<{ success: boolean; message: string }> {
+  const ctx = await resolveAccountContext(accountId);
+  const summary = await getAccountGameSummary(accountId);
+  const gameUid = summary.mathGame?.uid;
+  if (!gameUid) {
+    throw new AppError("未获取到算术游戏 uid", 400, 400);
+  }
+
+  const res = await requestGameJson(
+    `/game/point/redeem?uid=${encodeURIComponent(gameUid)}&productId=${productId}&timeStamp=${Date.now()}`
+  );
+  if (res?.Result === 1) {
+    return {
+      success: true,
+      message: `兑换成功！获得 ${res.data} 个说道币/叮咚币（有效期3个月）`
+    };
+  }
+  return {
+    success: false,
+    message: res?.Reason || "兑换失败，库存不足或积分未达标"
+  };
 }
