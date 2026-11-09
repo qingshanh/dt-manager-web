@@ -3248,13 +3248,27 @@ async function mergeDuplicateAccountData(targetAccountId: number, duplicateAccou
 
 async function findExistingAccount(adminId: number, appVariant: AppVariant, email: string | null, phone: string | null) {
   if (email) {
-    return prisma.dtAccount.findFirst({
+    const exact = await prisma.dtAccount.findFirst({
       where: { adminId, appVariant, email }
+    });
+    if (exact) {
+      return exact;
+    }
+    return prisma.dtAccount.findFirst({
+      where: { adminId, email },
+      orderBy: [{ dtUserId: "desc" }, { id: "desc" }]
     });
   }
   if (phone) {
-    return prisma.dtAccount.findFirst({
+    const exact = await prisma.dtAccount.findFirst({
       where: { adminId, appVariant, phone }
+    });
+    if (exact) {
+      return exact;
+    }
+    return prisma.dtAccount.findFirst({
+      where: { adminId, phone },
+      orderBy: [{ dtUserId: "desc" }, { id: "desc" }]
     });
   }
   return null;
@@ -5234,6 +5248,34 @@ async function sendVerificationCodeWithFastAck(input: {
 }): Promise<VerificationSendFastAckResult> {
   const sendTask = sendVerificationCodeWithVariantFallback(input.sendInput)
     .then(async (sendResult) => {
+      if (input.sendInput.email) {
+        const conflicting = await prisma.dtAccount.findFirst({
+          where: {
+            adminId: input.adminId,
+            appVariant: sendResult.appVariant,
+            email: input.sendInput.email,
+            id: { not: input.accountId }
+          }
+        });
+        if (conflicting) {
+          if (!conflicting.dtUserId) {
+            await prisma.dtAccount.delete({ where: { id: conflicting.id } }).catch(() => null);
+          } else {
+            await prisma.dtAccount.update({
+              where: { id: conflicting.id },
+              data: {
+                dtDeviceId: sendResult.deviceId,
+                dtTrackCode: sendResult.trackCode,
+                status: input.statusOnSuccess,
+                lastError: null
+              }
+            });
+            await prisma.dtAccount.delete({ where: { id: input.accountId } }).catch(() => null);
+            input.accountId = conflicting.id;
+            return sendResult;
+          }
+        }
+      }
       await prisma.dtAccount.updateMany({
         where: { id: input.accountId, adminId: input.adminId },
         data: {
