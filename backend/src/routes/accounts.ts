@@ -417,6 +417,21 @@ accountsRouter.get("/", async (req, res, next) => {
     const pageSize = Number(req.query.pageSize ?? 20);
     const status = req.query.status ? String(req.query.status) : undefined;
     const keyword = req.query.keyword ? String(req.query.keyword) : undefined;
+    const sortBy = req.query.sort_by ? String(req.query.sort_by) : undefined;
+    const sortOrder = req.query.sort_order === "asc" ? "asc" : "desc";
+
+    let orderBy: Prisma.DtAccountOrderByWithRelationInput[] = [{ sortOrder: "asc" }, { createdAt: "desc" }];
+    if (sortBy === "app_variant") {
+      orderBy = [{ appVariant: sortOrder }, { sortOrder: "asc" }];
+    } else if (sortBy === "email") {
+      orderBy = [{ email: sortOrder }, { sortOrder: "asc" }];
+    } else if (sortBy === "status") {
+      orderBy = [{ status: sortOrder }, { sortOrder: "asc" }];
+    } else if (sortBy === "nickname") {
+      orderBy = [{ nickname: sortOrder }, { sortOrder: "asc" }];
+    } else if (sortBy === "last_login_at") {
+      orderBy = [{ lastLoginAt: sortOrder }, { sortOrder: "asc" }];
+    }
 
     const where: Prisma.DtAccountWhereInput = {
       adminId: req.auth!.userId,
@@ -440,7 +455,7 @@ accountsRouter.get("/", async (req, res, next) => {
         where,
         skip: (page - 1) * pageSize,
         take: pageSize,
-        orderBy: [{ sortOrder: "asc" }, { createdAt: "desc" }],
+        orderBy,
         include: {
           snapshot: {
             select: {
@@ -503,6 +518,10 @@ accountsRouter.get("/", async (req, res, next) => {
         created_at: item.createdAt
       };
     });
+
+    if (sortBy === "unread_count") {
+      list.sort((a, b) => (sortOrder === "asc" ? a.unread_count - b.unread_count : b.unread_count - a.unread_count));
+    }
 
     paged(res, { list, total, page, pageSize });
   } catch (error) {
@@ -5302,7 +5321,7 @@ export function otherVerificationAppVariant(appVariant: AppVariant | "dingtone" 
 
 export function shouldRetryVerificationWithOtherVariant(error: unknown) {
   const message = formatVerificationSendError(error);
-  return /user exist in other app|Direct registerEmail failed: REST call failed|current local account type/i.test(message);
+  return /user exist in other app|Direct registerEmail failed|current local account type|Timed out waiting for registerEmail/i.test(message);
 }
 
 function formatVerificationSendError(error: unknown) {

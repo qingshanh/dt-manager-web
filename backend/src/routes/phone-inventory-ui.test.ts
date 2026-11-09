@@ -45,7 +45,7 @@ test("interactive refreshes are bounded and never call cached data fresh", () =>
   const phoneBlock = accounts.slice(phoneStart, phoneEnd);
 
   assert.match(refreshBlock, /accountMonitorService\.withMaintenance/);
-  assert.match(refreshBlock, /includePhoneNumbers:\s*false/);
+  assert.match(refreshBlock, /includePhoneNumbers:\s*true/);
   assert.match(refreshBlock, /allowHelperSnapshot:\s*false/);
   assert.match(refreshBlock, /allowAdbPoint:\s*false/);
   assert.match(refreshBlock, /includePublicEnrichment:\s*false/);
@@ -83,7 +83,7 @@ test("frontend exposes phone inventory types, filtered cache keys, and invalidat
 });
 
 test("latest request guard accepts only the newest inventory request", async () => {
-  const moduleUrl = pathToFileURL(path.join(root, "frontend/src/services/endpoints.ts")).href;
+  const moduleUrl = pathToFileURL(path.join(root, "frontend/src/utils/request-guard.ts")).href;
   const endpoints = await import(moduleUrl) as Record<string, unknown>;
   const factory = endpoints.createLatestRequestGuard;
   assert.ok(typeof factory === "function", "createLatestRequestGuard should be exported");

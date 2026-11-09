@@ -77,6 +77,9 @@ export default function AccountAdd() {
       if (isVerificationLogin) {
         const targetAccountId = result.account_id ?? result.id;
         setAccountId(targetAccountId);
+        if (result.app_variant && result.app_variant !== appVariant) {
+          setAppVariant(result.app_variant);
+        }
         setStep(1);
         if (result.send_pending) {
           message.warning(result.message || '验证码请求已提交；如果你已经收到验证码，可以直接输入继续登录。');
@@ -131,6 +134,9 @@ export default function AccountAdd() {
       const targetAccountId = result.account_id ?? accountId;
       if (result.account_id) {
         setAccountId(result.account_id);
+      }
+      if (result.app_variant && result.app_variant !== appVariant) {
+        setAppVariant(result.app_variant);
       }
       if (result.send_pending) {
           message.warning(result.message || '验证码请求已提交；如果你已经收到验证码，可以直接输入继续登录。');

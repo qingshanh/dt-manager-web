@@ -10,7 +10,6 @@ import {
   Alert,
   Button,
   Card,
-  Collapse,
   Descriptions,
   Drawer,
   Empty,
@@ -21,9 +20,12 @@ import {
   Select,
   Space,
   Statistic,
+  Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
+import type { ColumnsType } from 'antd/es/table';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -45,6 +47,15 @@ const EMPTY_DATA: PhoneInventoryResponse = {
   summary: { total: 0, active: 0, account_count: 0, expiring_soon: 0 },
   groups: [],
 };
+
+interface PhoneTableRow {
+  key: string;
+  group: PhoneInventoryGroup;
+  accountRowSpan: number;
+  totalAccountPhones: number;
+  hasPhone: boolean;
+  phone?: PhoneInventoryPhone;
+}
 
 export default function PhoneInventory() {
   const { message, modal } = App.useApp();
@@ -208,17 +219,275 @@ export default function PhoneInventory() {
     [data.groups],
   );
 
+  const tableRows = useMemo<PhoneTableRow[]>(() => {
+    const rows: PhoneTableRow[] = [];
+    for (const group of data.groups) {
+      if (!group.phones || group.phones.length === 0) {
+        rows.push({
+          key: `acc-${group.account.id}-empty`,
+          group,
+          accountRowSpan: 1,
+          totalAccountPhones: 0,
+          hasPhone: false,
+        });
+      } else {
+        group.phones.forEach((phone, index) => {
+          rows.push({
+            key: `acc-${group.account.id}-phone-${phone.id}`,
+            group,
+            accountRowSpan: index === 0 ? group.phones.length : 0,
+            totalAccountPhones: group.phones.length,
+            hasPhone: true,
+            phone,
+          });
+        });
+      }
+    }
+    return rows;
+  }, [data.groups]);
+
+  const columns: ColumnsType<PhoneTableRow> = [
+    {
+      title: '所属账户',
+      key: 'account',
+      width: 250,
+      onCell: (record) => ({
+        rowSpan: record.accountRowSpan,
+      }),
+      render: (_, record) => {
+        const group = record.group;
+        return (
+          <Space direction="vertical" size={8} style={{ width: '100%', minWidth: 0 }}>
+            <AccountGroupTitle group={group} />
+            {accountRefreshErrors[group.account.id] && (
+              <Alert
+                showIcon
+                type="error"
+                message="刷新失败"
+                description={accountRefreshErrors[group.account.id]}
+                action={
+                  <Button size="small" onClick={() => void refreshGroup(group.account.id)}>
+                    重新刷新
+                  </Button>
+                }
+              />
+            )}
+            <Space wrap onClick={(event) => event.stopPropagation()}>
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                loading={refreshingAccountId === group.account.id}
+                onClick={() => void refreshGroup(group.account.id)}
+              >
+                刷新
+              </Button>
+              <Button
+                size="small"
+                icon={<RightOutlined />}
+                onClick={() => navigate(`/accounts/${group.account.id}`)}
+              >
+                账户详情
+              </Button>
+            </Space>
+          </Space>
+        );
+      },
+    },
+    {
+      title: '手机号码',
+      key: 'phone_number',
+      width: 185,
+      render: (_, record) => {
+        if (!record.hasPhone || !record.phone) {
+          return <Typography.Text type="secondary">暂无号码</Typography.Text>;
+        }
+        const phone = record.phone;
+        return (
+          <Space direction="vertical" size={4} style={{ width: '100%' }}>
+            <Space size={6}>
+              <Typography.Text strong style={{ fontSize: 14 }}>
+                {formatPhone(phone)}
+              </Typography.Text>
+              <Tooltip title="复制号码">
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<CopyOutlined />}
+                  onClick={() => void copyPhone(phone.phone_number)}
+                />
+              </Tooltip>
+            </Space>
+            <Space wrap size={4}>
+              {phone.is_primary && <Tag color="gold" style={{ marginInlineEnd: 0 }}>主号码</Tag>}
+              {phone.is_good_number && <Tag color="purple" style={{ marginInlineEnd: 0 }}>靓号</Tag>}
+              {phone.auto_renew && <Tag color="cyan" style={{ marginInlineEnd: 0 }}>自动续费</Tag>}
+            </Space>
+          </Space>
+        );
+      },
+    },
+    {
+      title: '备注',
+      key: 'display_name',
+      width: 130,
+      ellipsis: true,
+      render: (_, record) => {
+        if (!record.hasPhone || !record.phone) return '-';
+        const phone = record.phone;
+        return (
+          <Space size={4}>
+            <Typography.Text ellipsis style={{ maxWidth: 95 }}>
+              {phone.display_name || '-'}
+            </Typography.Text>
+            <Tooltip title="修改备注">
+              <Button
+                size="small"
+                type="text"
+                icon={<EditOutlined />}
+                onClick={() => {
+                  setEditing({ accountId: record.group.account.id, phone });
+                  noteForm.setFieldsValue({ display_name: phone.display_name ?? '' });
+                }}
+              />
+            </Tooltip>
+          </Space>
+        );
+      },
+    },
+    {
+      title: '国家/地区',
+      key: 'country',
+      width: 140,
+      render: (_, record) => {
+        if (!record.hasPhone || !record.phone) return '-';
+        const phone = record.phone;
+        const location = [phone.city_name, phone.state_name].filter(Boolean).join(', ');
+        return (
+          <Space direction="vertical" size={2}>
+            <Typography.Text strong>{formatCountry(phone)}</Typography.Text>
+            {phone.area_code ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                区号: {phone.area_code}
+              </Typography.Text>
+            ) : null}
+            {location ? (
+              <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                {location}
+              </Typography.Text>
+            ) : null}
+          </Space>
+        );
+      },
+    },
+    {
+      title: '号码状态',
+      key: 'status',
+      width: 140,
+      render: (_, record) => {
+        if (!record.hasPhone || !record.phone) return '-';
+        const phone = record.phone;
+        return (
+          <Space direction="vertical" size={4}>
+            <Tag color={statusColor(phone.status)} style={{ marginInlineEnd: 0 }}>
+              {statusLabel(phone.status)}
+            </Tag>
+            <Tag
+              color={phone.allow_receive_sms === false ? 'error' : phone.allow_receive_sms === true ? 'success' : 'default'}
+              style={{ marginInlineEnd: 0, fontSize: 11 }}
+            >
+              {phone.allow_receive_sms === false ? '短信接收关闭' : phone.allow_receive_sms === true ? '短信接收开启' : '短信未确认'}
+            </Tag>
+          </Space>
+        );
+      },
+    },
+    {
+      title: '到期时间',
+      key: 'expired_time',
+      width: 165,
+      render: (_, record) => {
+        if (!record.hasPhone || !record.phone) return '-';
+        const phone = record.phone;
+        return (
+          <Space direction="vertical" size={2}>
+            <PhoneExpiryBadge value={phone.expired_time} />
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {formatDate(phone.expired_time)}
+            </Typography.Text>
+          </Space>
+        );
+      },
+    },
+    {
+      title: '获得时间',
+      key: 'gain_time',
+      width: 135,
+      render: (_, record) => {
+        if (!record.hasPhone || !record.phone) return '-';
+        const phone = record.phone;
+        return (
+          <Space direction="vertical" size={2}>
+            <Typography.Text style={{ fontSize: 12 }}>
+              {formatDate(phone.gain_time)}
+            </Typography.Text>
+            {phone.valid_period_days ? (
+              <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                有效期 {phone.valid_period_days} 天
+              </Typography.Text>
+            ) : null}
+          </Space>
+        );
+      },
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      width: 160,
+      render: (_, record) => {
+        if (!record.hasPhone || !record.phone) return '-';
+        const phone = record.phone;
+        return (
+          <Space wrap size={4}>
+            <Button
+              size="small"
+              icon={<CopyOutlined />}
+              onClick={() => void copyPhone(phone.phone_number)}
+            >
+              复制
+            </Button>
+            <Button
+              size="small"
+              icon={<EditOutlined />}
+              onClick={() => {
+                setEditing({ accountId: record.group.account.id, phone });
+                noteForm.setFieldsValue({ display_name: phone.display_name ?? '' });
+              }}
+            >
+              备注
+            </Button>
+            <Button
+              size="small"
+              onClick={() => setDetailPhone(phone)}
+            >
+              完整详情
+            </Button>
+          </Space>
+        );
+      },
+    },
+  ];
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       <Space wrap style={{ width: '100%', justifyContent: 'space-between' }}>
         <div>
           <Typography.Title level={2} style={{ marginBottom: 0 }}>手机号管理</Typography.Title>
-          <Typography.Text type="secondary">按账户查看所有已购手机号；页面默认只读取本地数据库。</Typography.Text>
+          <Typography.Text type="secondary">按账户表格化展示所有已购手机号；支持按账号合并展示多个号码。</Typography.Text>
         </div>
         <Button icon={<ReloadOutlined />} loading={refreshingAll} onClick={refreshAll}>刷新全部</Button>
       </Space>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: isNarrow ? 'minmax(0, 1fr)' : 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12 }}>
         <Card><Statistic title="全部号码" value={data.summary.total} /></Card>
         <Card><Statistic title="正常号码" value={data.summary.active} /></Card>
         <Card><Statistic title="所属账户" value={data.summary.account_count} /></Card>
@@ -314,74 +583,14 @@ export default function PhoneInventory() {
           <Empty description="没有符合条件的手机号" />
         ) : null}
         {data.groups.length > 0 && (
-          <Collapse
-            defaultActiveKey={data.groups.map((group) => String(group.account.id))}
-            items={data.groups.map((group) => ({
-              key: String(group.account.id),
-              label: (
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', width: '100%', minWidth: 0 }}>
-                  <AccountGroupTitle group={group} />
-                  <Space wrap onClick={(event) => event.stopPropagation()}>
-                    <Button
-                      size="small"
-                      icon={<ReloadOutlined />}
-                      loading={refreshingAccountId === group.account.id}
-                      onClick={() => void refreshGroup(group.account.id)}
-                    >刷新</Button>
-                    <Button
-                      size="small"
-                      icon={<RightOutlined />}
-                      onClick={() => navigate(`/accounts/${group.account.id}`)}
-                    >账户详情</Button>
-                  </Space>
-                </div>
-              ),
-              children: (
-                <Space direction="vertical" size={12} style={{ width: '100%', minWidth: 0 }}>
-                  {accountRefreshErrors[group.account.id] && (
-                    <Alert
-                      showIcon
-                      type="error"
-                      message="刷新失败"
-                      description={accountRefreshErrors[group.account.id]}
-                      action={(
-                        <Button size="small" onClick={() => void refreshGroup(group.account.id)}>
-                          重新刷新
-                        </Button>
-                      )}
-                    />
-                  )}
-                  <div style={{ display: 'grid', gridTemplateColumns: isNarrow ? 'minmax(0, 1fr)' : 'repeat(auto-fit, minmax(320px, 1fr))', gap: 12, minWidth: 0 }}>
-                    {group.phones.map((phone) => (
-                      <Card key={phone.id} size="small" title={<Typography.Text>{formatPhone(phone)}</Typography.Text>} style={{ minWidth: 0 }}>
-                        <Space direction="vertical" size={8} style={{ width: '100%', minWidth: 0 }}>
-                          <PhoneTags phone={phone} />
-                          <Typography.Text type="secondary">备注：{phone.display_name || '-'}</Typography.Text>
-                          <Descriptions size="small" column={isNarrow ? 1 : 2} colon={false}>
-                            <Descriptions.Item label="国家">{formatCountry(phone)}</Descriptions.Item>
-                            <Descriptions.Item label="Provider">{phone.provider_id ?? '-'}</Descriptions.Item>
-                            <Descriptions.Item label="获得时间">{formatDate(phone.gain_time)}</Descriptions.Item>
-                            <Descriptions.Item label="到期时间"><PhoneExpiryBadge value={phone.expired_time} /></Descriptions.Item>
-                          </Descriptions>
-                          <Space wrap>
-                            <Button size="small" icon={<CopyOutlined />} onClick={() => void copyPhone(phone.phone_number)}>复制</Button>
-                            <Button
-                              size="small"
-                              icon={<EditOutlined />}
-                              onClick={() => {
-                                setEditing({ accountId: group.account.id, phone });
-                                noteForm.setFieldsValue({ display_name: phone.display_name ?? '' });
-                              }}
-                            >修改备注</Button>
-                            <Button size="small" onClick={() => setDetailPhone(phone)}>完整详情</Button>
-                          </Space>
-                        </Space>
-                      </Card>
-                    ))}
-                  </div>
-                </Space>
-              ),
-            }))}
+          <Table<PhoneTableRow>
+            bordered
+            columns={columns}
+            dataSource={tableRows}
+            rowKey="key"
+            pagination={false}
+            scroll={{ x: 1180 }}
+            size="middle"
           />
         )}
       </Card>
@@ -412,27 +621,29 @@ export default function PhoneInventory() {
 function AccountGroupTitle({ group }: { group: PhoneInventoryGroup }) {
   const activeCount = group.phones.filter((phone) => phone.status === 'active').length;
   return (
-    <Space wrap>
-      <Typography.Text strong>#{group.account.id} {group.account.nickname || '未命名账户'}</Typography.Text>
-      <Tag>{group.account.app_variant}</Tag>
-      <Tag color={group.account.status === 'online' ? 'success' : 'default'}>{group.account.status}</Tag>
-      <Tag color={group.account.monitor_enabled ? 'processing' : 'default'}>监听{group.account.monitor_enabled ? '中' : '停'}</Tag>
-      <Tag color={group.account.telegram_notify ? 'blue' : 'default'}>TG{group.account.telegram_notify ? '开' : '关'}</Tag>
-      <Tag>{group.phones.length} 个 / 正常 {activeCount}</Tag>
-    </Space>
-  );
-}
-
-function PhoneTags({ phone }: { phone: PhoneInventoryPhone }) {
-  return (
-    <Space wrap>
-      <Tag color={statusColor(phone.status)}>{statusLabel(phone.status)}</Tag>
-      {phone.is_primary && <Tag color="gold">主号码</Tag>}
-      {phone.is_good_number && <Tag color="purple">靓号</Tag>}
-      {phone.auto_renew && <Tag color="cyan">自动续费</Tag>}
-      <Tag color={phone.allow_receive_sms === false ? 'error' : phone.allow_receive_sms === true ? 'success' : 'default'}>
-        {phone.allow_receive_sms === false ? '短信接收关闭' : phone.allow_receive_sms === true ? '短信接收开启' : '短信设置未确认'}
-      </Tag>
+    <Space direction="vertical" size={4} style={{ width: '100%' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+        <Typography.Text strong style={{ fontSize: 14 }}>
+          #{group.account.id} {group.account.nickname || '未命名账户'}
+        </Typography.Text>
+        <Tag color={group.account.app_variant === 'dingdong' ? 'blue' : 'gold'}>
+          {group.account.app_variant === 'dingdong' ? '叮咚' : '说道'}
+        </Tag>
+        <Tag color={group.account.status === 'online' ? 'success' : 'default'}>
+          {group.account.status === 'online' ? '在线' : '离线'}
+        </Tag>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+        <Tag color={group.account.monitor_enabled ? 'processing' : 'default'} style={{ fontSize: 11, marginInlineEnd: 0 }}>
+          监听{group.account.monitor_enabled ? '中' : '关'}
+        </Tag>
+        <Tag color={group.account.telegram_notify ? 'blue' : 'default'} style={{ fontSize: 11, marginInlineEnd: 0 }}>
+          TG{group.account.telegram_notify ? '开' : '关'}
+        </Tag>
+        <Tag style={{ fontSize: 11, marginInlineEnd: 0 }}>
+          {group.phones.length} 个 / 正常 {activeCount}
+        </Tag>
+      </div>
     </Space>
   );
 }

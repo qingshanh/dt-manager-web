@@ -3,6 +3,7 @@ import { generateUUID } from '../utils/uuid';
 import { fetchCachedData, invalidateCachedData, isCachedDataFresh, makeCacheKey, readCachedData } from './client-cache';
 import type {
   ApiResponse,
+  AppVariant,
   BulkAccountAction,
   BulkAccountActionResult,
   CreateAccountRequest,
@@ -48,18 +49,7 @@ import type {
 type CacheOptions = { force?: boolean };
 const PAGE_NAVIGATION_TIMEOUT_MS = 30_000;
 
-export function createLatestRequestGuard() {
-  let latestRequestId = 0;
-  return {
-    begin() {
-      latestRequestId += 1;
-      return latestRequestId;
-    },
-    isLatest(requestId: number) {
-      return requestId === latestRequestId;
-    },
-  };
-}
+export { createLatestRequestGuard } from '../utils/request-guard';
 
 export const CACHE_TTL_MS = {
   dashboard: 60_000,
@@ -188,6 +178,7 @@ export async function createAccount(data: CreateAccountRequest) {
     ApiResponse<{
       id: number;
       account_id?: number;
+      app_variant?: AppVariant;
       message?: string;
       dt_user_id?: string;
       status?: string;
@@ -230,7 +221,7 @@ export async function deleteAccount(id: number) {
 }
 
 export async function sendVerificationCode(id: number, options?: { fresh_device?: boolean }) {
-  const res = await api.post<ApiResponse<{ account_id?: number; message: string; mock?: boolean; verification_code?: string | null; verification_flow?: 'recover' | 'register' | null; send_pending?: boolean }>>(
+  const res = await api.post<ApiResponse<{ account_id?: number; app_variant?: AppVariant; message: string; mock?: boolean; verification_code?: string | null; verification_flow?: 'recover' | 'register' | null; send_pending?: boolean }>>(
     `/accounts/${id}/send-verification-code`,
     options ?? undefined,
     { timeout: 90_000 },

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { App, Button, Card, Checkbox, Dropdown, Grid, Input, Pagination, Popconfirm, Space, Switch, Table, Tag, Tooltip, Typography, theme as antdTheme } from 'antd';
+import { App, Button, Card, Checkbox, Dropdown, Grid, Input, Pagination, Popconfirm, Select, Space, Switch, Table, Tag, Tooltip, Typography, theme as antdTheme } from 'antd';
 import {
   ArrowDownOutlined,
   ArrowUpOutlined,
@@ -137,7 +137,8 @@ export default function AccountList() {
   const { message, modal } = App.useApp();
   const { token } = antdTheme.useToken();
   const screens = Grid.useBreakpoint();
-  const compactAccountRows = screens.xxl === false;
+  const compactAccountRows = screens.sm === false;
+  const [mobileSortKey, setMobileSortKey] = useState<string>('default');
 
   const fetch = useCallback(
     async (currentPage = page, currentKeyword = keyword, options?: { force?: boolean }) => {
@@ -378,6 +379,7 @@ export default function AccountList() {
       dataIndex: 'nickname',
       width: 116,
       ellipsis: true,
+      sorter: (a, b) => (a.nickname || '').localeCompare(b.nickname || ''),
       render: (text, record) => (
         <Typography.Text
           editable={{
@@ -400,6 +402,7 @@ export default function AccountList() {
       title: '类型',
       dataIndex: 'app_variant',
       width: 80,
+      sorter: (a, b) => (a.app_variant || '').localeCompare(b.app_variant || ''),
       render: (value) => <Tag color={value === 'dingdong' ? 'blue' : 'gold'}>{value === 'dingdong' ? '叮咚' : '说道'}</Tag>,
     },
     {
@@ -407,6 +410,7 @@ export default function AccountList() {
       dataIndex: 'email',
       width: 196,
       ellipsis: true,
+      sorter: (a, b) => (a.email || '').localeCompare(b.email || ''),
       render: (value, record) => (
         <CopyableCell
           value={value}
@@ -420,6 +424,7 @@ export default function AccountList() {
       title: '用户 ID',
       dataIndex: 'dt_user_id',
       width: 120,
+      sorter: (a, b) => (a.dt_user_id || '').localeCompare(b.dt_user_id || ''),
       render: (value, record) => (
         <CopyableCell
           value={value}
@@ -433,6 +438,7 @@ export default function AccountList() {
       title: '状态',
       dataIndex: 'status',
       width: 82,
+      sorter: (a, b) => (a.status || '').localeCompare(b.status || ''),
       render: (value: string, record) => {
         const item = statusMap[value] || { color: 'default', label: value };
         const tags = (
@@ -448,6 +454,7 @@ export default function AccountList() {
       title: '电报',
       dataIndex: 'telegram_notify',
       width: 58,
+      sorter: (a, b) => Number(a.telegram_notify) - Number(b.telegram_notify),
       render: (value, record) => (
         <Switch size="small" checked={value} loading={actionLoading === record.id} onChange={(checked) => void handleTelegramToggle(record, checked)} />
       ),
@@ -455,7 +462,8 @@ export default function AccountList() {
     {
       title: '未读',
       dataIndex: 'unread_count',
-      width: 48,
+      width: 52,
+      sorter: (a, b) => (a.unread_count || 0) - (b.unread_count || 0),
       render: (value) => (value > 0 ? <Tag color="red" style={{ marginInlineEnd: 0 }}>{value}</Tag> : <Typography.Text type="secondary">0</Typography.Text>),
     },
     {
@@ -486,7 +494,8 @@ export default function AccountList() {
     {
       title: '最近登录',
       dataIndex: 'last_login_at',
-      width: 78,
+      width: 88,
+      sorter: (a, b) => (a.last_login_at ? dayjs(a.last_login_at).valueOf() : 0) - (b.last_login_at ? dayjs(b.last_login_at).valueOf() : 0),
       render: (value) => (value ? dayjs(value).format('MM-DD HH:mm') : '-'),
     },
     {
@@ -606,8 +615,32 @@ export default function AccountList() {
       {selectionToolbar}
       {compactAccountRows ? (
         <div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>排序：</Typography.Text>
+            <Select
+              size="small"
+              style={{ width: 120 }}
+              value={mobileSortKey}
+              onChange={setMobileSortKey}
+              options={[
+                { value: 'default', label: '默认排序' },
+                { value: 'app_variant', label: '按类型' },
+                { value: 'email', label: '按邮箱' },
+                { value: 'status', label: '按状态' },
+                { value: 'unread', label: '按未读数' },
+                { value: 'login', label: '按登录时间' },
+              ]}
+            />
+          </div>
           <div style={{ borderTop: `1px solid ${token.colorBorderSecondary}`, borderBottom: `1px solid ${token.colorBorderSecondary}` }}>
-            {accounts.map((record) => {
+            {[...accounts].sort((a, b) => {
+              if (mobileSortKey === 'app_variant') return (a.app_variant || '').localeCompare(b.app_variant || '');
+              if (mobileSortKey === 'email') return (a.email || '').localeCompare(b.email || '');
+              if (mobileSortKey === 'status') return (a.status || '').localeCompare(b.status || '');
+              if (mobileSortKey === 'unread') return (b.unread_count || 0) - (a.unread_count || 0);
+              if (mobileSortKey === 'login') return (b.last_login_at ? dayjs(b.last_login_at).valueOf() : 0) - (a.last_login_at ? dayjs(a.last_login_at).valueOf() : 0);
+              return 0;
+            }).map((record) => {
               const status = statusMap[record.status] || { color: 'default', label: record.status };
               const selected = selectedAccountIds.includes(record.id);
               return (
@@ -676,7 +709,7 @@ export default function AccountList() {
             }}
             loading={loading}
             size="small"
-            tableLayout="fixed"
+            scroll={{ x: 1050 }}
             className="account-table"
             pagination={pagination}
           />

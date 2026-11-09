@@ -62,6 +62,9 @@ export default function VerificationReloginModal({ open, account, onCancel, onSu
     setSending(true);
     try {
       const result = await sendVerificationCode(account.id, { fresh_device: true });
+      if (result.app_variant && result.app_variant !== account.app_variant) {
+        account.app_variant = result.app_variant;
+      }
       setSent(true);
       setCountdown(60);
       if (result.send_pending) {

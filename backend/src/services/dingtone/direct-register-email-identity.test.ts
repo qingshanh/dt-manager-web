@@ -231,3 +231,66 @@ test("checkActivatedUser and registerEmail share one activation session", async 
   assert.equal(result.payload.Result, 1);
   assert.equal(result.activatedUser?.dtUserId, "123");
 });
+test("detects variant mismatch from checkActivatedUser AppType and fails fast with user exist in other app", async () => {
+  const calls: string[] = [];
+  const runtime = {
+    primaryHost: "primary.example",
+    backupHost: "backup.example",
+    port: 443,
+    useTls: false,
+    appVersion: "6.3.1",
+    dingdongAppVersion: "6.5.0",
+    apkCertificateSign: "unused"
+  } as any;
+  const session = {
+    async openActivation() {
+      calls.push("open");
+    },
+    async callCommonRestJson(_label: string, apiName: string) {
+      if (apiName === "clientInfo") {
+        calls.push("clientInfo");
+        return { Result: 1 };
+      }
+      calls.push("check");
+      return {
+        Result: 1,
+        User: [{ UserId: "145138355354993", DingtoneId: "260293632", AppType: 3 }]
+      };
+    },
+    async callConfiguredRegisterEmailTemplate() {
+      calls.push("register");
+      return { Result: 1 };
+    },
+    async close() {
+      calls.push("close");
+    }
+  };
+
+  await assert.rejects(
+    async () => {
+      await callDirectEmailVerificationSequenceForTest(
+        runtime,
+        {
+          loginType: "email_code",
+          appVariant: "dingtone",
+          email: "poll@980999.xyz",
+          deviceId: "And.00000000000000000000000000000000",
+          trackCode: "6701025728065539"
+        } as any,
+        "poll@980999.xyz",
+        {
+          hostCandidates: () => ["primary.example", "backup.example"],
+          createSession: () => session as any
+        }
+      );
+    },
+    (err: any) => {
+      assert.match(err.message, /user exist in other app/);
+      assert.match(err.message, /dingdong/);
+      return true;
+    }
+  );
+
+  assert.deepEqual(calls, ["open", "clientInfo", "check", "close"]);
+  assert.equal(calls.includes("register"), false);
+});

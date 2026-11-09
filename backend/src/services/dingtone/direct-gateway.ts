@@ -7453,6 +7453,17 @@ async function callDirectEmailVerificationSequence(
         });
       }
 
+      if (activatedUser?.appType !== null && activatedUser?.appType !== undefined) {
+        const expectedVariant = activatedUser.appType === 3 ? "dingdong" : "dingtone";
+        if (expectedVariant !== input.appVariant) {
+          throw new AppError(
+            `user exist in other app: account belongs to ${expectedVariant} (AppType ${activatedUser.appType}), but request was for ${input.appVariant}`,
+            400,
+            400
+          );
+        }
+      }
+
       const payload = await session.callConfiguredRegisterEmailTemplate(
         "registerEmail",
         activationDeviceId(identity),
@@ -7463,6 +7474,9 @@ async function callDirectEmailVerificationSequence(
       return { activatedUser, payload, nextTrackCode };
     } catch (error) {
       lastError = error;
+      if (error instanceof AppError && /user exist in other app/i.test(error.message)) {
+        throw error;
+      }
       logger.warn("Direct email verification sequence failed", {
         host,
         port: runtime.port,
@@ -9109,10 +9123,11 @@ function extractActivatedEmailUser(payload: ApiResult) {
   const records = collectNestedRecords(payload);
   const dtUserId = pickStringFromRecords(records, ["UserId", "userId", "UserID", "uid", "dtUserId", "dt_user_id"]);
   const dingtoneId = pickStringFromRecords(records, ["DingtoneId", "DingtoneID", "dingtoneId", "dtDingtoneId"]);
+  const appType = pickNumberFromRecords(records, ["AppType", "appType", "app_type"]);
   if (!dtUserId && !dingtoneId) {
     return null;
   }
-  return { dtUserId, dingtoneId };
+  return { dtUserId, dingtoneId, appType };
 }
 
 function extractActivationDeviceId(payload: ApiResult) {
