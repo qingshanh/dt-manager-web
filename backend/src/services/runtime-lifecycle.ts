@@ -8,6 +8,7 @@ type RuntimeLifecycleDependencies = {
   stopTelegram: () => void | Promise<void>;
   stopAutoRefresh: () => void | Promise<void>;
   stopExpiryReminder: () => void | Promise<void>;
+  stopGameScheduler?: () => void | Promise<void>;
   stopWorkQueue: () => void | Promise<void>;
   stopAccountMonitor: () => Promise<void>;
   closeHttp: () => Promise<void>;
@@ -41,6 +42,7 @@ export class RuntimeLifecycle {
       { name: "telegram", promise: invokeAsync(this.dependencies.stopTelegram) },
       { name: "auto-refresh", promise: invokeAsync(this.dependencies.stopAutoRefresh) },
       { name: "expiry-reminder", promise: invokeAsync(this.dependencies.stopExpiryReminder) },
+      { name: "game-scheduler", promise: invokeAsync(this.dependencies.stopGameScheduler ?? (() => undefined)) },
       { name: "work-queue", promise: invokeAsync(this.dependencies.stopWorkQueue) },
       { name: "account-monitor", promise: invokeAsync(this.dependencies.stopAccountMonitor) },
       { name: "http", promise: invokeAsync(this.dependencies.closeHttp) }

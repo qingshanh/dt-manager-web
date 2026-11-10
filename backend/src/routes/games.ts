@@ -1,7 +1,10 @@
 import { Router } from "express";
 import { prisma } from "../lib/prisma.js";
+import { gameAutoSchedulerService } from "../services/game-auto-scheduler.js";
 import {
+  addXiequWhitelist,
   getAccountGameSummary,
+  runAccountMemberDaily,
   getGameRankList,
   loadFruitHarvestHistory,
   redeemMathGamePoints,
@@ -152,6 +155,40 @@ gamesRouter.post("/daily-all", async (req, res, next) => {
     const adminId = req.auth!.userId;
     const result = await runBatchAllAccountsDaily(adminId);
     ok(res, result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/games/xiequ/whitelist - Add server IP to Xiequ whitelist
+gamesRouter.post("/xiequ/whitelist", async (req, res, next) => {
+  try {
+    const ukey = req.body?.ukey ? String(req.body.ukey).trim() : undefined;
+    const result = await addXiequWhitelist(ukey);
+    ok(res, result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/games/scheduler/status
+gamesRouter.get("/scheduler/status", async (_req, res, next) => {
+  try {
+    const status = gameAutoSchedulerService.getStatus();
+    ok(res, status);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/accounts/:id/games/member/daily - Run member checkin and ad roulette
+gamesRouter.post("/member/daily", async (req, res, next) => {
+  try {
+    const accountId = Number((req.params as any).id || req.body.account_id);
+    await assertAccountAccess(accountId, req.auth!.userId);
+    const logs: any[] = [];
+    const success = await runAccountMemberDaily(accountId, logs);
+    ok(res, { success, logs });
   } catch (error) {
     next(error);
   }

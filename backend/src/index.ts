@@ -22,6 +22,7 @@ import { accountMonitorService } from "./services/account-monitor.js";
 import { ensureDefaultSettings, getGatewayMode, getSettingsMap } from "./services/settings.service.js";
 import { telegramBotService } from "./services/telegram-bot.js";
 import { accountAutoRefreshService } from "./services/account-auto-refresh.js";
+import { gameAutoSchedulerService } from "./services/game-auto-scheduler.js";
 import { phoneExpiryReminderService } from "./services/phone-expiry-reminder.js";
 import { recoverPhoneActionOperations } from "./services/phone-action-reconciliation.js";
 import { buildHealthPayload } from "./services/runtime-health.js";
@@ -183,6 +184,7 @@ async function bootstrap() {
     telegramBotService.start();
     accountAutoRefreshService.start();
     phoneExpiryReminderService.start();
+    gameAutoSchedulerService.start();
   });
 
   const lifecycle = new RuntimeLifecycle({
@@ -192,6 +194,7 @@ async function bootstrap() {
     },
     stopTelegram: () => telegramBotService.stop(),
     stopAutoRefresh: () => accountAutoRefreshService.stop(),
+    stopGameScheduler: () => gameAutoSchedulerService.stop(),
     stopExpiryReminder: () => phoneExpiryReminderService.stop(),
     stopWorkQueue: () => undefined,
     stopAccountMonitor: () => accountMonitorService.stopAll(),

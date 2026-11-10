@@ -835,3 +835,18 @@ export async function runAllAccountsGameDaily(): Promise<{ total: number; result
   const res = await api.post<ApiResponse<{ total: number; results: GameExecutionResult[] }>>(`/games/daily-all`);
   return res.data.data;
 }
+
+export async function addXiequWhitelist(ukey?: string): Promise<{ success: boolean; ip: string; message: string }> {
+  const res = await api.post<ApiResponse<{ success: boolean; ip: string; message: string }>>('/games/xiequ/whitelist', { ukey });
+  return res.data.data;
+}
+
+export async function runAccountMemberDaily(accountId: number): Promise<{ success: boolean; logs: GameTaskLog[] }> {
+  const res = await api.post<ApiResponse<{ success: boolean; logs: GameTaskLog[] }>>(`/accounts/${accountId}/games/member/daily`);
+  return res.data.data;
+}
+
+export async function getGameSchedulerStatus(): Promise<{ running: boolean; isNightQuiet: boolean; lastCycleAt: string | null; completedTodayCount: number }> {
+  const res = await api.get<ApiResponse<{ running: boolean; isNightQuiet: boolean; lastCycleAt: string | null; completedTodayCount: number }>>('/games/scheduler/status');
+  return res.data.data;
+}

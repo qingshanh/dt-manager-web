@@ -715,6 +715,8 @@ export async function runAccountAllDaily(accountId: number): Promise<GameExecuti
   const knifeSuccess = await runAccountKnifeDaily(accountId, logs);
   await delay(1500);
   const checkinSuccess = await runAccountCheckinDaily(accountId, logs);
+  await delay(1500);
+  const memberSuccess = await runAccountMemberDaily(accountId, logs);
 
   // Auto-redeem points if balance >= 1000
   try {
@@ -1038,4 +1040,127 @@ export async function redeemMathGamePoints(accountId: number, productId: number)
     success: false,
     message: res?.Reason || "兑换失败，库存不足或积分未达标"
   };
+}
+
+// ── Member Daily (Check-in & Ad Roulette) ──
+export async function runAccountMemberDaily(accountId: number, logs: GameTaskLog[] = []): Promise<boolean> {
+  const ctx = await resolveAccountContext(accountId);
+  let success = false;
+
+  // 1. 每日好运广告转盘 (Ad Roulette)
+  if (ctx.dtUserId) {
+    try {
+      const devId = ctx.account.dtDeviceId || "And.8b0355c263713b5301559b2a0c222859.dttalk";
+      let totalTimes = 0;
+      // 看广告增加2次抽奖机会
+      for (let i = 0; i < 2; i++) {
+        const addRes = await requestGameJson(
+          `/web/ad/roulette/chance/add?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}`
+        ).catch(() => null);
+        if (addRes?.Result === 1 && typeof addRes.data === "number") {
+          totalTimes = addRes.data;
+        }
+        await delay(1200);
+      }
+
+      if (totalTimes > 0) {
+        logs.push(formatLog("checkin", "info", `🌟 会员好运抽奖可用次数: ${totalTimes} 次，开始抽奖...`));
+        for (let i = 0; i < totalTimes; i++) {
+          const lotRes = await requestGameJson(
+            `/web/ad/roulette/reward?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}&timeZone=Asia%2FShanghai&isoCC=US`
+          ).catch(() => null);
+          if (lotRes?.Result === 1 && lotRes.data?.prizeName) {
+            logs.push(formatLog("checkin", "success", `好运抽奖获得: ${lotRes.data.prizeName}`));
+            success = true;
+          }
+          await delay(1200);
+        }
+      }
+    } catch (err) {
+      logs.push(formatLog("checkin", "warn", `好运抽奖执行异常: ${err instanceof Error ? err.message : String(err)}`));
+    }
+  }
+
+  // 2. 积分中心签到 (Checkin)
+  if (ctx.pointUid) {
+    try {
+      const timesRes = await requestGameJson(`/point/checkin/times?uid=${ctx.pointUid}`).catch(() => null);
+      if (timesRes?.Result === 1 && timesRes.data) {
+        const { validTimes, addTimes, maxAddTimes } = timesRes.data;
+        if (addTimes < maxAddTimes) {
+          const needed = maxAddTimes - addTimes;
+          for (let i = 0; i < needed; i++) {
+            await requestGameJson(`/point/checkin/addtimes?uid=${ctx.pointUid}`).catch(() => null);
+            const claim = await requestGameJson(`/point/checkin/reward?uid=${ctx.pointUid}`).catch(() => null);
+            if (claim?.Result === 1 && claim.data?.prizeName) {
+              logs.push(formatLog("checkin", "success", `每日签到领奖: ${claim.data.prizeName}`));
+              success = true;
+            }
+            await delay(1200);
+          }
+        } else if (validTimes > 0) {
+          const claim = await requestGameJson(`/point/checkin/reward?uid=${ctx.pointUid}`).catch(() => null);
+          if (claim?.Result === 1 && claim.data?.prizeName) {
+            logs.push(formatLog("checkin", "success", `签到抽奖获得: ${claim.data.prizeName}`));
+            success = true;
+          }
+        }
+      }
+    } catch (err) {
+      logs.push(formatLog("checkin", "warn", `签到执行异常: ${err instanceof Error ? err.message : String(err)}`));
+    }
+  }
+
+  return success;
+}
+
+// ── Xiequ Whitelist & Proxy Tester ──
+export async function addXiequWhitelist(ukey = "D87227D05A9A43BCB34204FFFA3FDC18"): Promise<{ success: boolean; ip: string; message: string }> {
+  let myIp = "";
+  try {
+    const res = await fetch("https://api.ipify.org?format=json", { signal: AbortSignal.timeout(5000) });
+    const json = (await res.json()) as any;
+    myIp = json.ip;
+  } catch {
+    const res2 = await fetch("https://checkip.amazonaws.com", { signal: AbortSignal.timeout(5000) });
+    myIp = (await res2.text()).trim();
+  }
+
+  if (!myIp) {
+    throw new AppError("无法获取本机公网 IP 地址", 500, 500);
+  }
+
+  const wlUrl = `http://op.xiequ.cn/IpWhiteList.aspx?uid=105900&ukey=${ukey}&act=add&ip=${myIp}&meno=dtmanager`;
+  const wlRes = await fetch(wlUrl, { signal: AbortSignal.timeout(8000) });
+  const text = (await wlRes.text()).trim();
+  return {
+    success: text.includes("success") || text.includes("已存在") || text.includes("成功"),
+    ip: myIp,
+    message: text
+  };
+}
+
+export function testHttpProxyConnection(targetUrl: string, proxyHost: string, proxyPort: number): Promise<{ status?: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    import("node:http").then((http) => {
+      const parsed = new URL(targetUrl);
+      const req = http.request({
+        host: proxyHost,
+        port: proxyPort,
+        path: targetUrl,
+        headers: {
+          Host: parsed.host,
+          "User-Agent": DEFAULT_HEADERS["user-agent"]
+        },
+        timeout: 6000
+      }, (res) => {
+        let data = "";
+        res.on("data", (chunk) => data += chunk);
+        res.on("end", () => resolve({ status: res.statusCode, body: data }));
+      });
+      req.on("error", reject);
+      req.on("timeout", () => req.destroy(new Error("Proxy timeout")));
+      req.end();
+    }).catch(reject);
+  });
 }

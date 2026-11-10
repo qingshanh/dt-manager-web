@@ -21,8 +21,10 @@ import {
   CopyOutlined,
   InfoCircleOutlined,
   PlayCircleOutlined,
+  GlobalOutlined,
   ReloadOutlined,
   ShareAltOutlined,
+  StarOutlined,
   ThunderboltOutlined,
   TrophyOutlined,
 } from '@ant-design/icons';
@@ -36,6 +38,8 @@ import {
   runAccountKnifeDaily,
   runAllAccountsGameDaily,
   waterAccountFruit,
+  addXiequWhitelist,
+  runAccountMemberDaily,
   type AccountGameSummary,
   type GameTaskLog,
   type RankLeaderboardItem,
@@ -167,6 +171,36 @@ export default function AccountGameRewards({ accountId }: Props) {
     }
   };
 
+  const handleRunMemberDaily = async () => {
+    setActionLoading('member');
+    try {
+      const res = await runAccountMemberDaily(accountId);
+      setLogs((prev) => [...res.logs, ...prev]);
+      message.success('会员签到与好运抽奖已执行完成！');
+      await loadData();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '会员任务执行失败');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleAddWhitelist = async () => {
+    setActionLoading('whitelist');
+    try {
+      const res = await addXiequWhitelist();
+      if (res.success) {
+        message.success(`当前服务器公网 IP (${res.ip}) 已成功添加至携趣白名单！`);
+      } else {
+        message.info(`白名单响应: ${res.message} (IP: ${res.ip})`);
+      }
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '添加携趣白名单失败');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   const handleRunKnife = async () => {
     setActionLoading('knife');
     try {
@@ -250,6 +284,8 @@ export default function AccountGameRewards({ accountId }: Props) {
         </Space>
         <Space wrap>
           <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void loadData()}>刷新数据</Button>
+          <Button icon={<StarOutlined />} loading={actionLoading === 'member'} onClick={() => void handleRunMemberDaily()}>会员好运/签到</Button>
+          <Button icon={<GlobalOutlined />} loading={actionLoading === 'whitelist'} onClick={() => void handleAddWhitelist()}>加携趣白名单</Button>
           <Button
             icon={<ThunderboltOutlined />}
             loading={runningAllDaily}
