@@ -1401,8 +1401,8 @@ accountsRouter.post("/:id/refresh", async (req, res, next) => {
       allowAdbPoint: false,
       includePublicEnrichment: false,
       persistCachedSnapshot: false,
-      gatewaySnapshotWaitMs: 20_000,
-      phoneListWaitMs: 15_000
+      gatewaySnapshotWaitMs: 8_000,
+      phoneListWaitMs: 6_000
     });
     const result = useDirect
       ? await accountMonitorService.withMaintenance(accountId, refresh)
@@ -1473,10 +1473,14 @@ accountsRouter.get("/:id/pointstore", async (req, res, next) => {
 accountsRouter.get("/:id/auto-redeem-amazon", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);
-    const setting = await prisma.setting.findUnique({
-      where: { key: `auto_redeem_amazon_${accountId}` }
+    const settings = await prisma.setting.findMany({
+      where: { key: { in: [`auto_redeem_amazon_${accountId}`, `auto_redeem_target_product_${accountId}`] } }
     });
-    ok(res, { enabled: setting?.value === "true" });
+    const map = Object.fromEntries(settings.map((s) => [s.key, s.value]));
+    ok(res, {
+      enabled: map[`auto_redeem_amazon_${accountId}`] === "true",
+      target_product: map[`auto_redeem_target_product_${accountId}`] || "7001"
+    });
   } catch (err) {
     next(err);
   }
@@ -1486,16 +1490,20 @@ accountsRouter.post("/:id/auto-redeem-amazon", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);
     const enabled = Boolean(req.body.enabled);
-    await prisma.setting.upsert({
-      where: { key: `auto_redeem_amazon_${accountId}` },
-      update: { value: String(enabled) },
-      create: {
-        key: `auto_redeem_amazon_${accountId}`,
-        value: String(enabled),
-        description: `Account #${accountId} auto redeem Amazon Gift Card`
-      }
-    });
-    ok(res, { enabled });
+    const targetProduct = String(req.body.target_product || "7001").trim();
+    await prisma.$transaction([
+      prisma.setting.upsert({
+        where: { key: `auto_redeem_amazon_${accountId}` },
+        update: { value: String(enabled) },
+        create: { key: `auto_redeem_amazon_${accountId}`, value: String(enabled) }
+      }),
+      prisma.setting.upsert({
+        where: { key: `auto_redeem_target_product_${accountId}` },
+        update: { value: targetProduct },
+        create: { key: `auto_redeem_target_product_${accountId}`, value: targetProduct }
+      })
+    ]);
+    ok(res, { enabled, target_product: targetProduct });
   } catch (err) {
     next(err);
   }

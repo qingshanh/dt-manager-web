@@ -9,6 +9,7 @@ import {
   Empty,
   Modal,
   Progress,
+  Select,
   Space,
   Switch,
   Table,
@@ -64,6 +65,7 @@ export default function AccountGameRewards({ accountId }: Props) {
   const [logs, setLogs] = useState<GameTaskLog[]>([]);
   const navigate = useNavigate();
   const [autoRedeemAmazon, setAutoRedeemAmazonState] = useState(false);
+  const [autoRedeemTarget, setAutoRedeemTarget] = useState('7001');
   const [savingAutoRedeem, setSavingAutoRedeem] = useState(false);
   const [pointStoreData, setPointStoreData] = useState<any>(null);
   const [schedulerStatus, setSchedulerStatus] = useState<any>(null);
@@ -81,7 +83,7 @@ export default function AccountGameRewards({ accountId }: Props) {
     try {
       const summary = await getAccountGameSummary(accountId);
       setData(summary);
-      void getAutoRedeemAmazon(accountId).then((res) => setAutoRedeemAmazonState(res.enabled)).catch(() => {});
+      void getAutoRedeemAmazon(accountId).then((res) => { setAutoRedeemAmazonState(res.enabled); if (res.target_product) setAutoRedeemTarget(res.target_product); }).catch(() => {});
       void getAccountPointStore(accountId).then((res) => setPointStoreData(res)).catch(() => {});
       void getGameSchedulerStatus().then((res) => setSchedulerStatus(res)).catch(() => {});
     } catch (err) {
@@ -187,17 +189,23 @@ export default function AccountGameRewards({ accountId }: Props) {
 
 
 
-  const handleToggleAutoRedeemAmazon = async (checked: boolean) => {
+  const handleToggleAutoRedeemAmazon = async (checked: boolean, target = autoRedeemTarget) => {
     setSavingAutoRedeem(true);
     try {
-      const res = await setAutoRedeemAmazon(accountId, checked);
+      const res = await setAutoRedeemAmazon(accountId, checked, target);
       setAutoRedeemAmazonState(res.enabled);
-      message.success(res.enabled ? '已开启 Amazon Gift Card $5 自动兑换（积分年底到期<=30天时自动触发）' : '已关闭自动兑换');
+      if (res.target_product) setAutoRedeemTarget(res.target_product);
+      message.success(res.enabled ? '已开启积分年底到期自动兑换' : '已关闭自动兑换');
     } catch (err) {
       message.error(err instanceof Error ? err.message : '保存设置失败');
     } finally {
       setSavingAutoRedeem(false);
     }
+  };
+
+  const handleSaveAutoRedeemTarget = async () => {
+    await handleToggleAutoRedeemAmazon(autoRedeemAmazon, autoRedeemTarget);
+    message.success('已保存自动兑换目标商品配置！');
   };
 
   const handleRunMathDaily = async () => {
@@ -341,22 +349,17 @@ export default function AccountGameRewards({ accountId }: Props) {
         </Space>
       </div>
 
-      {/* 说道币/积分到期提醒横幅 */}
-      {expiry && (expiry.expireCredit > 0 || expiry.expireDate) ? (
+      {/* 会员积分年底到期提醒 (仅在当年有积分到期时单行展示) */}
+      {expiry && typeof expiry.expireCredit === 'number' && expiry.expireCredit > 0 ? (
         <Alert
           type="warning"
           showIcon
-          icon={<ClockCircleOutlined />}
-          message="🌟 会员商城积分年底到期提醒"
-          description={(
-            <Space direction="vertical" size={2}>
-              <Typography.Text>
-                当前账户有 <Typography.Text strong type="warning">{expiry.expireCredit}</Typography.Text> 会员积分
-                {expiry.expireDate ? <>，将于 <Typography.Text strong>{expiry.expireDate}</Typography.Text> 年底到期。</> : ' 即将到期。'}
-                注：说道币 / 叮咚币为永久有效钱包余额（保持账号活跃即可），此处到期仅指商城会员积分。
-              </Typography.Text>
-            </Space>
-          )}
+          style={{ padding: '6px 16px', borderRadius: 6, fontSize: 13 }}
+          message={
+            <span>
+              🌟 <Typography.Text strong>积分年底到期提醒</Typography.Text>：当前账户有 <Typography.Text strong type="danger">{expiry.expireCredit}</Typography.Text> 积分将于 {expiry.expireDate || '年底'} 到期，请及时兑换！(说道币/叮咚币为钱包余额永久有效)
+            </span>
+          }
         />
       ) : null}
 
@@ -672,29 +675,11 @@ export default function AccountGameRewards({ accountId }: Props) {
         </Card>
         {/* 卡片 5: 会员好运与每日签到 (Member & Roulette) */}
         <Card
-          title={(
-            <Space>
-              <span>🌟 会员好运签到</span>
-              {member?.lastReward ? <Tag color="gold">最近: {member.lastReward}</Tag> : null}
-            </Space>
-          )}
+          title="🌟 会员好运签到"
           extra={(
             <Space size={6}>
-              <Button
-                size="small"
-                icon={<ClockCircleOutlined />}
-                onClick={() => setMemberHistoryModalOpen(true)}
-              >
-                奖励历史
-              </Button>
-              <Button
-                size="small"
-                icon={<StarOutlined />}
-                loading={actionLoading === 'member'}
-                onClick={() => void handleRunMemberDaily()}
-              >
-                签到/抽奖
-              </Button>
+              <Button size="small" icon={<ClockCircleOutlined />} onClick={() => setMemberHistoryModalOpen(true)}>历史</Button>
+              <Button size="small" icon={<StarOutlined />} loading={actionLoading === 'member'} onClick={() => void handleRunMemberDaily()}>签到抽奖</Button>
             </Space>
           )}
         >
@@ -786,36 +771,59 @@ export default function AccountGameRewards({ accountId }: Props) {
               </Space>
             </Descriptions.Item>
 
-            <Descriptions.Item label="自动兑换 Amazon $5">
-              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+            <Descriptions.Item label="自动兑换设置">
+              <Space direction="vertical" size={6} style={{ width: '100%' }}>
                 <Space wrap style={{ justifyContent: 'space-between', width: '100%' }}>
                   <Typography.Text strong>
-                    自动兑换 Amazon Gift Card $5
+                    积分年底到期自动兑换商品
                   </Typography.Text>
                   <Switch
                     checked={autoRedeemAmazon}
                     loading={savingAutoRedeem}
-                    onChange={(checked) => void handleToggleAutoRedeemAmazon(checked)}
+                    onChange={(checked) => void handleToggleAutoRedeemAmazon(checked, autoRedeemTarget)}
                     checkedChildren="开启"
                     unCheckedChildren="关闭"
                   />
                 </Space>
-                <div style={{ fontSize: 12, color: '#666', lineHeight: 1.5 }}>
-                  满足条件自动兑换并电报通知：①开启开关；②积分充足；③当年有到期积分且距离年底 &le; 30天；④商品有货。
+                <Space wrap style={{ width: '100%', gap: 8 }}>
+                  <span style={{ fontSize: 13, color: '#555' }}>目标商品:</span>
+                  <Select
+                    showSearch
+                    style={{ minWidth: 260, flex: 1 }}
+                    placeholder="选择或输入商品 ID / 名称"
+                    value={autoRedeemTarget}
+                    onChange={(val) => setAutoRedeemTarget(val)}
+                    options={[
+                      { value: '7001', label: '[ID: 7001] Amazon Gift Card $5 (999分)' },
+                      ...(pointStoreData?.products ?? []).map((p: any) => ({
+                        value: String(p.product_id),
+                        label: `[ID: ${p.product_id}] ${p.name} (${p.price}分)`
+                      }))
+                    ]}
+                  />
+                  <Button size="small" type="primary" loading={savingAutoRedeem} onClick={handleSaveAutoRedeemTarget}>
+                    保存目标
+                  </Button>
+                </Space>
+                <div style={{ fontSize: 12, color: '#888', lineHeight: 1.4 }}>
+                  触发条件：①开启开关；②可用积分充足；③当年有积分要过期且距离到期 &le; 30天；④商品有货。满足时自动下单并电报通知。
                 </div>
               </Space>
             </Descriptions.Item>
 
-            <Descriptions.Item label="商城快捷商品">
+            <Descriptions.Item label="商城商品 (带商品ID)">
               <Space wrap size={6}>
                 {pointStoreData?.products?.map((p: any) => (
                   <Button
                     key={p.product_id}
                     size="small"
                     disabled={(pointStoreData?.valid_point ?? 0) < (p.price ?? 0)}
-                    onClick={() => navigate(`/accounts/${accountId}/point-store`)}
+                    onClick={() => {
+                      setAutoRedeemTarget(String(p.product_id));
+                      message.info(`已选中目标商品 [ID: ${p.product_id}] ${p.name}`);
+                    }}
                   >
-                    {p.name} ({p.price}分)
+                    [ID: {p.product_id}] {p.name} ({p.price}分)
                   </Button>
                 ))}
                 {(!pointStoreData?.products || pointStoreData.products.length === 0) && (

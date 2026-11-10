@@ -905,12 +905,12 @@ export async function runAccountMathDaily(accountId: number): Promise<{ success:
 }
 
 
-export async function getAutoRedeemAmazon(accountId: number): Promise<{ enabled: boolean }> {
+export async function getAutoRedeemAmazon(accountId: number): Promise<{ enabled: boolean; target_product?: string }> {
   const res = await api.get<ApiResponse<{ enabled: boolean }>>(`/accounts/${accountId}/auto-redeem-amazon`);
   return res.data.data;
 }
 
-export async function setAutoRedeemAmazon(accountId: number, enabled: boolean): Promise<{ enabled: boolean }> {
-  const res = await api.post<ApiResponse<{ enabled: boolean }>>(`/accounts/${accountId}/auto-redeem-amazon`, { enabled });
+export async function setAutoRedeemAmazon(accountId: number, enabled: boolean, targetProduct?: string): Promise<{ enabled: boolean; target_product?: string }> {
+  const res = await api.post<ApiResponse<{ enabled: boolean }>>(`/accounts/${accountId}/auto-redeem-amazon`, { enabled, target_product: targetProduct });
   return res.data.data;
 }

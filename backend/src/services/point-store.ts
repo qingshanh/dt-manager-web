@@ -629,19 +629,23 @@ function isRecord(value: unknown): value is JsonRecord {
 }
 
 
-export async function checkAndAutoRedeemAmazonGiftCard(accountId: number): Promise<{
+export async function checkAndAutoRedeemTargetPointProduct(accountId: number): Promise<{
   attempted: boolean;
   redeemed: boolean;
   reason: string;
 }> {
   const settingKey = `auto_redeem_amazon_${accountId}`;
-  const setting = await prisma.setting.findFirst({
-    where: { key: { in: [settingKey, "auto_redeem_amazon_gift_card_enabled"] } }
+  const targetKey = `auto_redeem_target_product_${accountId}`;
+  const settings = await prisma.setting.findMany({
+    where: { key: { in: [settingKey, targetKey, "auto_redeem_amazon_gift_card_enabled"] } }
   });
-  const enabled = setting?.value === "true";
+  const map = Object.fromEntries(settings.map((s) => [s.key, s.value]));
+  const enabled = map[settingKey] === "true" || map.auto_redeem_amazon_gift_card_enabled === "true";
   if (!enabled) {
-    return { attempted: false, redeemed: false, reason: "自动兑换 Amazon Gift Card 功能未开启" };
+    return { attempted: false, redeemed: false, reason: "自动兑换功能未开启" };
   }
+
+  const targetSelector = map[targetKey]?.trim() || "7001";
 
   let pointStore: AccountPointStore;
   try {
@@ -670,41 +674,41 @@ export async function checkAndAutoRedeemAmazonGiftCard(accountId: number): Promi
     return { attempted: false, redeemed: false, reason: `距离积分过期还有 ${Math.ceil(daysRemaining)} 天 (>30天)，暂不触发兑换` };
   }
 
-  const amazonProduct = pointStore.products.find(
+  const targetProduct = pointStore.products.find(
     (p) =>
-      p.productId === "7001" ||
-      p.name.toLowerCase().includes("amazon") ||
-      (p.name.includes("礼品卡") && p.name.includes("5"))
+      p.productId === targetSelector ||
+      p.name.toLowerCase().includes(targetSelector.toLowerCase()) ||
+      (targetSelector === "7001" && (p.name.includes("Amazon") || p.name.includes("礼品卡")))
   );
-  if (!amazonProduct) {
-    return { attempted: false, redeemed: false, reason: "积分商城未找到 Amazon Gift Card $5 商品" };
+  if (!targetProduct) {
+    return { attempted: false, redeemed: false, reason: `积分商城未找到目标商品【${targetSelector}】` };
   }
 
-  const requiredPrice = amazonProduct.price ?? 999;
+  const requiredPrice = targetProduct.price ?? 999;
   if (validPoint < requiredPrice) {
-    return { attempted: false, redeemed: false, reason: `可用积分不足 (${validPoint} < ${requiredPrice})，无法兑换` };
+    return { attempted: false, redeemed: false, reason: `可用积分不足 (${validPoint} < ${requiredPrice})，无法兑换【${targetProduct.name}】` };
   }
 
-  if (amazonProduct.stock !== null && amazonProduct.stock <= 0) {
-    return { attempted: false, redeemed: false, reason: `商品【${amazonProduct.name}】当前缺货 (库存: 0)` };
+  if (targetProduct.stock !== null && targetProduct.stock <= 0) {
+    return { attempted: false, redeemed: false, reason: `商品【${targetProduct.name}】当前缺货 (库存: 0)` };
   }
 
   try {
     const account = await prisma.dtAccount.findUnique({ where: { id: accountId } });
     const targetEmail = pointStore.email || account?.email;
     if (!targetEmail) {
-      return { attempted: true, redeemed: false, reason: "账号缺少用于接收礼品卡的邮箱地址" };
+      return { attempted: true, redeemed: false, reason: "账号缺少用于接收商品的邮箱地址" };
     }
-    const orderResult = await orderAccountPointStoreProduct(accountId, amazonProduct.productId, targetEmail);
-    logger.info("Auto redeemed Amazon Gift Card successfully", {
+    const orderResult = await orderAccountPointStoreProduct(accountId, targetProduct.productId, targetEmail);
+    logger.info("Auto redeemed point product successfully", {
       accountId,
       orderId: orderResult.orderId,
-      productName: amazonProduct.name
+      productName: targetProduct.name
     });
     return {
       attempted: true,
       redeemed: true,
-      reason: `成功自动兑换【${amazonProduct.name}】！订单已提交并发送电报通知。`
+      reason: `成功自动兑换【${targetProduct.name}】！订单已提交并发送电报通知。`
     };
   } catch (err) {
     return {
@@ -714,3 +718,5 @@ export async function checkAndAutoRedeemAmazonGiftCard(accountId: number): Promi
     };
   }
 }
+
+export const checkAndAutoRedeemAmazonGiftCard = checkAndAutoRedeemTargetPointProduct;

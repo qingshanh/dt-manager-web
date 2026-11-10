@@ -56,6 +56,7 @@ export class GameAutoSchedulerService {
   private readonly accountDailyCompletedDates = new Map<number, string>();
   private isRunning = false;
   private lastCycleAt: Date | null = null;
+  private nextCycleAt: Date | null = null;
 
   private readonly loop = new BackgroundLoop({
     initialDelayMs: 30_000,
@@ -187,7 +188,9 @@ export class GameAutoSchedulerService {
       this.isRunning = false;
     }
 
-    return GAME_SCHEDULER_CYCLE_DELAY_MS;
+    const nextDelay = isNightQuietHours(new Date()) ? NIGHT_CYCLE_DELAY_MS : GAME_SCHEDULER_CYCLE_DELAY_MS;
+    this.nextCycleAt = new Date(Date.now() + nextDelay);
+    return nextDelay;
   }
 }
 
