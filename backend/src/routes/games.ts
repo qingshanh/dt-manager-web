@@ -9,6 +9,8 @@ import {
   loadFruitHarvestHistory,
   loadMemberRewardHistory,
   testHttpProxyConnection,
+  extractProxiesFromResponse,
+  BUILTIN_89IP_PROXY_URL,
   redeemMathGamePoints,
   runAccountAllDaily,
   runAccountFruitDaily,
@@ -215,40 +217,56 @@ gamesRouter.post("/proxy/test", async (req, res, next) => {
       const s = await prisma.setting.findFirst({
         where: { key: { in: ["game_proxy_extract_url", "game_proxy_pool_url"] } }
       });
-      extractUrl = s?.value?.trim() || "";
+      extractUrl = s?.value?.trim() || BUILTIN_89IP_PROXY_URL;
     }
-    if (!extractUrl) {
-      throw new AppError("请先在输入框或系统设置中提供代理提取 URL", 400, 400);
-    }
-    const extractRes = await fetch(extractUrl, { signal: AbortSignal.timeout(8000) });
+    const extractRes = await fetch(extractUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+      },
+      signal: AbortSignal.timeout(10000)
+    });
     const text = (await extractRes.text()).trim();
-    const match = text.match(/(\d+\.\d+\.\d+\.\d+):(\d+)/);
-    if (!match) {
+    const candidates = extractProxiesFromResponse(text);
+    if (candidates.length === 0) {
       return ok(res, {
         success: false,
-        message: `未能从提取链接解析出 IP:端口，响应内容: ${text.slice(0, 150)}`
+        message: `未能从提取链接解析出有效的 IP:端口，响应内容前缀: ${text.slice(0, 150)}`
       });
     }
-    const host = match[1] || "";
-    const port = Number(match[2] || 0);
-    const start = Date.now();
-    try {
-      const probe = await testHttpProxyConnection("http://dt-apigatewayv2.dt-pn1.com/game/point/redeemInfo", host, port);
-      const latency = Date.now() - start;
+
+    let workingProxy: string | null = null;
+    let bestLatency = 0;
+    let lastError: string | null = null;
+    for (const c of candidates.slice(0, 10)) {
+      const start = Date.now();
+      try {
+        const probe = await testHttpProxyConnection("http://dt-apigatewayv2.dt-pn1.com/game/point/redeemInfo", c.host, c.port);
+        if (probe.status === 200) {
+          workingProxy = c.proxy;
+          bestLatency = Date.now() - start;
+          break;
+        }
+      } catch (testErr) {
+        lastError = testErr instanceof Error ? testErr.message : String(testErr);
+      }
+    }
+
+    if (workingProxy) {
       return ok(res, {
         success: true,
-        proxy: `${host}:${port}`,
-        latency_ms: latency,
-        status: probe.status,
-        message: `代理连接测试成功 (耗时: ${latency}ms, 状态码: ${probe.status})`
-      });
-    } catch (testErr) {
-      return ok(res, {
-        success: false,
-        proxy: `${host}:${port}`,
-        message: `提取到代理 ${host}:${port}，但连接网关测试超时或失败: ${testErr instanceof Error ? testErr.message : String(testErr)}`
+        proxy: workingProxy,
+        total_extracted: candidates.length,
+        latency_ms: bestLatency,
+        message: `从代理源成功解析到 ${candidates.length} 个 IP，连通测试成功: ${workingProxy} (耗时: ${bestLatency}ms)`
       });
     }
+
+    return ok(res, {
+      success: false,
+      total_extracted: candidates.length,
+      proxy: candidates[0]?.proxy,
+      message: `从代理源提取到 ${candidates.length} 个 IP，但抽测前几组代理均无响应或超时 (${lastError || "网络超时"})，建议稍后重试或使用携趣等付费代理。`
+    });
   } catch (error) {
     next(error);
   }

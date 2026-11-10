@@ -524,9 +524,11 @@ function resolveProgressPointTotal(level: number | null, pointGradeInfoData: Jso
     return explicit;
   }
 
-  if (level === 4) {
-    return 5000;
-  }
+  if (level === 1) return 500;
+  if (level === 2) return 1000;
+  if (level === 3) return 3000;
+  if (level === 4) return 5000;
+  if (level === 5) return 10000;
   return null;
 }
 

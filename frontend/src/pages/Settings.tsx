@@ -577,14 +577,22 @@ export default function Settings() {
                   <Form.Item
                     label="代理 IP 提取 API 链接 (携趣 / 89 代理等)"
                     name="game_proxy_extract_url"
-                    help="用于算术挑战自动换 IP 助力的代理提取链接，返回格式需包含 ip:port。例如携趣提取 API 或 89 免费代理 API。"
+                    help="用于算术挑战自动换 IP 助力的代理提取链接，返回格式支持 HTML/TXT/JSON 中的 ip:port。系统已默认内置 89 免费代理（无需鉴权）；若需要更高稳定性可填入携趣等付费代理。"
                   >
-                    <Input.TextArea rows={2} placeholder="http://api.xiequ.cn/VAD/GetIp.aspx?act=get&uid=... 或 https://www.89ip.cn/tqdl.html?num=1..." />
+                    <Input.TextArea rows={2} placeholder="https://www.89ip.cn/tqdl.html?num=30&address=&kill_address=&port=&kill_port=&isp=" />
                   </Form.Item>
 
                   <Space wrap size={12}>
                     <Button type="primary" htmlType="submit" loading={saving}>
                       保存设置
+                    </Button>
+                    <Button
+                      onClick={() => {
+                        gameProxyForm.setFieldValue('game_proxy_extract_url', 'https://www.89ip.cn/tqdl.html?num=30&address=&kill_address=&port=&kill_port=&isp=');
+                        message.info('已填入内置 89 免费代理提取链接，点击保存即可生效');
+                      }}
+                    >
+                      填入内置 89 免费代理
                     </Button>
                     <Button
                       icon={<GlobalOutlined />}

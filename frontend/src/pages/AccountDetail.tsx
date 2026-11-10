@@ -1091,7 +1091,7 @@ export default function AccountDetail() {
   const userGradeValue = pointStore?.user_grade ?? snapshotExtras.userGrade ?? snapshot?.user_grade ?? null;
   const progressPointValue = pointStore?.history_point ?? snapshotExtras.progressPoint ?? snapshot?.progress_point ?? null;
   const progressPointTotalValue =
-    snapshot?.progress_point_total ?? snapshotExtras.progressPointTotal ?? (userGradeValue === 4 ? 5000 : null);
+    snapshot?.progress_point_total ?? snapshotExtras.progressPointTotal ?? (userGradeValue === 1 ? 500 : userGradeValue === 2 ? 1000 : userGradeValue === 3 ? 3000 : userGradeValue === 4 ? 5000 : null);
   const expirePointValue = pointStore?.expire_point ?? snapshotExtras.expirePoint;
   const expireTimeValue = pointStore?.expire_time ?? snapshotExtras.expireTime;
   const dingtoneIdValue = snapshotExtras.dtDingtoneId ?? snapshot?.dt_dingtone_id ?? null;
@@ -2407,7 +2407,7 @@ export default function AccountDetail() {
                         title="升级进度"
                         value={
                           progressPointValue !== null
-                            ? `${formatNumber(progressPointValue, 1)} / ${formatNumber(progressPointTotalValue, 1, '-')}`
+                            ? `${formatNumber(progressPointValue, 0)} / ${formatNumber(progressPointTotalValue, 0, '-')}`
                             : '未同步'
                         }
                       />

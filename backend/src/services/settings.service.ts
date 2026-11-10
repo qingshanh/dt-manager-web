@@ -67,7 +67,7 @@ const defaultSettings = [
   ["log_level", config.LOG_LEVEL, "Log level"],
   ["game_xiequ_whitelist_ukey", "", "携趣代理添加白名单 ukey（如 YOUR_XIEQU_UKEY）"],
   ["game_xiequ_whitelist_uid", "105900", "携趣代理用户 uid（如 105900）"],
-  ["game_proxy_extract_url", "", "代理 IP 提取 API 链接（携趣提取 URL 或 89 免费代理提取 URL）"]
+  ["game_proxy_extract_url", "https://www.89ip.cn/tqdl.html?num=30&address=&kill_address=&port=&kill_port=&isp=", "代理 IP 提取 API 链接（系统已内置 89 免费代理，亦可填写携趣等付费代理）"]
 ] as const;
 
 const runtimeSettings = [

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { Alert, App, Button, Card, Col, Descriptions, Empty, Input, Row, Space, Statistic, Table, Tabs, Tag, Typography } from 'antd';
+import { Alert, App, Button, Card, Col, Descriptions, Empty, Input, Row, Segmented, Space, Statistic, Table, Tabs, Tag, Typography } from 'antd';
 import { ArrowLeftOutlined, GiftOutlined, HistoryOutlined, MailOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
@@ -35,6 +35,12 @@ function orderStatusColor(status: string) {
   return 'default';
 }
 
+
+function isGameExchangeOrder(order: PointStoreOrder) {
+  const name = order.product_name || '';
+  return name.includes('叮咚币') || name.includes('说道币') || name.includes('积分兑换') || String(order.product_id) === '22';
+}
+
 function pointStoreOrderFeedback(status: string, orderId: string | number) {
   const normalized = status.toLowerCase();
   if (/complete|success|done|1/.test(normalized)) {
@@ -63,6 +69,13 @@ export default function PointStore() {
   const [ordersStale, setOrdersStale] = useState(false);
   const [ordersSyncError, setOrdersSyncError] = useState<string | null>(null);
   const [ordersSyncedAt, setOrdersSyncedAt] = useState<string | null>(null);
+  const [orderCategoryFilter, setOrderCategoryFilter] = useState<'all' | 'mall' | 'game'>('all');
+
+  const filteredOrders = useMemo(() => {
+    if (orderCategoryFilter === 'mall') return orders.filter((o) => !isGameExchangeOrder(o));
+    if (orderCategoryFilter === 'game') return orders.filter((o) => isGameExchangeOrder(o));
+    return orders;
+  }, [orders, orderCategoryFilter]);
   const [email, setEmail] = useState('');
   const [defaultEmail, setDefaultEmail] = useState('');
   const [loading, setLoading] = useState(true);
@@ -214,7 +227,20 @@ export default function PointStore() {
 
   const orderColumns: ColumnsType<PointStoreOrder> = [
     { title: '订单 ID', dataIndex: 'remote_order_id', width: 180, render: (value, order) => value || `本地-${order.id}` },
-    { title: '商品', dataIndex: 'product_name', ellipsis: true },
+    {
+      title: '商品',
+      dataIndex: 'product_name',
+      ellipsis: true,
+      render: (value: string, order: PointStoreOrder) => {
+        const isGame = isGameExchangeOrder(order);
+        return (
+          <Space>
+            {isGame ? <Tag color="purple">🎮 算术游戏收益</Tag> : <Tag color="blue">🎁 商城权益兑换</Tag>}
+            <span>{value}</span>
+          </Space>
+        );
+      },
+    },
     { title: '邮箱', dataIndex: 'email', width: 220, ellipsis: true },
     { title: '积分', dataIndex: 'product_price', width: 90, render: formatPoints },
     {
@@ -279,12 +305,23 @@ export default function PointStore() {
             label: <Space><HistoryOutlined />历史订单</Space>,
             children: (
               <Space direction="vertical" size={12} style={{ width: '100%' }}>
-                <Space wrap>
-                  <Button icon={<ReloadOutlined />} loading={ordersLoading} onClick={() => void loadOrders()}>
-                    手动刷新
-                  </Button>
+                <Space wrap style={{ width: '100%', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <Space wrap>
+                    <Button icon={<ReloadOutlined />} loading={ordersLoading} onClick={() => void loadOrders()}>
+                      手动刷新
+                    </Button>
+                    <Segmented
+                      value={orderCategoryFilter}
+                      onChange={(val) => setOrderCategoryFilter(val as any)}
+                      options={[
+                        { label: `全部订单 (${orders.length})`, value: 'all' },
+                        { label: `🎁 商城权益 (${orders.filter((o) => !isGameExchangeOrder(o)).length})`, value: 'mall' },
+                        { label: `🎮 游戏收益 (${orders.filter((o) => isGameExchangeOrder(o)).length})`, value: 'game' },
+                      ]}
+                    />
+                  </Space>
                   {ordersSyncedAt ? (
-                    <Typography.Text type="secondary">
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                       最近同步：{dayjs(ordersSyncedAt).format('YYYY-MM-DD HH:mm:ss')}
                     </Typography.Text>
                   ) : null}
@@ -302,7 +339,7 @@ export default function PointStore() {
                 ) : (
                   <Table
                     columns={orderColumns}
-                    dataSource={orders}
+                    dataSource={filteredOrders}
                     rowKey="id"
                     loading={ordersLoading}
                     locale={{ emptyText: orderHistoryView.emptyText }}

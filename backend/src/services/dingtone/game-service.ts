@@ -828,6 +828,28 @@ export async function runBatchAllAccountsDaily(adminId: number): Promise<{ total
   return { total: accounts.length, results };
 }
 
+export const BUILTIN_89IP_PROXY_URL = "https://www.89ip.cn/tqdl.html?num=30&address=&kill_address=&port=&kill_port=&isp=";
+
+export function extractProxiesFromResponse(text: string): Array<{ host: string; port: number; proxy: string }> {
+  const list: Array<{ host: string; port: number; proxy: string }> = [];
+  const seen = new Set<string>();
+  const regex = /(\b(?:\d{1,3}\.){3}\d{1,3}\b):(\d{2,5})/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    const host = match[1] || "";
+    const port = Number(match[2] || 0);
+    if (host.startsWith("127.") || host === "0.0.0.0" || port <= 0 || port > 65535) {
+      continue;
+    }
+    const key = `${host}:${port}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      list.push({ host, port, proxy: key });
+    }
+  }
+  return list;
+}
+
 export async function runAccountShareBoost(accountId: number, maxBoosts = 10): Promise<{ count: number; logs: string[] }> {
   const logs: string[] = [];
   const summary = await getAccountGameSummary(accountId);
@@ -843,12 +865,25 @@ export async function runAccountShareBoost(accountId: number, maxBoosts = 10): P
     where: { key: { in: ["game_proxy_extract_url", "game_proxy_pool_url", "dt_proxy_url"] } }
   });
   const settingsMap = Object.fromEntries(settings.map((s) => [s.key, s.value]));
-  const proxyPoolUrl = settingsMap.game_proxy_extract_url?.trim() || settingsMap.game_proxy_pool_url?.trim() || "";
+  const proxyPoolUrl = settingsMap.game_proxy_extract_url?.trim() || settingsMap.game_proxy_pool_url?.trim() || BUILTIN_89IP_PROXY_URL;
+  logs.push(`使用代理源: ${proxyPoolUrl.includes("89ip.cn") ? "系统内置 89 免费代理池" : proxyPoolUrl}`);
+
+  let candidates: Array<{ host: string; port: number; proxy: string }> = [];
+  try {
+    const ipRes = await fetch(proxyPoolUrl, {
+      headers: { "User-Agent": DEFAULT_HEADERS["user-agent"] },
+      signal: AbortSignal.timeout(8000)
+    });
+    const ipText = (await ipRes.text()).trim();
+    candidates = extractProxiesFromResponse(ipText);
+    logs.push(`从代理源成功解析到 ${candidates.length} 个候选代理`);
+  } catch (err) {
+    logs.push(`提取代理源异常: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   let successCount = 0;
-  if (!proxyPoolUrl) {
-    // If no proxy pool URL is configured, attempt direct request once
-    logs.push("未配置动态代理池 API，尝试使用本机出口 IP 访问一次...");
+  if (candidates.length === 0) {
+    logs.push("未能获取有效候选代理，尝试使用本机出口 IP 访问一次...");
     try {
       const res = await requestGameJson(`/game/shareAddChance?shortUuid=${encodeURIComponent(shortUuid)}`);
       if (res?.Result === 1) {
@@ -861,35 +896,33 @@ export async function runAccountShareBoost(accountId: number, maxBoosts = 10): P
       logs.push(`助力请求失败: ${err instanceof Error ? err.message : String(err)}`);
     }
   } else {
-    logs.push(`使用配置的动态代理池 API: ${proxyPoolUrl}`);
-    for (let i = 0; i < maxBoosts; i++) {
+    const targetUrl = `http://dt-apigatewayv2.dt-pn1.com/game/shareAddChance?shortUuid=${encodeURIComponent(shortUuid)}`;
+    for (let i = 0; i < candidates.length && successCount < maxBoosts; i++) {
+      const candidate = candidates[i];
+      if (!candidate) continue;
       try {
-        const ipRes = await fetch(proxyPoolUrl, { signal: AbortSignal.timeout(6000) });
-        const ipText = (await ipRes.text()).trim();
-        const match = ipText.match(/(\d+\.\d+\.\d+\.\d+:\d+)/);
-        if (!match) {
-          logs.push(`第 ${i + 1} 次提取代理失败: ${ipText.slice(0, 80)}`);
-          break;
-        }
-        const proxyHostPort = match[1];
-        logs.push(`获取到代理 IP: ${proxyHostPort}`);
-        // Fetch via proxy
-        const boostRes = await fetch(`http://dt-apigatewayv2.dt-pn1.com/game/shareAddChance?shortUuid=${encodeURIComponent(shortUuid)}`, {
-          signal: AbortSignal.timeout(6000)
-        });
-        const json = await boostRes.json().catch(() => null);
-        if (json?.Result === 1) {
-          successCount += 1;
-          logs.push(`第 ${i + 1} 次助力成功！`);
-        } else if (json?.Result === 0) {
-          logs.push(`助力响应: ${json.Reason}`);
-          if (json.Reason?.includes("已达上限")) {
-            break;
+        const probe = await testHttpProxyConnection(targetUrl, candidate.host, candidate.port);
+        if (probe.status === 200 && probe.body) {
+          let json: any = null;
+          try {
+            json = JSON.parse(probe.body);
+          } catch {
+            continue;
+          }
+          if (json?.Result === 1) {
+            successCount += 1;
+            logs.push(`通过代理 [${candidate.proxy}] 助力成功 +1 次！(累计: ${successCount})`);
+          } else if (json?.Result === 0) {
+            logs.push(`代理 [${candidate.proxy}] 助力响应: ${json.Reason}`);
+            if (json.Reason?.includes("已达上限")) {
+              logs.push("用户当日分享助力已达系统上限，结束助力");
+              break;
+            }
           }
         }
-        await delay(1000);
-      } catch (err) {
-        logs.push(`第 ${i + 1} 次代理助力失败: ${err instanceof Error ? err.message : String(err)}`);
+        await delay(800);
+      } catch {
+        // timeout or error, continue to next candidate
       }
     }
   }
