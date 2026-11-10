@@ -645,7 +645,7 @@ export async function checkAndAutoRedeemTargetPointProduct(accountId: number): P
     return { attempted: false, redeemed: false, reason: "自动兑换功能未开启" };
   }
 
-  const targetSelector = map[targetKey]?.trim() || "7001";
+  const targetSelector = map[targetKey]?.trim() || "";
 
   let pointStore: AccountPointStore;
   try {
@@ -678,7 +678,7 @@ export async function checkAndAutoRedeemTargetPointProduct(accountId: number): P
     (p) =>
       p.productId === targetSelector ||
       p.name.toLowerCase().includes(targetSelector.toLowerCase()) ||
-      (targetSelector === "7001" && (p.name.includes("Amazon") || p.name.includes("礼品卡")))
+      (!targetSelector && Boolean(p.productId))
   );
   if (!targetProduct) {
     return { attempted: false, redeemed: false, reason: `积分商城未找到目标商品【${targetSelector}】` };

@@ -337,7 +337,8 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
           }))
         : [],
       tasks: fruitTasks,
-      harvestHistory: loadFruitHarvestHistory(accountId)
+      harvestHistory: loadFruitHarvestHistory(accountId),
+      isDailyWaterLimitReached: loadMathDailyState(accountId).fruitWaterLimitReached
     };
   }
 
@@ -708,17 +709,28 @@ export async function runAccountFruitDaily(accountId: number, logs: GameTaskLog[
       const waterDrops = reloaded.data.nutritiveNumber ?? 0;
       logs.push(formatLog("fruit", "info", `当前拥有水滴: ${waterDrops}`));
       const unharvestedFruit = reloaded.data.plantFruitList?.find((item: any) => item.completionRate < 1);
-      if (waterDrops > 0 && unharvestedFruit) {
+      const dailyState = loadMathDailyState(accountId);
+      if (dailyState.fruitWaterLimitReached) {
+        logs.push(formatLog("fruit", "warn", "🍎 今日果树浇水已达官方每日上限，今日跳过浇水"));
+      } else if (waterDrops > 0 && unharvestedFruit) {
         const waterRes = await requestGameJson(
           `/campaign/fruit/warter?userId=${ctx.dtUserId}&campaignId=10094&appType=${ctx.appType}&dingtoneId=${ctx.dingtoneId}&fruitId=${unharvestedFruit.fruitId}&timeStamp=${Date.now()}`
-        );
+        ).catch((err) => ({ Result: 0, Reason: err instanceof Error ? err.message : String(err) }));
         if (waterRes?.Result === 1) {
-          const nextRate = Math.round((waterRes.data?.completionRate ?? 0) * 100);
+          const nextRate = Math.round(((waterRes as any)?.data?.completionRate ?? 0) * 100);
           logs.push(formatLog("fruit", "success", `浇水成功！果树成熟进度提升至: ${nextRate}%`));
-          if (waterRes.data?.completionRate >= 1.0) {
+          if ((waterRes as any)?.data?.completionRate >= 1.0) {
             await requestGameJson(
               `/campaign/fruit/credit/reward?userId=${ctx.dtUserId}&dingtoneId=${ctx.dingtoneId}&campaignId=10094&fruitId=${unharvestedFruit.fruitId}&timeStamp=${Date.now()}`
             ).catch(() => null);
+          }
+        } else {
+          const reason = waterRes?.Reason || "未知原因";
+          logs.push(formatLog("fruit", "warn", `果园浇水返回: ${reason}`));
+          if ((waterRes as any)?.ErrCode === 10004 || reason.includes("限制") || reason.includes("上限") || reason.includes("已达")) {
+            dailyState.fruitWaterLimitReached = true;
+            saveMathDailyState(dailyState);
+            logs.push(formatLog("fruit", "warn", "今日浇水已达官方每日上限，系统已记录，次日自动刷新"));
           }
         }
       }
@@ -1262,6 +1274,7 @@ export interface MathDailyState {
   shareBoostCount: number;
   isShareBoostMaxReached: boolean;
   redeemedProductIds: number[];
+  fruitWaterLimitReached: boolean;
 }
 
 const MATH_STATE_FILE_PATH = path.resolve(process.cwd(), "_tmp/runtime/math_daily_state.json");
@@ -1289,7 +1302,8 @@ export function loadMathDailyState(accountId: number): MathDailyState {
     dateStr: today,
     shareBoostCount: 0,
     isShareBoostMaxReached: false,
-    redeemedProductIds: []
+    redeemedProductIds: [],
+    fruitWaterLimitReached: false
   };
 }
 

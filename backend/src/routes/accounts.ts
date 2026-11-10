@@ -1401,8 +1401,8 @@ accountsRouter.post("/:id/refresh", async (req, res, next) => {
       allowAdbPoint: false,
       includePublicEnrichment: false,
       persistCachedSnapshot: false,
-      gatewaySnapshotWaitMs: 8_000,
-      phoneListWaitMs: 6_000
+      gatewaySnapshotWaitMs: 20_000,
+      phoneListWaitMs: 15_000
     });
     const result = useDirect
       ? await accountMonitorService.withMaintenance(accountId, refresh)
@@ -1479,7 +1479,7 @@ accountsRouter.get("/:id/auto-redeem-amazon", async (req, res, next) => {
     const map = Object.fromEntries(settings.map((s) => [s.key, s.value]));
     ok(res, {
       enabled: map[`auto_redeem_amazon_${accountId}`] === "true",
-      target_product: map[`auto_redeem_target_product_${accountId}`] || "7001"
+      target_product: map[`auto_redeem_target_product_${accountId}`] || ""
     });
   } catch (err) {
     next(err);
@@ -1490,7 +1490,7 @@ accountsRouter.post("/:id/auto-redeem-amazon", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);
     const enabled = Boolean(req.body.enabled);
-    const targetProduct = String(req.body.target_product || "7001").trim();
+    const targetProduct = String(req.body.target_product || "").trim();
     await prisma.$transaction([
       prisma.setting.upsert({
         where: { key: `auto_redeem_amazon_${accountId}` },

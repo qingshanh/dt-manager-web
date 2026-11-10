@@ -65,7 +65,7 @@ export default function AccountGameRewards({ accountId }: Props) {
   const [logs, setLogs] = useState<GameTaskLog[]>([]);
   const navigate = useNavigate();
   const [autoRedeemAmazon, setAutoRedeemAmazonState] = useState(false);
-  const [autoRedeemTarget, setAutoRedeemTarget] = useState('7001');
+  const [autoRedeemTarget, setAutoRedeemTarget] = useState('');
   const [savingAutoRedeem, setSavingAutoRedeem] = useState(false);
   const [pointStoreData, setPointStoreData] = useState<any>(null);
   const [schedulerStatus, setSchedulerStatus] = useState<any>(null);
@@ -84,7 +84,12 @@ export default function AccountGameRewards({ accountId }: Props) {
       const summary = await getAccountGameSummary(accountId);
       setData(summary);
       void getAutoRedeemAmazon(accountId).then((res) => { setAutoRedeemAmazonState(res.enabled); if (res.target_product) setAutoRedeemTarget(res.target_product); }).catch(() => {});
-      void getAccountPointStore(accountId).then((res) => setPointStoreData(res)).catch(() => {});
+      void getAccountPointStore(accountId).then((res) => {
+        setPointStoreData(res);
+        if (!autoRedeemTarget && res?.products?.[0]?.product_id) {
+          setAutoRedeemTarget(String(res.products[0].product_id));
+        }
+      }).catch(() => {});
       void getGameSchedulerStatus().then((res) => setSchedulerStatus(res)).catch(() => {});
     } catch (err) {
       message.error(err instanceof Error ? err.message : '获取游戏与福利数据失败');
@@ -793,13 +798,10 @@ export default function AccountGameRewards({ accountId }: Props) {
                     placeholder="选择或输入商品 ID / 名称"
                     value={autoRedeemTarget}
                     onChange={(val) => setAutoRedeemTarget(val)}
-                    options={[
-                      { value: '7001', label: '[ID: 7001] Amazon Gift Card $5 (999分)' },
-                      ...(pointStoreData?.products ?? []).map((p: any) => ({
-                        value: String(p.product_id),
-                        label: `[ID: ${p.product_id}] ${p.name} (${p.price}分)`
-                      }))
-                    ]}
+                    options={(pointStoreData?.products ?? []).map((p: any) => ({
+                      value: String(p.product_id),
+                      label: `[ID: ${p.product_id}] ${p.name} (${p.price}分)`
+                    }))}
                   />
                   <Button size="small" type="primary" loading={savingAutoRedeem} onClick={handleSaveAutoRedeemTarget}>
                     保存目标
