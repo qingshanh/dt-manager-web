@@ -369,7 +369,25 @@ export default function AccountGameRewards({ accountId }: Props) {
       ) : null}
 
       {/* 4 大游戏功能卡片网格 */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(330px, 1fr))', gap: 16 }}>
+      <style>{`
+        .game-cards-grid {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 16px;
+        }
+        @media (max-width: 1280px) {
+          .game-cards-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+        }
+        @media (max-width: 768px) {
+          .game-cards-grid {
+            grid-template-columns: 1fr;
+            gap: 12px;
+          }
+        }
+      `}</style>
+      <div className="game-cards-grid">
         {/* 卡片 1: 萌宠工坊 (Pet) */}
         <Card
           title={(
@@ -776,11 +794,11 @@ export default function AccountGameRewards({ accountId }: Props) {
               </Space>
             </Descriptions.Item>
 
-            <Descriptions.Item label="自动兑换设置">
+            <Descriptions.Item label="自动兑换配置">
               <Space direction="vertical" size={6} style={{ width: '100%' }}>
                 <Space wrap style={{ justifyContent: 'space-between', width: '100%' }}>
                   <Typography.Text strong>
-                    积分年底到期自动兑换商品
+                    积分到期自动兑换
                   </Typography.Text>
                   <Switch
                     checked={autoRedeemAmazon}
@@ -790,13 +808,13 @@ export default function AccountGameRewards({ accountId }: Props) {
                     unCheckedChildren="关闭"
                   />
                 </Space>
-                <Space wrap style={{ width: '100%', gap: 8 }}>
-                  <span style={{ fontSize: 13, color: '#555' }}>目标商品:</span>
+                <Space wrap style={{ width: '100%', gap: 6 }}>
+                  <span style={{ fontSize: 12, color: '#555' }}>目标:</span>
                   <Select
                     showSearch
-                    style={{ minWidth: 260, flex: 1 }}
+                    style={{ minWidth: 200, flex: 1 }}
                     placeholder="选择或输入商品 ID / 名称"
-                    value={autoRedeemTarget}
+                    value={autoRedeemTarget || undefined}
                     onChange={(val) => setAutoRedeemTarget(val)}
                     options={(pointStoreData?.products ?? []).map((p: any) => ({
                       value: String(p.product_id),
@@ -804,16 +822,16 @@ export default function AccountGameRewards({ accountId }: Props) {
                     }))}
                   />
                   <Button size="small" type="primary" loading={savingAutoRedeem} onClick={handleSaveAutoRedeemTarget}>
-                    保存目标
+                    保存
                   </Button>
                 </Space>
-                <div style={{ fontSize: 12, color: '#888', lineHeight: 1.4 }}>
-                  触发条件：①开启开关；②可用积分充足；③当年有积分要过期且距离到期 &le; 30天；④商品有货。满足时自动下单并电报通知。
+                <div style={{ fontSize: 11, color: '#888', lineHeight: 1.4 }}>
+                  触发规则：①开启开关；②积分充足；③当年有积分要过期且距离到期 &le; 30天；④商品有货。满足时自动下单并电报通知。
                 </div>
               </Space>
             </Descriptions.Item>
 
-            <Descriptions.Item label="商城商品 (带商品ID)">
+            <Descriptions.Item label="商城商品 (点击选中)">
               <Space wrap size={6}>
                 {pointStoreData?.products?.map((p: any) => (
                   <Button
@@ -830,7 +848,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                 ))}
                 {(!pointStoreData?.products || pointStoreData.products.length === 0) && (
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    包含 Amazon 礼品卡、通话折扣券及各专属权益，点击右上角进入商城
+                    暂无商品，点击右上角进入商城
                   </Typography.Text>
                 )}
               </Space>

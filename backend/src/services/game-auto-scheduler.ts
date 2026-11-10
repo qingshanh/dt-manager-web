@@ -47,7 +47,7 @@ function getAccountScheduledDailyTime(accountId: number, dateStr: string): { hou
     hash |= 0;
   }
   const positive = Math.abs(hash);
-  const hour = 8 + (positive % 13); // 8 to 20
+  const hour = 7 + (positive % 5); // 7:00 到 11:30 上午做完全部日常
   const minute = (positive >> 4) % 60; // 0 to 59
   return { hour, minute };
 }
@@ -127,7 +127,7 @@ export class GameAutoSchedulerService {
         // Tier 1: Check if main daily tasks should run for this account today
         const shouldRunMainDaily =
           lastCompleted !== dateStr &&
-          (currentHour > targetHour || (currentHour === targetHour && currentMinute >= targetMinute));
+          (currentHour >= 12 || currentHour > targetHour || (currentHour === targetHour && currentMinute >= targetMinute));
 
         if (shouldRunMainDaily) {
           logger.info("Game auto scheduler running daily tasks for account", {
@@ -151,37 +151,90 @@ export class GameAutoSchedulerService {
           continue;
         }
 
-        // Tier 2: For accounts that have completed daily, perform cooldown checks (feeding, treasure hunt)
+        // Tier 2: 全天 10 分钟机会补漏与冷却消化池
         try {
           const summary = await getAccountGameSummary(account.id);
-          // 1. Pet Feed
-          if (summary.pet && summary.pet.nextFeedRemainingTime === 0 && (summary.pet.fishNum ?? 0) > 0) {
-            logger.info("Game auto scheduler auto-feeding hungry pet", { accountId: account.id });
-            await runAccountPetDaily(account.id);
-            await randomDelay(2000, 5000);
-          }
-          // 2. Pet Treasure Hunt Claim
-          if (summary.pet && summary.pet.treasureHuntStatus === 2) {
-            logger.info("Game auto scheduler claiming pet treasure hunt and restarting", { accountId: account.id });
-            await runAccountPetDaily(account.id);
-            await randomDelay(2000, 5000);
-          }
-          // 3. Knife Box Open
-          if (summary.knife && summary.knife.canOpenTreasureBox) {
-            logger.info("Game auto scheduler opening knife treasure box", { accountId: account.id });
-            await runAccountKnifeDaily(account.id);
-            await randomDelay(2000, 5000);
-          }
-          // 4. Fruit Harvest
-          if (summary.fruit?.plantFruitList?.some((f) => f.completionRate >= 1.0)) {
-            logger.info("Game auto scheduler harvesting mature fruit", { accountId: account.id });
-            await runAccountFruitDaily(account.id);
-            await randomDelay(2000, 5000);
-          }
-        } catch {
-          // ignore single account cooldown poll error
-        }
 
+          // 1. 算术不等式: 检测到有剩余机会或广告机会，立即答题做完翻倍
+          if (summary.mathGame && ((summary.mathGame.chanceLeft ?? 0) > 0 || (summary.mathGame.watchAdsAddChanceFrequency ?? 0) > 0)) {
+            logger.info("Game auto scheduler consuming math game chances and climbing rank", {
+              accountId: account.id,
+              chanceLeft: summary.mathGame.chanceLeft
+            });
+            await runAccountMathDaily(account.id);
+            await randomDelay(2000, 5000);
+          }
+
+          // 2. 飞刀国王: 开箱，投掷全部剩余飞刀并抽奖翻倍
+          if (summary.knife) {
+            if (summary.knife.canOpenTreasureBox) {
+              logger.info("Game auto scheduler opening knife treasure box", { accountId: account.id });
+              await runAccountKnifeDaily(account.id);
+              await randomDelay(2000, 5000);
+            } else if (
+              (summary.knife.remainPlayTimes ?? 0) > 0 ||
+              summary.knife.watchingGetPlayTimes < summary.knife.watchingGetPlayTimesLimit
+            ) {
+              logger.info("Game auto scheduler running knife play chances", {
+                accountId: account.id,
+                remainPlayTimes: summary.knife.remainPlayTimes
+              });
+              await runAccountKnifeDaily(account.id);
+              await randomDelay(2000, 5000);
+            }
+          }
+
+          // 3. 会员好运与签到: 抽奖机会立即抽完，签到领奖
+          if (summary.member) {
+            if (
+              summary.member.adRouletteRemainTimes > 0 ||
+              summary.member.validTimes > 0 ||
+              summary.member.addTimes < summary.member.maxAddTimes
+            ) {
+              logger.info("Game auto scheduler running member roulette and checkin", { accountId: account.id });
+              await runAccountMemberDaily(account.id);
+              await randomDelay(2000, 5000);
+            }
+          }
+
+          // 4. 萌宠工坊: 饥饿投喂、寻宝双倍领奖、玩耍与转盘
+          if (summary.pet) {
+            if (summary.pet.nextFeedRemainingTime === 0 && (summary.pet.fishNum ?? 0) > 0) {
+              logger.info("Game auto scheduler auto-feeding hungry pet", { accountId: account.id });
+              await runAccountPetDaily(account.id);
+              await randomDelay(2000, 5000);
+            } else if (summary.pet.treasureHuntStatus === 2) {
+              logger.info("Game auto scheduler claiming pet treasure hunt and restarting", { accountId: account.id });
+              await runAccountPetDaily(account.id);
+              await randomDelay(2000, 5000);
+            } else if (summary.pet.lotteryLeftChance > 0 || summary.pet.playLeftChance > 0) {
+              logger.info("Game auto scheduler using pet lottery or play chances", { accountId: account.id });
+              await runAccountPetDaily(account.id);
+              await randomDelay(2000, 5000);
+            }
+          }
+
+          // 5. 每日果园: 成熟自动收获、未达上限自动浇水
+          if (summary.fruit) {
+            if (summary.fruit.plantFruitList?.some((f) => (f.completionRate ?? 0) >= 1.0)) {
+              logger.info("Game auto scheduler harvesting mature fruit", { accountId: account.id });
+              await runAccountFruitDaily(account.id);
+              await randomDelay(2000, 5000);
+            } else if (!summary.fruit.isDailyWaterLimitReached && (summary.fruit.nutritiveNumber ?? 0) >= 10) {
+              logger.info("Game auto scheduler auto-watering fruit tree", { accountId: account.id });
+              await runAccountFruitDaily(account.id);
+              await randomDelay(2000, 5000);
+            }
+          }
+
+          // 6. 自动兑换指定积分商品检测
+          await checkAndAutoRedeemAmazonGiftCard(account.id).catch(() => null);
+        } catch (err) {
+          logger.warn("Tier 2 opportunistic task error", {
+            accountId: account.id,
+            error: err instanceof Error ? err.message : String(err)
+          });
+        }
         await delay(2000);
       }
     } finally {
