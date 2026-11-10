@@ -64,6 +64,7 @@ export default function AccountGameRewards({ accountId }: Props) {
   const [rankModalOpen, setRankModalOpen] = useState(false);
   const [rankLoading, setRankLoading] = useState(false);
   const [rankList, setRankList] = useState<RankLeaderboardItem[]>([]);
+  const [memberHistoryModalOpen, setMemberHistoryModalOpen] = useState(false);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -271,6 +272,7 @@ export default function AccountGameRewards({ accountId }: Props) {
   const fruit = data?.fruit;
   const knife = data?.knife;
   const math = data?.mathGame;
+  const member = data?.member;
   const currentFruit = fruit?.plantFruitList?.[0];
   const expiry = data?.creditExpiry;
 
@@ -632,6 +634,100 @@ export default function AccountGameRewards({ accountId }: Props) {
             <Empty description="暂无算术游戏数据" />
           )}
         </Card>
+        {/* 卡片 5: 会员好运与每日签到 (Member & Roulette) */}
+        <Card
+          title={(
+            <Space>
+              <span>🌟 会员好运与每日签到</span>
+              {member?.lastReward ? <Tag color="gold">最近: {member.lastReward}</Tag> : null}
+            </Space>
+          )}
+          extra={(
+            <Space size={6}>
+              <Tooltip title="查看玩法介绍与收益说明">
+                <Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('member')}>说明</Button>
+              </Tooltip>
+              <Button
+                size="small"
+                icon={<ClockCircleOutlined />}
+                onClick={() => setMemberHistoryModalOpen(true)}
+              >
+                奖励历史
+              </Button>
+              <Button
+                size="small"
+                icon={<StarOutlined />}
+                loading={actionLoading === 'member'}
+                onClick={() => void handleRunMemberDaily()}
+              >
+                签到/抽奖
+              </Button>
+            </Space>
+          )}
+        >
+          <Descriptions size="small" column={1} bordered>
+            <Descriptions.Item label="每日好运转盘">
+              <Space wrap size={[4, 4]}>
+                <Tag color={member && member.adRouletteRemainTimes > 0 ? 'orange' : 'default'}>
+                  可用抽奖: {member?.adRouletteRemainTimes ?? 0} 次
+                </Tag>
+                <Tag color="blue">
+                  广告加抽奖: 每日看广告 +2 次
+                </Tag>
+              </Space>
+            </Descriptions.Item>
+            <Descriptions.Item label="会员每日签到">
+              <Space wrap size={[4, 4]}>
+                <Tag color={member && member.validTimes > 0 ? 'green' : 'default'}>
+                  签到状态: {member && member.validTimes > 0 ? `可签到 (${member.validTimes}次)` : '今日已签到'}
+                </Tag>
+                <Tag color="cyan">
+                  加赠任务: {member ? `${member.addTimes} / ${member.maxAddTimes}` : '0 / 2'}
+                </Tag>
+              </Space>
+            </Descriptions.Item>
+            <Descriptions.Item label="最近中奖奖励">
+              {member?.lastReward ? (
+                <Space>
+                  <Tag color="success" style={{ fontSize: 13, padding: '2px 8px' }}>
+                    🎉 {member.lastReward}
+                  </Tag>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    (已持久化存档)
+                  </Typography.Text>
+                </Space>
+              ) : (
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  执行签到或好运转盘后将自动展示最新奖品并存档
+                </Typography.Text>
+              )}
+            </Descriptions.Item>
+            <Descriptions.Item label="历史中奖记录 (永久保存)">
+              {member?.history && member.history.length > 0 ? (
+                <div style={{ maxHeight: 75, overflowY: 'auto' }}>
+                  {member.history.slice(0, 3).map((h, i) => (
+                    <div key={i} style={{ fontSize: 12, marginBottom: 2 }}>
+                      <Tag color="purple" style={{ marginInlineEnd: 4 }}>{h.sourceName}</Tag>
+                      <Typography.Text strong style={{ color: '#d46b08' }}>{h.prizeName}</Typography.Text>
+                      <Typography.Text type="secondary" style={{ marginLeft: 6, fontSize: 11 }}>
+                        ({new Date(h.receivedAt).toLocaleDateString()})
+                      </Typography.Text>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  暂无历史奖励记录，点击「签到/抽奖」或运行全量日常即可触发
+                </Typography.Text>
+              )}
+            </Descriptions.Item>
+            <Descriptions.Item label="全自动执行机制">
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                日常自动调度时自动看广告拿满 2 次好运抽奖，自动完成签到领奖，所有中奖均留存本地可追溯！
+              </Typography.Text>
+            </Descriptions.Item>
+          </Descriptions>
+        </Card>
       </div>
 
       {/* 实时执行日志 */}
@@ -794,6 +890,49 @@ export default function AccountGameRewards({ accountId }: Props) {
           ]}
         />
       </Modal>
+      {/* 会员奖励历史 Modal */}
+      <Modal
+        title="🎁 会员好运抽奖与每日签到中奖历史"
+        open={memberHistoryModalOpen}
+        onCancel={() => setMemberHistoryModalOpen(false)}
+        footer={null}
+        width={680}
+      >
+        <Table
+          size="small"
+          rowKey={(r: any, index) => `${r.receivedAt}-${index}`}
+          dataSource={data?.member?.history ?? []}
+          pagination={{ pageSize: 8, hideOnSinglePage: true }}
+          locale={{ emptyText: '暂无中奖记录' }}
+          columns={[
+            {
+              title: '时间',
+              dataIndex: 'receivedAt',
+              key: 'receivedAt',
+              width: 170,
+              render: (val: string) => (val ? new Date(val).toLocaleString() : '-'),
+            },
+            {
+              title: '来源活动',
+              dataIndex: 'sourceName',
+              key: 'sourceName',
+              width: 140,
+              render: (val: string) => <Tag color={val.includes('转盘') ? 'orange' : 'cyan'}>{val}</Tag>,
+            },
+            {
+              title: '获得奖品',
+              dataIndex: 'prizeName',
+              key: 'prizeName',
+              render: (val: string) => (
+                <Typography.Text strong style={{ color: '#d46b08' }}>
+                  {val}
+                </Typography.Text>
+              ),
+            },
+          ]}
+        />
+      </Modal>
+
     </Space>
   );
 }

@@ -7,6 +7,8 @@ import {
   runAccountMemberDaily,
   getGameRankList,
   loadFruitHarvestHistory,
+  loadMemberRewardHistory,
+  testHttpProxyConnection,
   redeemMathGamePoints,
   runAccountAllDaily,
   runAccountFruitDaily,
@@ -189,6 +191,64 @@ gamesRouter.post("/member/daily", async (req, res, next) => {
     const logs: any[] = [];
     const success = await runAccountMemberDaily(accountId, logs);
     ok(res, { success, logs });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/accounts/:id/games/member/rewards
+gamesRouter.get("/member/rewards", async (req, res, next) => {
+  try {
+    const accountId = Number((req.params as any).id || req.query.account_id);
+    const history = loadMemberRewardHistory(accountId ? Number(accountId) : undefined);
+    ok(res, history);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/games/proxy/test
+gamesRouter.post("/proxy/test", async (req, res, next) => {
+  try {
+    let extractUrl = req.body?.extract_url ? String(req.body.extract_url).trim() : "";
+    if (!extractUrl) {
+      const s = await prisma.setting.findFirst({
+        where: { key: { in: ["game_proxy_extract_url", "game_proxy_pool_url"] } }
+      });
+      extractUrl = s?.value?.trim() || "";
+    }
+    if (!extractUrl) {
+      throw new AppError("请先在输入框或系统设置中提供代理提取 URL", 400, 400);
+    }
+    const extractRes = await fetch(extractUrl, { signal: AbortSignal.timeout(8000) });
+    const text = (await extractRes.text()).trim();
+    const match = text.match(/(\d+\.\d+\.\d+\.\d+):(\d+)/);
+    if (!match) {
+      return ok(res, {
+        success: false,
+        message: `未能从提取链接解析出 IP:端口，响应内容: ${text.slice(0, 150)}`
+      });
+    }
+    const host = match[1] || "";
+    const port = Number(match[2] || 0);
+    const start = Date.now();
+    try {
+      const probe = await testHttpProxyConnection("http://dt-apigatewayv2.dt-pn1.com/game/point/redeemInfo", host, port);
+      const latency = Date.now() - start;
+      return ok(res, {
+        success: true,
+        proxy: `${host}:${port}`,
+        latency_ms: latency,
+        status: probe.status,
+        message: `代理连接测试成功 (耗时: ${latency}ms, 状态码: ${probe.status})`
+      });
+    } catch (testErr) {
+      return ok(res, {
+        success: false,
+        proxy: `${host}:${port}`,
+        message: `提取到代理 ${host}:${port}，但连接网关测试超时或失败: ${testErr instanceof Error ? testErr.message : String(testErr)}`
+      });
+    }
   } catch (error) {
     next(error);
   }

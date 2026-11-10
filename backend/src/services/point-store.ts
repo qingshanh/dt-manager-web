@@ -46,7 +46,7 @@ export type AccountPointStore = {
 
 export async function getAccountPointStore(accountId: number): Promise<AccountPointStore> {
   const account = await getAccountWithSnapshot(accountId);
-  const pointUid = resolvePointUid(account);
+  const pointUid = await resolvePointUid(account);
   const [userInfoResponse, storeResponse] = await Promise.all([
     fetchPublicJson(`/point/userinfo?uid=${encodeURIComponent(pointUid)}&zone=800`),
     fetchPublicJson(`/pointstore/entrance?uid=${encodeURIComponent(pointUid)}&lang=cn&osType=2`)
@@ -239,7 +239,7 @@ export async function refreshAccountPointStoreOrder(accountId: number, orderId: 
   if (!found.remoteOrderId) {
     return found;
   }
-  const pointUid = resolvePointUid(account);
+  const pointUid = await resolvePointUid(account);
   const response = await fetchPublicJson(
     `/pointstore/order/info?orderId=${encodeURIComponent(found.remoteOrderId)}&uid=${encodeURIComponent(pointUid)}`
   );
@@ -280,7 +280,7 @@ export async function refreshAccountPointStoreOrder(accountId: number, orderId: 
 
 export async function syncAndListAccountPointStoreOrders(accountId: number) {
   const account = await getAccountWithSnapshot(accountId);
-  const pointUid = safelyResolvePointStoreHistoryUid(() => resolvePointUid(account));
+  const pointUid = (await resolvePointUid(account).catch(() => null)) ?? safelyResolvePointStoreHistoryUid(() => null as any);
   const fallbackEmail = normalizeOptionalString(account.email ?? account.snapshot?.email) ?? "";
   return synchronizePointStoreOrderHistory(
     { accountId, pointUid, fallbackEmail },
@@ -349,7 +349,7 @@ async function getAccountWithSnapshot(accountId: number) {
   );
 }
 
-function resolvePointUid(account: DtAccount & { snapshot: AccountSnapshot | null }) {
+async function resolvePointUid(account: DtAccount & { snapshot: AccountSnapshot | null }): Promise<string> {
   const raw = parseJsonRecord(account.snapshot?.rawJson);
   const candidates = [
     readPathString(raw, ["point", "uid"]),
@@ -361,7 +361,20 @@ function resolvePointUid(account: DtAccount & { snapshot: AccountSnapshot | null
     readPathString(raw, ["pointExtras", "context", "pointUid"]),
     readPathString(raw, ["context", "pointUid"])
   ];
-  const pointUid = candidates.find((value) => Boolean(value));
+  let pointUid = candidates.find((value) => Boolean(value));
+  if (!pointUid && account.dtUserId) {
+    const gameAppId = account.appVariant === "dingdong" ? 66 : 67;
+    const summaryRes = await fetchPublicJson(
+      `/point/summary?userId=${encodeURIComponent(account.dtUserId)}&appId=${gameAppId}&TrackCode=${Date.now()}`
+    ).catch(() => null);
+    pointUid = readPathString(summaryRes ?? {}, ["data", "uid"]) || readPathString(summaryRes ?? {}, ["uid"]);
+    if (!pointUid) {
+      const gameRes = await fetchPublicJson(
+        `/game/homePage?userId=${encodeURIComponent(account.dtUserId)}&appId=${gameAppId}&zone=-800&timeStamp=${Date.now()}`
+      ).catch(() => null);
+      pointUid = readPathString(gameRes ?? {}, ["data", "uid"]) || readPathString(gameRes ?? {}, ["uid"]);
+    }
+  }
   if (!pointUid) {
     throw new AppError("当前账户缺少积分系统 uid，请先刷新账户或从已登录 App 导入一次会话。", 400, 400);
   }

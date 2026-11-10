@@ -689,6 +689,14 @@ export async function mockMessage(account_id: number, content: string, from_numb
 
 // ── 游戏与宠物福利 ──
 
+export interface MemberRewardRecord {
+  accountId: number;
+  source: 'roulette' | 'checkin';
+  sourceName: string;
+  prizeName: string;
+  receivedAt: string;
+}
+
 export interface FruitHarvestRecord {
   accountId: number;
   fruitId: number;
@@ -776,6 +784,15 @@ export interface AccountGameSummary {
       stock: number;
     }>;
   } | null;
+  member?: {
+    validTimes: number;
+    addTimes: number;
+    maxAddTimes: number;
+    adRouletteRemainTimes: number;
+    adRouletteAddedTimes: number;
+    lastReward: string | null;
+    history: MemberRewardRecord[];
+  } | null;
 }
 
 export interface GameTaskLog {
@@ -848,5 +865,29 @@ export async function runAccountMemberDaily(accountId: number): Promise<{ succes
 
 export async function getGameSchedulerStatus(): Promise<{ running: boolean; isNightQuiet: boolean; lastCycleAt: string | null; completedTodayCount: number }> {
   const res = await api.get<ApiResponse<{ running: boolean; isNightQuiet: boolean; lastCycleAt: string | null; completedTodayCount: number }>>('/games/scheduler/status');
+  return res.data.data;
+}
+
+
+export async function getMemberRewardsHistory(accountId?: number): Promise<MemberRewardRecord[]> {
+  const url = accountId ? `/accounts/${accountId}/games/member/rewards` : `/games/member/rewards`;
+  const res = await api.get<ApiResponse<MemberRewardRecord[]>>(url);
+  return res.data.data;
+}
+
+export async function testGameProxy(extractUrl?: string): Promise<{
+  success: boolean;
+  proxy?: string;
+  latency_ms?: number;
+  status?: number;
+  message: string;
+}> {
+  const res = await api.post<ApiResponse<{
+    success: boolean;
+    proxy?: string;
+    latency_ms?: number;
+    status?: number;
+    message: string;
+  }>>('/games/proxy/test', { extract_url: extractUrl });
   return res.data.data;
 }

@@ -64,7 +64,10 @@ const defaultSettings = [
   ["account_monitor_restore_enabled", "true", "Restore SMS monitors automatically when the backend starts"],
   ["max_retry_count", String(config.DEFAULT_MAX_RETRY_COUNT), "Maximum retry count"],
   ["monitor_restore_delay", String(config.DEFAULT_MONITOR_RESTORE_DELAY), "Delay in seconds between restoring account monitors after backend startup"],
-  ["log_level", config.LOG_LEVEL, "Log level"]
+  ["log_level", config.LOG_LEVEL, "Log level"],
+  ["game_xiequ_whitelist_ukey", "", "携趣代理添加白名单 ukey（如 YOUR_XIEQU_UKEY）"],
+  ["game_xiequ_whitelist_uid", "105900", "携趣代理用户 uid（如 105900）"],
+  ["game_proxy_extract_url", "", "代理 IP 提取 API 链接（携趣提取 URL 或 89 免费代理提取 URL）"]
 ] as const;
 
 const runtimeSettings = [

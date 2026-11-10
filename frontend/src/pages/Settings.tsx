@@ -19,8 +19,8 @@ import {
   Typography,
   theme as antdTheme,
 } from 'antd';
-import { ApiOutlined, CloudServerOutlined, ReloadOutlined, RobotOutlined } from '@ant-design/icons';
-import { CACHE_TTL_MS, cacheKeys, getSettings, getVersionInfo, isCachedDataFresh, readCachedData, testTelegram, updateSettings } from '../services/endpoints';
+import { ApiOutlined, CloudServerOutlined, GlobalOutlined, ReloadOutlined, RobotOutlined, RocketOutlined } from '@ant-design/icons';
+import { CACHE_TTL_MS, cacheKeys, getSettings, getVersionInfo, isCachedDataFresh, readCachedData, testTelegram, updateSettings, addXiequWhitelist, testGameProxy } from '../services/endpoints';
 import type { SettingItem, VersionInfo } from '../types';
 
 type GatewayMode = 'mock' | 'real' | 'bridge' | 'direct';
@@ -82,6 +82,9 @@ export default function Settings() {
   const [telegramForm] = Form.useForm();
   const [serverForm] = Form.useForm();
   const [generalForm] = Form.useForm();
+  const [gameProxyForm] = Form.useForm();
+  const [testingWhitelist, setTestingWhitelist] = useState(false);
+  const [testingProxy, setTestingProxy] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -165,6 +168,40 @@ export default function Settings() {
       setTesting(false);
     }
   };
+  const handleWhitelistTest = async () => {
+    setTestingWhitelist(true);
+    try {
+      const ukey = gameProxyForm.getFieldValue('game_xiequ_whitelist_ukey');
+      const res = await addXiequWhitelist(ukey);
+      if (res.success) {
+        message.success(`当前服务器公网 IP (${res.ip}) 已成功添加至携趣白名单！`);
+      } else {
+        message.info(`白名单响应: ${res.message} (IP: ${res.ip})`);
+      }
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '添加携趣白名单失败');
+    } finally {
+      setTestingWhitelist(false);
+    }
+  };
+
+  const handleProxyTest = async () => {
+    setTestingProxy(true);
+    try {
+      const extractUrl = gameProxyForm.getFieldValue('game_proxy_extract_url');
+      const res = await testGameProxy(extractUrl);
+      if (res.success) {
+        message.success(res.message);
+      } else {
+        message.warning(res.message);
+      }
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '代理测试失败');
+    } finally {
+      setTestingProxy(false);
+    }
+  };
+
 
   const settingsMap = useMemo(() => toMap(items), [items]);
   const filteredVersions = useMemo(() => {
@@ -500,6 +537,75 @@ export default function Settings() {
               </Card>
             ),
           },
+          {
+            key: 'game_proxy',
+            label: (
+              <span>
+                <RocketOutlined /> 游戏与代理配置
+              </span>
+            ),
+            children: (
+              <Card loading={loading}>
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message="游戏福利与自动助力代理配置"
+                  description="支持配置携趣代理白名单 ukey、用户 UID 以及动态代理提取 API（如携趣或 89 免费代理提取链接）。所有凭据仅保存在本地数据库中，绝不上报或提交至远端代码仓库。"
+                />
+                <Form
+                  form={gameProxyForm}
+                  layout="vertical"
+                  onFinish={(values) => handleSave(values as Record<string, string | number | boolean>)}
+                >
+                  <Form.Item
+                    label="携趣代理白名单 ukey"
+                    name="game_xiequ_whitelist_ukey"
+                    help="用于自动将当前服务器公网 IP 添加到携趣白名单（例如：YOUR_XIEQU_UKEY）。"
+                  >
+                    <Input.Password placeholder="输入携趣加白名单 ukey" />
+                  </Form.Item>
+
+                  <Form.Item
+                    label="携趣代理用户 UID"
+                    name="game_xiequ_whitelist_uid"
+                    help="携趣账号的用户编号，默认为 105900。"
+                  >
+                    <Input placeholder="105900" />
+                  </Form.Item>
+
+                  <Form.Item
+                    label="代理 IP 提取 API 链接 (携趣 / 89 代理等)"
+                    name="game_proxy_extract_url"
+                    help="用于算术挑战自动换 IP 助力的代理提取链接，返回格式需包含 ip:port。例如携趣提取 API 或 89 免费代理 API。"
+                  >
+                    <Input.TextArea rows={2} placeholder="http://api.xiequ.cn/VAD/GetIp.aspx?act=get&uid=... 或 https://www.89ip.cn/tqdl.html?num=1..." />
+                  </Form.Item>
+
+                  <Space wrap size={12}>
+                    <Button type="primary" htmlType="submit" loading={saving}>
+                      保存设置
+                    </Button>
+                    <Button
+                      icon={<GlobalOutlined />}
+                      loading={testingWhitelist}
+                      onClick={handleWhitelistTest}
+                    >
+                      一键加白当前 IP 到携趣
+                    </Button>
+                    <Button
+                      icon={<ApiOutlined />}
+                      loading={testingProxy}
+                      onClick={handleProxyTest}
+                    >
+                      测试代理提取与网关连通性
+                    </Button>
+                  </Space>
+                </Form>
+              </Card>
+            ),
+          },
+
           {
             key: 'about',
             label: '关于',

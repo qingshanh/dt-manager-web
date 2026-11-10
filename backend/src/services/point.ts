@@ -35,22 +35,35 @@ export type AccountPointData = {
   };
 };
 
-export async function getAccountPoint(accountId: number): Promise<AccountPointData> {
+export async function getAccountPoint(accountId: number) {
   const account = await getAccountWithSnapshot(accountId);
   const raw = parseJsonRecord(account.snapshot?.rawJson);
-  const pointUid = resolveOptionalPointUid(raw);
   const userId = resolvePointUserId(account, raw);
   const appType = account.appVariant === "dingdong" ? 0 : 3;
   const gameAppId = account.appVariant === "dingdong" ? 66 : 67;
 
-  const [userInfoResponse, gradeInfoResponse, gameHomePageResponse] = await Promise.all([
+  let gameHomePageResponse: JsonRecord | null = null;
+  if (userId) {
+    gameHomePageResponse = await fetchPublicJson(
+      `/game/homePage?userId=${encodeURIComponent(userId)}&appId=${gameAppId}&zone=-800&timeStamp=${Date.now()}`
+    ).catch(() => null);
+  }
+
+  let autoDiscoveredUid: string | null = null;
+  if (!resolveOptionalPointUid(raw) && userId) {
+    autoDiscoveredUid = readPathString(gameHomePageResponse ?? {}, ["data", "uid"]) || readPathString(gameHomePageResponse ?? {}, ["uid"]);
+    if (!autoDiscoveredUid) {
+      const summaryRes = await fetchPublicJson(
+        `/point/summary?userId=${encodeURIComponent(userId)}&appId=${gameAppId}&TrackCode=${Date.now()}`
+      ).catch(() => null);
+      autoDiscoveredUid = readPathString(summaryRes ?? {}, ["data", "uid"]) || readPathString(summaryRes ?? {}, ["uid"]) || null;
+    }
+  }
+  const pointUid = resolveOptionalPointUid(raw) || autoDiscoveredUid;
+
+  const [userInfoResponse, gradeInfoResponse] = await Promise.all([
     pointUid ? fetchPublicJson(`/point/userinfo?uid=${encodeURIComponent(pointUid)}&zone=800`).catch(() => null) : Promise.resolve(null),
-    pointUid ? fetchPublicJson(`/point/gradeinfo?uid=${encodeURIComponent(pointUid)}`).catch(() => null) : Promise.resolve(null),
-    userId
-      ? fetchPublicJson(
-          `/game/homePage?userId=${encodeURIComponent(userId)}&appId=${gameAppId}&zone=-800&timeStamp=${Date.now()}`
-        ).catch(() => null)
-      : Promise.resolve(null)
+    pointUid ? fetchPublicJson(`/point/gradeinfo?uid=${encodeURIComponent(pointUid)}`).catch(() => null) : Promise.resolve(null)
   ]);
 
   const userInfo = unwrapData(userInfoResponse);

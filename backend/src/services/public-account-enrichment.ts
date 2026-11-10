@@ -47,7 +47,6 @@ export async function enrichSnapshotWithPublicData(input: PublicAccountEnrichmen
     readPathString(previousRaw, ["pointExtras", "context", "pointUid"]),
     readPathString(previousRaw, ["context", "pointUid"])
   ]);
-  const pointUid = currentPointUid ?? previousPointUid;
   const pointUserId = pickFirstString([
     readPathString(currentRaw, ["pointExtras", "dtUserId"]),
     readPathString(currentRaw, ["pointExtras", "context", "dtUserId"]),
@@ -59,6 +58,14 @@ export async function enrichSnapshotWithPublicData(input: PublicAccountEnrichmen
   ]);
   const appType = input.appVariant === "dingdong" ? 0 : 3;
   const gameAppId = input.appVariant === "dingdong" ? 66 : 67;
+
+  let pointUid = currentPointUid ?? previousPointUid;
+  if (!pointUid && pointUserId) {
+    const summaryRes = await fetchPublicJson(
+      `/point/summary?userId=${encodeURIComponent(pointUserId)}&appId=${gameAppId}&TrackCode=${Date.now()}`
+    ).catch(() => null);
+    pointUid = readPathString(summaryRes ?? {}, ["data", "uid"]) || readPathString(summaryRes ?? {}, ["uid"]) || null;
+  }
 
   const rawPointGradeInfo =
     readPathRecord(currentRaw, ["point", "gradeInfo"]) ??

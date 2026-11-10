@@ -104,6 +104,15 @@ export interface AccountGameSummary {
       stock: number;
     }>;
   } | null;
+  member?: {
+    validTimes: number;
+    addTimes: number;
+    maxAddTimes: number;
+    adRouletteRemainTimes: number;
+    adRouletteAddedTimes: number;
+    lastReward: string | null;
+    history: MemberRewardRecord[];
+  } | null;
 }
 
 export interface GameTaskLog {
@@ -384,6 +393,36 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
     };
   }
 
+  // Member
+  let memberData: AccountGameSummary["member"] = null;
+  const memberHistory = loadMemberRewardHistory(accountId);
+  let validTimes = 0;
+  let addTimes = 0;
+  let maxAddTimes = 1;
+
+  if (ctx.pointUid) {
+    try {
+      const timesRes = await requestGameJson(`/point/checkin/times?uid=${ctx.pointUid}`).catch(() => null);
+      if (timesRes?.Result === 1 && timesRes.data) {
+        validTimes = timesRes.data.validTimes ?? 0;
+        addTimes = timesRes.data.addTimes ?? 0;
+        maxAddTimes = timesRes.data.maxAddTimes ?? 1;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  memberData = {
+    validTimes,
+    addTimes,
+    maxAddTimes,
+    adRouletteRemainTimes: 0,
+    adRouletteAddedTimes: 0,
+    lastReward: memberHistory[0]?.prizeName ?? null,
+    history: memberHistory
+  };
+
   return {
     accountId,
     dtUserId: ctx.dtUserId,
@@ -394,7 +433,8 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
     pet: petData,
     fruit: fruitData,
     knife: knifeData,
-    mathGame: mathGameData
+    mathGame: mathGameData,
+    member: memberData
   };
 }
 
@@ -800,10 +840,10 @@ export async function runAccountShareBoost(accountId: number, maxBoosts = 10): P
 
   // Fetch proxy settings
   const settings = await prisma.setting.findMany({
-    where: { key: { in: ["game_proxy_pool_url", "dt_proxy_url"] } }
+    where: { key: { in: ["game_proxy_extract_url", "game_proxy_pool_url", "dt_proxy_url"] } }
   });
   const settingsMap = Object.fromEntries(settings.map((s) => [s.key, s.value]));
-  const proxyPoolUrl = settingsMap.game_proxy_pool_url?.trim() || "";
+  const proxyPoolUrl = settingsMap.game_proxy_extract_url?.trim() || settingsMap.game_proxy_pool_url?.trim() || "";
 
   let successCount = 0;
   if (!proxyPoolUrl) {
@@ -881,6 +921,44 @@ function evalMathNumber(fnStr: string): number {
 }
 
 // ── Persistent Fruit Harvest History ──
+export interface MemberRewardRecord {
+  accountId: number;
+  source: 'roulette' | 'checkin';
+  sourceName: string;
+  prizeName: string;
+  receivedAt: string;
+}
+
+const MEMBER_REWARDS_FILE_PATH = path.resolve(process.cwd(), "_tmp/runtime/member_rewards.json");
+
+export function loadMemberRewardHistory(accountId?: number): MemberRewardRecord[] {
+  try {
+    ensureHarvestDir();
+    if (!fs.existsSync(MEMBER_REWARDS_FILE_PATH)) {
+      return [];
+    }
+    const raw = fs.readFileSync(MEMBER_REWARDS_FILE_PATH, "utf8");
+    const all = JSON.parse(raw) as MemberRewardRecord[];
+    if (accountId !== undefined) {
+      return all.filter((r) => r.accountId === accountId);
+    }
+    return all;
+  } catch {
+    return [];
+  }
+}
+
+export function saveMemberRewardRecord(record: MemberRewardRecord) {
+  try {
+    ensureHarvestDir();
+    const existing = loadMemberRewardHistory();
+    existing.unshift(record);
+    fs.writeFileSync(MEMBER_REWARDS_FILE_PATH, JSON.stringify(existing.slice(0, 300), null, 2), "utf8");
+  } catch (err) {
+    logger.warn("Failed to persist member reward record", { error: String(err) });
+  }
+}
+
 const HARVEST_FILE_PATH = path.resolve(process.cwd(), "_tmp/runtime/fruit_harvests.json");
 
 function ensureHarvestDir() {
@@ -1091,7 +1169,15 @@ export async function runAccountMemberDaily(accountId: number, logs: GameTaskLog
             `/web/ad/roulette/reward?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}&timeZone=Asia%2FShanghai&isoCC=US`
           ).catch(() => null);
           if (lotRes?.Result === 1 && lotRes.data?.prizeName) {
-            logs.push(formatLog("checkin", "success", `好运抽奖获得: ${lotRes.data.prizeName}`));
+            const prize = lotRes.data.prizeName;
+            logs.push(formatLog("checkin", "success", `好运抽奖获得: ${prize}`));
+            saveMemberRewardRecord({
+              accountId,
+              source: "roulette",
+              sourceName: "每日好运转盘",
+              prizeName: prize,
+              receivedAt: new Date().toISOString()
+            });
             success = true;
           }
           await delay(1200);
@@ -1114,7 +1200,15 @@ export async function runAccountMemberDaily(accountId: number, logs: GameTaskLog
             await requestGameJson(`/point/checkin/addtimes?uid=${ctx.pointUid}`).catch(() => null);
             const claim = await requestGameJson(`/point/checkin/reward?uid=${ctx.pointUid}`).catch(() => null);
             if (claim?.Result === 1 && claim.data?.prizeName) {
-              logs.push(formatLog("checkin", "success", `每日签到领奖: ${claim.data.prizeName}`));
+              const prize = claim.data.prizeName;
+              logs.push(formatLog("checkin", "success", `每日签到领奖: ${prize}`));
+              saveMemberRewardRecord({
+                accountId,
+                source: "checkin",
+                sourceName: "每日签到",
+                prizeName: prize,
+                receivedAt: new Date().toISOString()
+              });
               success = true;
             }
             await delay(1200);
@@ -1136,7 +1230,18 @@ export async function runAccountMemberDaily(accountId: number, logs: GameTaskLog
 }
 
 // ── Xiequ Whitelist & Proxy Tester ──
-export async function addXiequWhitelist(ukey = "D87227D05A9A43BCB34204FFFA3FDC18"): Promise<{ success: boolean; ip: string; message: string }> {
+export async function addXiequWhitelist(customUkey?: string): Promise<{ success: boolean; ip: string; message: string }> {
+  let ukey = customUkey?.trim();
+  if (!ukey) {
+    const setting = await prisma.setting.findUnique({
+      where: { key: "game_xiequ_whitelist_ukey" }
+    });
+    ukey = setting?.value?.trim() || "";
+  }
+  if (!ukey) {
+    throw new AppError("未配置携趣加白名单 ukey，请先在系统设置中配置。", 400, 400);
+  }
+
   let myIp = "";
   try {
     const res = await fetch("https://api.ipify.org?format=json", { signal: AbortSignal.timeout(5000) });

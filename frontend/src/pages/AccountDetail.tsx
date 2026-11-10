@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   App,
-  Alert,
   Button,
   Card,
   Col,
@@ -58,7 +57,6 @@ import {
   readCachedData,
   pausePhoneNumber,
   previewPhoneNumbers,
-  probeAccessCode,
   purchasePhoneNumber,
   readAllMessages,
   refreshAccount,
@@ -76,11 +74,6 @@ import {
 } from '../services/endpoints';
 import type {
   DtAccountDetail,
-  AccessCodeProbeCall,
-  AccessCodeProbeCapability,
-  AccessCodeProbeDryRunCapability,
-  AccessCodeProbeDryRunResult,
-  AccessCodeProbeResult,
   Message,
   PagedData,
   PhoneCountryOption,
@@ -120,13 +113,6 @@ type SnapshotExtras = {
   membershipBenefits: Array<{ code: string; name: string; price: number | null }>;
 };
 
-type AccessCodeProbeFormValues = {
-  kind: 'email' | 'phone';
-  target: string;
-  countryCode: number;
-  accessCode: string;
-  dryRun: boolean;
-};
 
 const LOCAL_MESSAGE_POLL_MS = 30_000;
 const PHONE_AUTO_SYNC_MAX_AGE_MS = 15 * 60 * 1000;
@@ -776,139 +762,16 @@ function phoneSmsDeliveryTag(diagnostic?: PhoneSmsReceptionDiagnostic) {
   );
 }
 
-function inferAccessCodeCountryCode(target: string) {
-  const digits = target.replace(/\D/g, '');
-  if (!digits) {
-    return 1;
-  }
-  const countryCodes = [
-    1787, 420, 230, 886, 852, 86, 82, 81, 65, 62, 61, 60, 48, 46, 45, 44, 43, 40, 34, 33, 32, 31, 7, 1,
-  ];
-  const matched = countryCodes.find((countryCode) => digits.startsWith(String(countryCode)));
-  if (!matched) {
-    return 1;
-  }
-  if (target.trim().startsWith('+')) {
-    return matched;
-  }
-  return looksLikeInternationalPhoneDigits(digits, matched) ? matched : 1;
-}
-
+// 历史逆向调试使用的验证码链路探针说明（UI卡片控件已按需移除以节约页面展示空间）
+// 真实请求会提交 confirm=true 并调用 recoverPassword / verifyAccessCode 接口
 function validateAccessCodeProbeTarget(kind: 'email' | 'phone', target: string) {
   const trimmed = target.trim();
-  if (!trimmed) {
-    return kind === 'phone' ? '请输入手机号' : '请输入邮箱';
-  }
-  if (kind === 'email') {
-    return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(trimmed) ? null : '请输入有效邮箱';
-  }
+  if (!trimmed) return kind === 'phone' ? '请输入手机号' : '请输入邮箱';
+  if (kind === 'email') return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(trimmed) ? null : '请输入有效邮箱';
   const digits = trimmed.replace(/\D/g, '');
   return digits.length >= 7 && digits.length <= 15 ? null : '请输入 7-15 位手机号数字';
 }
-
-function looksLikeInternationalPhoneDigits(digits: string, countryCode: number) {
-  if (countryCode === 1) {
-    return digits.length >= 11;
-  }
-  const countryLength = String(countryCode).length;
-  const localLength = digits.length - countryLength;
-  if (countryLength >= 4) {
-    return localLength >= 7;
-  }
-  if (countryLength >= 3) {
-    return localLength >= 7;
-  }
-  return localLength >= 9;
-}
-
-function AccessCodeProbeFormContent({
-  initialValues,
-  accountEmail,
-  accountPhone,
-  onChange,
-}: {
-  initialValues: AccessCodeProbeFormValues;
-  accountEmail?: string | null;
-  accountPhone?: string | null;
-  onChange: (values: AccessCodeProbeFormValues) => void;
-}) {
-  const [values, setValues] = useState(initialValues);
-
-  const updateValues = (next: AccessCodeProbeFormValues) => {
-    setValues(next);
-    onChange(next);
-  };
-
-  return (
-    <Space direction="vertical" style={{ width: '100%' }}>
-      <div style={{ color: '#666' }}>
-        默认只预览 recoverPassword / verifyAccessCode 参数，不会联网。
-      </div>
-      {!values.dryRun && (
-        <Alert
-          type="warning"
-          showIcon
-          message="真实请求会提交 confirm=true，并复用当前直连会话请求验证码接口，可能触发验证码短信。"
-        />
-      )}
-      <Switch
-        checkedChildren="dry-run"
-        unCheckedChildren="真实请求"
-        checked={values.dryRun}
-        onChange={(checked) => {
-          updateValues({ ...values, dryRun: checked });
-        }}
-      />
-      <Select
-        value={values.kind}
-        style={{ width: '100%' }}
-        options={[
-          { value: 'phone', label: '手机号' },
-          { value: 'email', label: '邮箱' },
-        ]}
-        onChange={(kind) => {
-          const target = kind === 'email' ? accountEmail ?? values.target : accountPhone ?? values.target;
-          updateValues({
-            ...values,
-            kind,
-            target,
-            countryCode: kind === 'phone' ? inferAccessCodeCountryCode(target) : 1,
-          });
-        }}
-      />
-      <Input
-        value={values.target}
-        placeholder="手机号或邮箱"
-        onChange={(event) => {
-          const target = event.target.value;
-          updateValues({
-            ...values,
-            target,
-            countryCode: values.kind === 'phone' ? inferAccessCodeCountryCode(target) : values.countryCode,
-          });
-        }}
-      />
-      <InputNumber
-        value={values.countryCode}
-        min={1}
-        precision={0}
-        style={{ width: '100%' }}
-        placeholder="手机号国家码，例如 1、86、33"
-        disabled={values.kind === 'email'}
-        onChange={(value) => {
-          updateValues({ ...values, countryCode: typeof value === 'number' && value > 0 ? value : 1 });
-        }}
-      />
-      <Input
-        value={values.accessCode}
-        placeholder="可选：收到的验证码。留空则只追踪发码请求"
-        onChange={(event) => {
-          updateValues({ ...values, accessCode: event.target.value });
-        }}
-      />
-    </Space>
-  );
-}
+void validateAccessCodeProbeTarget;
 
 function normalizePreview(preview: PhonePurchasePreview) {
   return preview.candidates.length > 0 ? preview : parsePhonePurchasePreview(preview.raw_json);
@@ -1059,37 +922,6 @@ function formatOfflineTemplateDiagnostic(item: NonNullable<NonNullable<RefreshMe
   return `offline catch-up not attempted${listen}`;
 }
 
-function formatProbeCall(call: AccessCodeProbeCall | null) {
-  if (!call) {
-    return '未执行';
-  }
-  if (!call.ok) {
-    return `失败 / ${call.duration_ms}ms / ${call.error || '无错误详情'}`;
-  }
-  return `成功 / ${call.duration_ms}ms`;
-}
-
-function formatProbePayload(call: AccessCodeProbeCall | null) {
-  if (!call?.payload) {
-    return '-';
-  }
-  return JSON.stringify(call.payload, null, 2);
-}
-
-function formatProbeCapability(capability: AccessCodeProbeCapability | AccessCodeProbeDryRunCapability | undefined) {
-  if (!capability) {
-    return '未知';
-  }
-  const loginCompleted =
-    'login_token_completed' in capability ? capability.login_token_completed : capability.loginTokenCompleted;
-  const verifiedCalls = 'verified_calls' in capability ? capability.verified_calls : capability.verifiedCalls;
-  const modeLabel = capability.mode === 'probe_only' ? '仅链路探针' : capability.mode;
-  return `${modeLabel} / ${verifiedCalls.join(', ')} / login token ${loginCompleted ? '已完成' : '未完成'}`;
-}
-
-function isAccessCodeDryRun(value: AccessCodeProbeResult | AccessCodeProbeDryRunResult): value is AccessCodeProbeDryRunResult {
-  return 'dry_run' in value && value.dry_run === true;
-}
 
 function getPhoneRemark(phone: PhoneNumber) {
   return phone.display_name || '-';
@@ -1926,116 +1758,6 @@ export default function AccountDetail() {
       message.error(err instanceof Error ? err.message : '操作失败');
     }
   };
-
-  const showAccessCodeProbeResult = (result: AccessCodeProbeResult | AccessCodeProbeDryRunResult) => {
-    if (isAccessCodeDryRun(result)) {
-      modal.info({
-        title: '验证码链路参数预览',
-        width: 720,
-        content: (
-          <Space direction="vertical" style={{ width: '100%' }}>
-            <Descriptions bordered column={1} size="small">
-              <Descriptions.Item label="能力边界">{formatProbeCapability(result.capability)}</Descriptions.Item>
-              <Descriptions.Item label="目标">{result.kind === 'phone' ? '手机号' : '邮箱'} / {result.target}</Descriptions.Item>
-              <Descriptions.Item label="国家码">{result.kind === 'phone' ? result.countryCode : '-'}</Descriptions.Item>
-              <Descriptions.Item label="recoverPassword">{result.recoverPassword.query}</Descriptions.Item>
-              <Descriptions.Item label="verifyAccessCode">{result.verifyAccessCode?.query ?? '未填写验证码，跳过'}</Descriptions.Item>
-            </Descriptions>
-            <div style={{ color: '#666' }}>
-              此追踪只验证 recoverPassword / verifyAccessCode 链路，不代表首次登录 token 已完成。
-            </div>
-            <Card size="small" title="recoverPassword params">
-              <pre style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{JSON.stringify(result.recoverPassword.params, null, 2)}</pre>
-            </Card>
-            {result.verifyAccessCode ? (
-              <Card size="small" title="verifyAccessCode params">
-                <pre style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{JSON.stringify(result.verifyAccessCode.params, null, 2)}</pre>
-              </Card>
-            ) : null}
-          </Space>
-        ),
-      });
-      return;
-    }
-
-    modal.info({
-      title: '验证码链路追踪结果',
-      width: 720,
-      content: (
-        <Space direction="vertical" style={{ width: '100%' }}>
-          <Descriptions bordered column={1} size="small">
-            <Descriptions.Item label="能力边界">{formatProbeCapability(result.capability)}</Descriptions.Item>
-            <Descriptions.Item label="目标">{result.kind === 'phone' ? '手机号' : '邮箱'} / {result.target}</Descriptions.Item>
-            <Descriptions.Item label="直连主机">{result.host}</Descriptions.Item>
-            <Descriptions.Item label="recoverPassword">{formatProbeCall(result.recover_password)}</Descriptions.Item>
-            <Descriptions.Item label="verifyAccessCode">{formatProbeCall(result.verify_access_code)}</Descriptions.Item>
-            <Descriptions.Item label="帧数量">{result.trace.length}</Descriptions.Item>
-          </Descriptions>
-          <div style={{ color: '#666' }}>
-            此追踪只验证 recoverPassword / verifyAccessCode 链路，不代表首次登录 token 已完成。
-          </div>
-          <Card size="small" title="recoverPassword payload">
-            <pre style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{formatProbePayload(result.recover_password)}</pre>
-          </Card>
-          {result.verify_access_code ? (
-            <Card size="small" title="verifyAccessCode payload">
-              <pre style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{formatProbePayload(result.verify_access_code)}</pre>
-            </Card>
-          ) : null}
-        </Space>
-      ),
-    });
-  };
-
-  const handleProbeAccessCode = () => {
-    const defaultKind = account?.login_type === 'email_code' || account?.login_type === 'email_password' ? 'email' : 'phone';
-    const defaultTarget = defaultKind === 'email' ? account?.email ?? '' : account?.phone ?? '';
-    let probeFormValues: AccessCodeProbeFormValues = {
-      kind: defaultKind,
-      target: defaultTarget,
-      countryCode: defaultKind === 'phone' ? inferAccessCodeCountryCode(defaultTarget) : 1,
-      accessCode: '',
-      dryRun: true,
-    };
-
-    modal.confirm({
-      title: '追踪验证码登录链路',
-      width: 560,
-      okText: '开始追踪',
-      cancelText: '取消',
-      content: (
-        <AccessCodeProbeFormContent
-          initialValues={probeFormValues}
-          accountEmail={account?.email}
-          accountPhone={account?.phone}
-          onChange={(values) => {
-            probeFormValues = values;
-          }}
-        />
-      ),
-      onOk: async () => {
-        const targetError = validateAccessCodeProbeTarget(probeFormValues.kind, probeFormValues.target);
-        if (targetError) {
-          message.warning(targetError);
-          return Promise.reject(new Error(targetError));
-        }
-        if (!probeFormValues.dryRun && !account?.dt_user_id) {
-          message.warning('真实请求需要先导入可用的直连会话；请保持 dry-run 只预览参数。');
-          return Promise.reject(new Error('Missing direct session for real request.'));
-        }
-        const result = await probeAccessCode(accountId, {
-          kind: probeFormValues.kind,
-          target: probeFormValues.target.trim() || undefined,
-          country_code: probeFormValues.kind === 'phone' ? probeFormValues.countryCode : undefined,
-          access_code: probeFormValues.accessCode.trim() || undefined,
-          dry_run: probeFormValues.dryRun,
-          confirm: !probeFormValues.dryRun,
-        });
-        showAccessCodeProbeResult(result);
-      },
-    });
-  };
-
   const handleMarkAllRead = async () => {
     try {
       await readAllMessages(accountId);
@@ -2721,17 +2443,6 @@ export default function AccountDetail() {
                   </Descriptions.Item>
                   <Descriptions.Item label="设备 ID">{account?.dt_device_id || '-'}</Descriptions.Item>
                 </Descriptions>
-
-                <Card size="small" title="验证码登录追踪" style={{ marginTop: 16 }}>
-                  <Space direction="vertical">
-                    <div style={{ color: '#666' }}>
-                      默认只预览 recoverPassword / verifyAccessCode 参数；真实请求需要先导入直连会话。
-                    </div>
-                    <Button onClick={handleProbeAccessCode}>
-                      追踪验证码链路
-                    </Button>
-                  </Space>
-                </Card>
 
                 <Card
                   size="small"
