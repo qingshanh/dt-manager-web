@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Alert,
   App,
@@ -9,6 +10,7 @@ import {
   Modal,
   Progress,
   Space,
+  Switch,
   Table,
   Tabs,
   Tag,
@@ -21,7 +23,6 @@ import {
   CopyOutlined,
   InfoCircleOutlined,
   PlayCircleOutlined,
-  GlobalOutlined,
   ReloadOutlined,
   ShareAltOutlined,
   StarOutlined,
@@ -38,9 +39,12 @@ import {
   runAccountKnifeDaily,
   runAllAccountsGameDaily,
   waterAccountFruit,
-  addXiequWhitelist,
   runAccountMemberDaily,
   runAccountMathDaily,
+  getAutoRedeemAmazon,
+  setAutoRedeemAmazon,
+  getAccountPointStore,
+  getGameSchedulerStatus,
   type AccountGameSummary,
   type GameTaskLog,
   type RankLeaderboardItem,
@@ -58,6 +62,11 @@ export default function AccountGameRewards({ accountId }: Props) {
   const [runningAllDaily, setRunningAllDaily] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [logs, setLogs] = useState<GameTaskLog[]>([]);
+  const navigate = useNavigate();
+  const [autoRedeemAmazon, setAutoRedeemAmazonState] = useState(false);
+  const [savingAutoRedeem, setSavingAutoRedeem] = useState(false);
+  const [pointStoreData, setPointStoreData] = useState<any>(null);
+  const [schedulerStatus, setSchedulerStatus] = useState<any>(null);
 
   // Modals state
   const [guideModalOpen, setGuideModalOpen] = useState(false);
@@ -72,6 +81,9 @@ export default function AccountGameRewards({ accountId }: Props) {
     try {
       const summary = await getAccountGameSummary(accountId);
       setData(summary);
+      void getAutoRedeemAmazon(accountId).then((res) => setAutoRedeemAmazonState(res.enabled)).catch(() => {});
+      void getAccountPointStore(accountId).then((res) => setPointStoreData(res)).catch(() => {});
+      void getGameSchedulerStatus().then((res) => setSchedulerStatus(res)).catch(() => {});
     } catch (err) {
       message.error(err instanceof Error ? err.message : '获取游戏与福利数据失败');
     } finally {
@@ -174,6 +186,20 @@ export default function AccountGameRewards({ accountId }: Props) {
   };
 
 
+
+  const handleToggleAutoRedeemAmazon = async (checked: boolean) => {
+    setSavingAutoRedeem(true);
+    try {
+      const res = await setAutoRedeemAmazon(accountId, checked);
+      setAutoRedeemAmazonState(res.enabled);
+      message.success(res.enabled ? '已开启 Amazon Gift Card $5 自动兑换（积分年底到期<=30天时自动触发）' : '已关闭自动兑换');
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '保存设置失败');
+    } finally {
+      setSavingAutoRedeem(false);
+    }
+  };
+
   const handleRunMathDaily = async () => {
     setActionLoading('math');
     try {
@@ -203,22 +229,6 @@ export default function AccountGameRewards({ accountId }: Props) {
       await loadData();
     } catch (err) {
       message.error(err instanceof Error ? err.message : '会员任务执行失败');
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
-  const handleAddWhitelist = async () => {
-    setActionLoading('whitelist');
-    try {
-      const res = await addXiequWhitelist();
-      if (res.success) {
-        message.success(`当前服务器公网 IP (${res.ip}) 已成功添加至携趣白名单！`);
-      } else {
-        message.info(`白名单响应: ${res.message} (IP: ${res.ip})`);
-      }
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : '添加携趣白名单失败');
     } finally {
       setActionLoading(null);
     }
@@ -306,10 +316,13 @@ export default function AccountGameRewards({ accountId }: Props) {
           <Typography.Title level={4} style={{ margin: 0 }}>🎮 游戏与福利自动化中心</Typography.Title>
           <Tag color="cyan">客户端: {data?.appType === 0 ? '叮咚 (0)' : '说道 (3)'}</Tag>
         </Space>
-        <Space wrap>
+        <Space wrap align="center">
+          {schedulerStatus?.nextCycleAt ? (
+            <Tag color="blue" icon={<ClockCircleOutlined />}>
+              下次自动唤醒: {new Date(schedulerStatus.nextCycleAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+            </Tag>
+          ) : null}
           <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void loadData()}>刷新数据</Button>
-          <Button icon={<StarOutlined />} loading={actionLoading === 'member'} onClick={() => void handleRunMemberDaily()}>会员好运/签到</Button>
-          <Button icon={<GlobalOutlined />} loading={actionLoading === 'whitelist'} onClick={() => void handleAddWhitelist()}>加携趣白名单</Button>
           <Button
             icon={<ThunderboltOutlined />}
             loading={runningAllDaily}
@@ -450,10 +463,11 @@ export default function AccountGameRewards({ accountId }: Props) {
               <Button
                 size="small"
                 icon={<ThunderboltOutlined />}
+                disabled={Boolean(fruit?.isDailyWaterLimitReached)}
                 loading={actionLoading === 'water'}
                 onClick={() => void handleWaterFruit()}
               >
-                浇水
+                {fruit?.isDailyWaterLimitReached ? '已达上限' : '浇水'}
               </Button>
             </Space>
           )}
@@ -477,6 +491,8 @@ export default function AccountGameRewards({ accountId }: Props) {
               <Descriptions.Item label="果树状态">
                 {currentFruit && currentFruit.completionRate >= 1 ? (
                   <Tag color="success">已成熟！自动日常可自动收获说道币</Tag>
+                ) : fruit?.isDailyWaterLimitReached ? (
+                  <Tag color="warning">生长期 (今日浇水已达官方上限，次日刷新)</Tag>
                 ) : currentFruit ? (
                   <Tag color="blue">生长期（有水滴将自动浇水）</Tag>
                 ) : (
@@ -742,6 +758,72 @@ export default function AccountGameRewards({ accountId }: Props) {
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 日常自动调度时自动看广告拿满 2 次好运抽奖，自动完成签到领奖，所有中奖均留存本地可追溯！
               </Typography.Text>
+            </Descriptions.Item>
+          </Descriptions>
+        </Card>
+
+        {/* 卡片 6: 会员积分商城与自动兑换 (Point Store & Amazon Auto Redeem) */}
+        <Card
+          title="🎁 积分商城"
+          extra={(
+            <Space size={6}>
+              <Button
+                size="small"
+                type="primary"
+                onClick={() => navigate(`/accounts/${accountId}/point-store`)}
+              >
+                进入商城
+              </Button>
+            </Space>
+          )}
+        >
+          <Descriptions size="small" column={1} bordered>
+            <Descriptions.Item label="积分总览">
+              <Space wrap size={[8, 4]}>
+                <span>可用: <Typography.Text strong style={{ color: '#d46b08', fontSize: 14 }}>{pointStoreData?.valid_point ?? math?.validPoint ?? 0}</Typography.Text></span>
+                <span>历史: <Typography.Text strong>{pointStoreData?.history_point ?? 0}</Typography.Text></span>
+                <span>年底到期: <Typography.Text strong type={expiry?.expireCredit ? 'danger' : undefined}>{expiry?.expireCredit ?? pointStoreData?.expire_point ?? 0}</Typography.Text></span>
+              </Space>
+            </Descriptions.Item>
+
+            <Descriptions.Item label="自动兑换 Amazon $5">
+              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                <Space wrap style={{ justifyContent: 'space-between', width: '100%' }}>
+                  <Typography.Text strong>
+                    自动兑换 Amazon Gift Card $5
+                  </Typography.Text>
+                  <Switch
+                    checked={autoRedeemAmazon}
+                    loading={savingAutoRedeem}
+                    onChange={(checked) => void handleToggleAutoRedeemAmazon(checked)}
+                    checkedChildren="开启"
+                    unCheckedChildren="关闭"
+                  />
+                </Space>
+                <div style={{ fontSize: 12, color: '#666', lineHeight: 1.5 }}>
+                  满足条件自动兑换并电报通知：①开启开关；②积分充足；③当年有到期积分且距离年底 &le; 30天；④商品有货。
+                </div>
+              </Space>
+            </Descriptions.Item>
+
+            <Descriptions.Item label="商城快捷商品">
+              <Space wrap size={6}>
+                {pointStoreData?.products?.map((p: any) => (
+                  <Button
+                    key={p.product_id}
+                    size="small"
+                    disabled={(pointStoreData?.valid_point ?? 0) < (p.price ?? 0)}
+                    onClick={() => navigate(`/accounts/${accountId}/point-store`)}
+                  >
+                    {p.name} ({p.price}分)
+                  </Button>
+                ))}
+                {(!pointStoreData?.products || pointStoreData.products.length === 0) && (
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    包含 Amazon 礼品卡、通话折扣券及各专属权益，点击右上角进入商城
+                  </Typography.Text>
+                )}
+              </Space>
             </Descriptions.Item>
           </Descriptions>
         </Card>

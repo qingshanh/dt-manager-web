@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { prisma } from "../../lib/prisma.js";
+import { checkAndAutoRedeemAmazonGiftCard } from "../point-store.js";
 import { AppError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
 import { fetchPublicJson } from "../public-account-enrichment.js";
@@ -79,6 +80,7 @@ export interface AccountGameSummary {
     }>;
     tasks: TaskItemProgress[];
     harvestHistory: FruitHarvestRecord[];
+    isDailyWaterLimitReached?: boolean;
   } | null;
   knife?: {
     remainPlayTimes: number;
@@ -807,6 +809,16 @@ export async function runAccountAllDaily(accountId: number): Promise<GameExecuti
       } else if (rRes?.message) {
         logs.push(formatLog("math", "info", `自动兑换提示: ${rRes.message}`));
       }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 7. 自动检测并兑换 Amazon Gift Card $5 (若开启且积分年底到期<=30天)
+  try {
+    const amazonRes = await checkAndAutoRedeemAmazonGiftCard(accountId);
+    if (amazonRes.attempted && amazonRes.redeemed) {
+      logs.push(formatLog("system", "success", `🎉 ${amazonRes.reason}`));
     }
   } catch {
     // ignore

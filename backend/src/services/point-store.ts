@@ -627,3 +627,90 @@ function safeJsonStringify(value: unknown) {
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+
+export async function checkAndAutoRedeemAmazonGiftCard(accountId: number): Promise<{
+  attempted: boolean;
+  redeemed: boolean;
+  reason: string;
+}> {
+  const settingKey = `auto_redeem_amazon_${accountId}`;
+  const setting = await prisma.setting.findFirst({
+    where: { key: { in: [settingKey, "auto_redeem_amazon_gift_card_enabled"] } }
+  });
+  const enabled = setting?.value === "true";
+  if (!enabled) {
+    return { attempted: false, redeemed: false, reason: "自动兑换 Amazon Gift Card 功能未开启" };
+  }
+
+  let pointStore: AccountPointStore;
+  try {
+    pointStore = await getAccountPointStore(accountId);
+  } catch (err) {
+    return { attempted: false, redeemed: false, reason: `获取积分商城信息失败: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  const validPoint = pointStore.validPoint ?? 0;
+  const expirePoint = pointStore.expirePoint ?? 0;
+  const expireTime = pointStore.expireTime;
+
+  if (expirePoint <= 0) {
+    return { attempted: false, redeemed: false, reason: "当年无即将过期积分，不触发自动兑换" };
+  }
+
+  if (!expireTime) {
+    return { attempted: false, redeemed: false, reason: "未获取到积分到期时间，无法计算剩余天数" };
+  }
+  const dateNormalized = expireTime.replace(/\./g, "-");
+  const expireDate = new Date(`${dateNormalized}T23:59:59Z`);
+  const now = new Date();
+  const msRemaining = expireDate.getTime() - now.getTime();
+  const daysRemaining = msRemaining / (1000 * 60 * 60 * 24);
+  if (daysRemaining > 30) {
+    return { attempted: false, redeemed: false, reason: `距离积分过期还有 ${Math.ceil(daysRemaining)} 天 (>30天)，暂不触发兑换` };
+  }
+
+  const amazonProduct = pointStore.products.find(
+    (p) =>
+      p.productId === "7001" ||
+      p.name.toLowerCase().includes("amazon") ||
+      (p.name.includes("礼品卡") && p.name.includes("5"))
+  );
+  if (!amazonProduct) {
+    return { attempted: false, redeemed: false, reason: "积分商城未找到 Amazon Gift Card $5 商品" };
+  }
+
+  const requiredPrice = amazonProduct.price ?? 999;
+  if (validPoint < requiredPrice) {
+    return { attempted: false, redeemed: false, reason: `可用积分不足 (${validPoint} < ${requiredPrice})，无法兑换` };
+  }
+
+  if (amazonProduct.stock !== null && amazonProduct.stock <= 0) {
+    return { attempted: false, redeemed: false, reason: `商品【${amazonProduct.name}】当前缺货 (库存: 0)` };
+  }
+
+  try {
+    const account = await prisma.dtAccount.findUnique({ where: { id: accountId } });
+    const targetEmail = pointStore.email || account?.email;
+    if (!targetEmail) {
+      return { attempted: true, redeemed: false, reason: "账号缺少用于接收礼品卡的邮箱地址" };
+    }
+    const orderResult = await orderAccountPointStoreProduct(accountId, amazonProduct.productId, targetEmail);
+    logger.info("Auto redeemed Amazon Gift Card successfully", {
+      accountId,
+      orderId: orderResult.orderId,
+      productName: amazonProduct.name
+    });
+    return {
+      attempted: true,
+      redeemed: true,
+      reason: `成功自动兑换【${amazonProduct.name}】！订单已提交并发送电报通知。`
+    };
+  } catch (err) {
+    return {
+      attempted: true,
+      redeemed: false,
+      reason: `自动兑换执行失败: ${err instanceof Error ? err.message : String(err)}`
+    };
+  }
+}

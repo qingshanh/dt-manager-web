@@ -1469,6 +1469,39 @@ accountsRouter.get("/:id/pointstore", async (req, res, next) => {
   }
 });
 
+
+accountsRouter.get("/:id/auto-redeem-amazon", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const setting = await prisma.setting.findUnique({
+      where: { key: `auto_redeem_amazon_${accountId}` }
+    });
+    ok(res, { enabled: setting?.value === "true" });
+  } catch (err) {
+    next(err);
+  }
+});
+
+accountsRouter.post("/:id/auto-redeem-amazon", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const enabled = Boolean(req.body.enabled);
+    await prisma.setting.upsert({
+      where: { key: `auto_redeem_amazon_${accountId}` },
+      update: { value: String(enabled) },
+      create: {
+        key: `auto_redeem_amazon_${accountId}`,
+        value: String(enabled),
+        description: `Account #${accountId} auto redeem Amazon Gift Card`
+      }
+    });
+    ok(res, { enabled });
+  } catch (err) {
+    next(err);
+  }
+});
+
+
 accountsRouter.get("/:id/pointstore/orders", async (req, res, next) => {
   try {
     const accountId = Number(req.params.id);

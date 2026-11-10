@@ -540,12 +540,7 @@ function formatEpochTime(value: string | number | null | undefined) {
   return date.isValid() ? date.format('YYYY-MM-DD HH:mm') : '-';
 }
 
-function formatPointPriceZh(value: number | null | undefined) {
-  if (value === null || value === undefined || Number.isNaN(value)) {
-    return '待解析';
-  }
-  return `${value.toFixed(2)} 积分`;
-}
+
 
 function resolveDefaultCandidatePeriodMonths(candidate: PhonePurchaseCandidate, raw: Record<string, unknown> | null): number {
   const priceQuote = (raw?.priceQuote ?? raw?.price_quote) as Record<string, unknown> | undefined;
@@ -1082,6 +1077,7 @@ export default function AccountDetail() {
   const [nickname, setNickname] = useState('');
   const [pointStore, setPointStore] = useState<PointStoreData | null>(null);
   const [pointStoreLoading, setPointStoreLoading] = useState(false);
+  void pointStoreLoading;
 
   const snapshot = account?.snapshot;
   const snapshotExtras = useMemo(() => parseSnapshotExtras(snapshot?.raw_json), [snapshot?.raw_json]);
@@ -1092,8 +1088,6 @@ export default function AccountDetail() {
   const progressPointValue = pointStore?.history_point ?? snapshotExtras.progressPoint ?? snapshot?.progress_point ?? null;
   const progressPointTotalValue =
     snapshot?.progress_point_total ?? snapshotExtras.progressPointTotal ?? (userGradeValue === 1 ? 500 : userGradeValue === 2 ? 1000 : userGradeValue === 3 ? 3000 : userGradeValue === 4 ? 5000 : null);
-  const expirePointValue = pointStore?.expire_point ?? snapshotExtras.expirePoint;
-  const expireTimeValue = pointStore?.expire_time ?? snapshotExtras.expireTime;
   const dingtoneIdValue = snapshotExtras.dtDingtoneId ?? snapshot?.dt_dingtone_id ?? null;
   const membershipLevelValue =
     snapshotExtras.membershipLevelLabel ||
@@ -1102,18 +1096,6 @@ export default function AccountDetail() {
     snapshot?.membership_type ||
     null;
   const boundPhoneValue = snapshot?.phone?.trim() ? snapshot.phone : null;
-  const pointStoreProductCount = pointStore?.products.length ?? snapshotExtras.membershipBenefits.length;
-  const pointStoreProductTags = pointStore?.products.map((item) => ({
-    key: item.product_id,
-    name: item.name,
-    price: item.price,
-    stock: item.stock,
-  })) ?? snapshotExtras.membershipBenefits.map((item) => ({
-    key: item.code || item.name,
-    name: item.name,
-    price: item.price,
-    stock: null as number | null,
-  }));
 
   const fetchAccount = useCallback(async (options?: { force?: boolean }) => {
     const requestScope = accountScopeRef.current;
@@ -1690,7 +1672,7 @@ export default function AccountDetail() {
     });
   };
 
-  const handleImportDirectSession = async () => {
+  const _handleImportDirectSession = async () => {
     setDirectSessionImportOpen(true);
     await fetchPhoneCountries();
   };
@@ -1714,7 +1696,8 @@ export default function AccountDetail() {
     }
   };
 
-  const handleCaptureHelperSession = () => {
+  void _handleImportDirectSession;
+  const _handleCaptureHelperSession = () => {
     const isDingdong = account?.app_variant === 'dingdong';
     const appName = isDingdong ? '叮咚' : '说道';
     const packageName = isDingdong ? 'me.dingtone.app.im' : 'me.talkyou.app.im';
@@ -1736,6 +1719,7 @@ export default function AccountDetail() {
       },
     });
   };
+  void _handleCaptureHelperSession;
 
   const handleSaveNickname = async () => {
     const nextNickname = nickname.trim().slice(0, 100);
@@ -2322,8 +2306,6 @@ export default function AccountDetail() {
           {account?.app_variant === 'dingdong' ? '叮咚' : '说道'}
         </Tag>
         <Space style={{ marginLeft: 'auto' }}>
-          <Button onClick={handleImportDirectSession}>导入会话</Button>
-          <Button onClick={handleCaptureHelperSession}>模拟器测试导入（仅逆向/测试）</Button>
           <Button
             type={account?.monitor_enabled ? 'default' : 'primary'}
             icon={account?.monitor_enabled ? <PauseCircleOutlined /> : <PlayCircleOutlined />}
@@ -2448,46 +2430,6 @@ export default function AccountDetail() {
                   </Descriptions.Item>
                   <Descriptions.Item label="设备 ID">{account?.dt_device_id || '-'}</Descriptions.Item>
                 </Descriptions>
-
-                <Card
-                  size="small"
-                  title="积分商城"
-                  loading={pointStoreLoading}
-                  extra={(
-                    <Space>
-                      <Button size="small" onClick={() => navigate(`/accounts/${accountId}/point-store`)}>进入商城</Button>
-                      <Button size="small" icon={<ReloadOutlined />} onClick={() => fetchPointStore()} loading={pointStoreLoading}>刷新</Button>
-                    </Space>
-                  )}
-                  style={{ marginTop: 16 }}
-                >
-                  <Descriptions bordered column={2} size="small">
-                    <Descriptions.Item label="当前等级">{membershipLevelValue || '-'}</Descriptions.Item>
-                    <Descriptions.Item label="会员到期">
-                      {snapshot?.membership_expire_at ? dayjs(snapshot.membership_expire_at).format('YYYY-MM-DD HH:mm') : '-'}
-                    </Descriptions.Item>
-                    <Descriptions.Item label="积分权益">{snapshotExtras.walletPrivilege || '暂未解析'}</Descriptions.Item>
-                    <Descriptions.Item label="商城项目数">{pointStoreProductCount || 0}</Descriptions.Item>
-                    <Descriptions.Item label="年底过期积分">
-                      {expirePointValue !== null
-                        ? `${formatNumber(expirePointValue, 0, '0')} 积分${expireTimeValue ? ` / ${expireTimeValue}` : ''}`
-                        : '未同步'}
-                    </Descriptions.Item>
-                  </Descriptions>
-                  {pointStoreProductTags.length > 0 ? (
-                    <Space wrap style={{ marginTop: 12 }}>
-                      {pointStoreProductTags.map((item) => (
-                        <Tag key={`${item.key}-${item.name}`} color="blue">
-                          {item.name}
-                          {item.price !== null ? ` / ${formatPointPriceZh(item.price)}` : ''}
-                          {item.stock !== null ? ` / 库存 ${item.stock}` : ''}
-                        </Tag>
-                      ))}
-                    </Space>
-                  ) : (
-                    <div style={{ marginTop: 12, color: '#999' }}>暂未解析到积分商城项目。</div>
-                  )}
-                </Card>
 
                 <Card size="small" title="通知设置" style={{ marginTop: 16 }}>
                   <Space>

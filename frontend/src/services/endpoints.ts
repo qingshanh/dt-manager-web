@@ -759,6 +759,7 @@ export interface AccountGameSummary {
     }>;
     tasks: TaskItemProgress[];
     harvestHistory: FruitHarvestRecord[];
+    isDailyWaterLimitReached?: boolean;
   } | null;
   knife?: {
     remainPlayTimes: number;
@@ -900,5 +901,16 @@ export async function testGameProxy(extractUrl?: string): Promise<{
 
 export async function runAccountMathDaily(accountId: number): Promise<{ success: boolean; logs: GameTaskLog[] }> {
   const res = await api.post<ApiResponse<{ success: boolean; logs: GameTaskLog[] }>>(`/accounts/${accountId}/games/math/daily`);
+  return res.data.data;
+}
+
+
+export async function getAutoRedeemAmazon(accountId: number): Promise<{ enabled: boolean }> {
+  const res = await api.get<ApiResponse<{ enabled: boolean }>>(`/accounts/${accountId}/auto-redeem-amazon`);
+  return res.data.data;
+}
+
+export async function setAutoRedeemAmazon(accountId: number, enabled: boolean): Promise<{ enabled: boolean }> {
+  const res = await api.post<ApiResponse<{ enabled: boolean }>>(`/accounts/${accountId}/auto-redeem-amazon`, { enabled });
   return res.data.data;
 }

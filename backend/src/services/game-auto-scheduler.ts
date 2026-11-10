@@ -12,6 +12,7 @@ import {
   runAccountMemberDaily
 } from "./dingtone/game-service.js";
 import { getSettingsMap } from "./settings.service.js";
+import { checkAndAutoRedeemAmazonGiftCard } from "./point-store.js";
 
 export const GAME_SCHEDULER_CYCLE_DELAY_MS = 10 * 60_000; // 10 minutes
 export const NIGHT_CYCLE_DELAY_MS = 20 * 60_000; // 20 minutes in night
@@ -78,10 +79,15 @@ export class GameAutoSchedulerService {
 
   getStatus() {
     const now = new Date();
+    const lastCycle = this.lastCycleAt;
+    const nextCycleAt = lastCycle
+      ? new Date(lastCycle.getTime() + (isNightQuietHours(now) ? NIGHT_CYCLE_DELAY_MS : GAME_SCHEDULER_CYCLE_DELAY_MS)).toISOString()
+      : new Date(now.getTime() + GAME_SCHEDULER_CYCLE_DELAY_MS).toISOString();
     return {
       running: this.isRunning,
       isNightQuiet: isNightQuietHours(now),
-      lastCycleAt: this.lastCycleAt,
+      lastCycleAt: this.lastCycleAt?.toISOString() ?? null,
+      nextCycleAt,
       completedTodayCount: Array.from(this.accountDailyCompletedDates.values()).filter((d) => d === getTodayDateString(now)).length
     };
   }
