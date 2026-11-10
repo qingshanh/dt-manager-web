@@ -783,6 +783,11 @@ export interface AccountGameSummary {
       price: number;
       stock: number;
     }>;
+    shareBoostToday?: {
+      count: number;
+      isMaxReached: boolean;
+    };
+    redeemedTodayProductIds?: number[];
   } | null;
   member?: {
     validTimes: number;

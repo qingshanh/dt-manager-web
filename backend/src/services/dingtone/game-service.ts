@@ -103,6 +103,11 @@ export interface AccountGameSummary {
       price: number;
       stock: number;
     }>;
+    shareBoostToday?: {
+      count: number;
+      isMaxReached: boolean;
+    };
+    redeemedTodayProductIds?: number[];
   } | null;
   member?: {
     validTimes: number;
@@ -381,6 +386,7 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
       }
     }
 
+    const mathDaily = loadMathDailyState(accountId);
     mathGameData = {
       uid: gameUid,
       validPoint: gameRes.data.validPoint ?? 0,
@@ -389,7 +395,12 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
       watchAdsAddChanceFrequency: gameRes.data.watchAdsAddChanceFrequency ?? 0,
       record: gameRes.data.record ?? null,
       shortUuid,
-      redeemProducts
+      redeemProducts,
+      shareBoostToday: {
+        count: mathDaily.shareBoostCount,
+        isMaxReached: mathDaily.isShareBoostMaxReached
+      },
+      redeemedTodayProductIds: mathDaily.redeemedProductIds
     };
   }
 
@@ -914,10 +925,16 @@ export async function runAccountShareBoost(accountId: number, maxBoosts = 10): P
           }
           if (json?.Result === 1) {
             successCount += 1;
+            const boostState = loadMathDailyState(accountId);
+            boostState.shareBoostCount += 1;
+            saveMathDailyState(boostState);
             logs.push(`通过代理 [${candidate.proxy}] 助力成功 +1 次！(累计: ${successCount})`);
           } else if (json?.Result === 0) {
             logs.push(`代理 [${candidate.proxy}] 助力响应: ${json.Reason}`);
             if (json.Reason?.includes("已达上限")) {
+              const boostState = loadMathDailyState(accountId);
+              boostState.isShareBoostMaxReached = true;
+              saveMathDailyState(boostState);
               logs.push("用户当日分享助力已达系统上限，结束助力");
               break;
             }
@@ -1226,6 +1243,74 @@ export interface MemberRewardRecord {
   receivedAt: string;
 }
 
+
+export interface MathDailyState {
+  accountId: number;
+  dateStr: string;
+  shareBoostCount: number;
+  isShareBoostMaxReached: boolean;
+  redeemedProductIds: number[];
+}
+
+const MATH_STATE_FILE_PATH = path.resolve(process.cwd(), "_tmp/runtime/math_daily_state.json");
+
+function getTodayDateStr(): string {
+  return new Date().toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" }).replace(/\//g, "-");
+}
+
+export function loadMathDailyState(accountId: number): MathDailyState {
+  const today = getTodayDateStr();
+  try {
+    ensureHarvestDir();
+    if (fs.existsSync(MATH_STATE_FILE_PATH)) {
+      const all = JSON.parse(fs.readFileSync(MATH_STATE_FILE_PATH, "utf8")) as Record<string, MathDailyState>;
+      const key = `${accountId}:${today}`;
+      if (all[key]) {
+        return all[key];
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return {
+    accountId,
+    dateStr: today,
+    shareBoostCount: 0,
+    isShareBoostMaxReached: false,
+    redeemedProductIds: []
+  };
+}
+
+export function saveMathDailyState(state: MathDailyState) {
+  try {
+    ensureHarvestDir();
+    let all: Record<string, MathDailyState> = {};
+    if (fs.existsSync(MATH_STATE_FILE_PATH)) {
+      all = JSON.parse(fs.readFileSync(MATH_STATE_FILE_PATH, "utf8"));
+    }
+    const key = `${state.accountId}:${state.dateStr}`;
+    all[key] = state;
+    fs.writeFileSync(MATH_STATE_FILE_PATH, JSON.stringify(all, null, 2), "utf8");
+  } catch (err) {
+    logger.warn("Failed to save math daily state", { error: String(err) });
+  }
+}
+
+export function formatPrizeName(rawPrize: string): string {
+  const clean = rawPrize.trim();
+  const MAP: Record<string, string> = {
+    "point_system_lucky_reward_0": "谢谢参与 (未中奖)",
+    "point_system_lucky_reward_1": "10 会员积分",
+    "point_system_lucky_reward_2": "20 会员积分",
+    "point_system_lucky_reward_3": "50 会员积分",
+    "point_system_lucky_reward_4": "商城通用卡券",
+    "point_system_lucky_reward_5": "商城抵扣券 (卡券包)",
+    "Thanks!": "谢谢参与 (未中奖)",
+    "thanks": "谢谢参与 (未中奖)"
+  };
+  return MAP[clean] || clean;
+}
+
 const MEMBER_REWARDS_FILE_PATH = path.resolve(process.cwd(), "_tmp/runtime/member_rewards.json");
 
 export function loadMemberRewardHistory(accountId?: number): MemberRewardRecord[] {
@@ -1237,9 +1322,9 @@ export function loadMemberRewardHistory(accountId?: number): MemberRewardRecord[
     const raw = fs.readFileSync(MEMBER_REWARDS_FILE_PATH, "utf8");
     const all = JSON.parse(raw) as MemberRewardRecord[];
     if (accountId !== undefined) {
-      return all.filter((r) => r.accountId === accountId);
+      return all.map(r => ({ ...r, prizeName: formatPrizeName(r.prizeName) })).filter((r) => r.accountId === accountId);
     }
-    return all;
+    return all.map(r => ({ ...r, prizeName: formatPrizeName(r.prizeName) }));
   } catch {
     return [];
   }
@@ -1351,7 +1436,7 @@ export async function runAccountKnifeDaily(accountId: number, logs: GameTaskLog[
     let playTimes = reloaded?.data?.remainPlayTimes ?? 0;
     if (playTimes > 0) {
       logs.push(formatLog("knife", "info", `开始进行飞刀投掷游戏，共 ${playTimes} 次...`));
-      for (let i = 0; i < Math.min(playTimes, 5); i++) {
+      for (let i = 0; i < playTimes; i++) {
         const playRes = await requestGameJson(
           `/knife/play?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${Date.now()}`
         );
@@ -1426,11 +1511,22 @@ export async function redeemMathGamePoints(accountId: number, productId: number)
   const res = await requestGameJson(
     `/game/point/redeem?uid=${encodeURIComponent(gameUid)}&productId=${productId}&timeStamp=${Date.now()}`
   );
+  const redeemState = loadMathDailyState(accountId);
   if (res?.Result === 1) {
+    if (!redeemState.redeemedProductIds.includes(productId)) {
+      redeemState.redeemedProductIds.push(productId);
+      saveMathDailyState(redeemState);
+    }
     return {
       success: true,
       message: `兑换成功！获得 ${res.data} 个说道币/叮咚币（有效期3个月）`
     };
+  }
+  if (res?.Reason?.includes("已达") || res?.Reason?.includes("上限") || res?.Reason?.includes("一次")) {
+    if (!redeemState.redeemedProductIds.includes(productId)) {
+      redeemState.redeemedProductIds.push(productId);
+      saveMathDailyState(redeemState);
+    }
   }
   return {
     success: false,

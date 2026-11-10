@@ -334,13 +334,13 @@ export default function AccountGameRewards({ accountId }: Props) {
           type="warning"
           showIcon
           icon={<ClockCircleOutlined />}
-          message="说道币 / 叮咚币 / 积分到期预警"
+          message="🌟 会员商城积分年底到期提醒"
           description={(
             <Space direction="vertical" size={2}>
               <Typography.Text>
-                当前账户有 <Typography.Text strong type="danger">{expiry.expireCredit}</Typography.Text> 积分/币
-                {expiry.expireDate ? <>，预计将于 <Typography.Text strong>{expiry.expireDate}</Typography.Text> 到期。</> : ' 即将到期。'}
-                请及时在下方兑换区或积分商城兑换！
+                当前账户有 <Typography.Text strong type="warning">{expiry.expireCredit}</Typography.Text> 会员积分
+                {expiry.expireDate ? <>，将于 <Typography.Text strong>{expiry.expireDate}</Typography.Text> 年底到期。</> : ' 即将到期。'}
+                注：说道币 / 叮咚币为永久有效钱包余额（保持账号活跃即可），此处到期仅指商城会员积分。
               </Typography.Text>
             </Space>
           )}
@@ -359,9 +359,7 @@ export default function AccountGameRewards({ accountId }: Props) {
           )}
           extra={(
             <Space size={6}>
-              <Tooltip title="查看玩法介绍与收益说明">
-                <Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('pet')}>说明</Button>
-              </Tooltip>
+              <Tooltip title="查看玩法说明"><Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('pet')} /></Tooltip>
               <Button
                 size="small"
                 icon={<ThunderboltOutlined />}
@@ -448,9 +446,7 @@ export default function AccountGameRewards({ accountId }: Props) {
           title="🍎 每日果园"
           extra={(
             <Space size={6}>
-              <Tooltip title="查看玩法介绍与收益说明">
-                <Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('fruit')}>说明</Button>
-              </Tooltip>
+              <Tooltip title="查看玩法说明"><Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('fruit')} /></Tooltip>
               <Button
                 size="small"
                 icon={<ThunderboltOutlined />}
@@ -521,9 +517,7 @@ export default function AccountGameRewards({ accountId }: Props) {
           title="🗡️ 飞刀国王"
           extra={(
             <Space size={6}>
-              <Tooltip title="查看玩法介绍与收益说明">
-                <Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('knife')}>说明</Button>
-              </Tooltip>
+              <Tooltip title="查看玩法说明"><Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('knife')} /></Tooltip>
               <Button
                 size="small"
                 icon={<ThunderboltOutlined />}
@@ -570,23 +564,12 @@ export default function AccountGameRewards({ accountId }: Props) {
 
         {/* 卡片 4: 算术与不等式挑战 (Math Game) */}
         <Card
-          title="🧮 算术不等式挑战"
+          title="🧮 算术挑战"
           extra={(
             <Space size={6}>
-              <Tooltip title="查看玩法介绍与收益说明">
-                <Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('math')}>说明</Button>
-              </Tooltip>
-              <Button size="small" icon={<TrophyOutlined />} onClick={handleOpenRank}>
-                世界前50排行榜
-              </Button>
-              <Button
-                size="small"
-                icon={<ThunderboltOutlined />}
-                loading={actionLoading === 'math'}
-                onClick={() => void handleRunMathDaily()}
-              >
-                做题/冲榜
-              </Button>
+              <Tooltip title="查看玩法说明"><Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('math')} /></Tooltip>
+              <Button size="small" icon={<TrophyOutlined />} onClick={handleOpenRank}>排行榜</Button>
+              <Button size="small" icon={<ThunderboltOutlined />} loading={actionLoading === 'math'} onClick={() => void handleRunMathDaily()}>冲榜/做题</Button>
             </Space>
           )}
         >
@@ -631,9 +614,13 @@ export default function AccountGameRewards({ accountId }: Props) {
                       />
                     </Tooltip>
                   ) : null}
+                  <Tag color={math.shareBoostToday?.isMaxReached ? 'default' : 'green'}>
+                    今日已助力: +{math.shareBoostToday?.count ?? 0} 次 {math.shareBoostToday?.isMaxReached ? '(已达上限)' : ''}
+                  </Tag>
                   <Button
                     size="small"
                     icon={<ShareAltOutlined />}
+                    disabled={math.shareBoostToday?.isMaxReached}
                     loading={actionLoading === 'boost'}
                     onClick={() => void handleShareBoost()}
                   >
@@ -641,21 +628,24 @@ export default function AccountGameRewards({ accountId }: Props) {
                   </Button>
                 </Space>
               </Descriptions.Item>
-              <Descriptions.Item label="积分额度兑换 (手动/自动)">
+              <Descriptions.Item label="积分额度兑换 (每日限1次)">
                 <Space wrap size={6}>
-                  {math.redeemProducts?.map((p) => (
-                    <Button
-                      key={p.productId}
-                      size="small"
-                      disabled={(math.validPoint ?? 0) < p.price}
-                      loading={actionLoading === `redeem-${p.productId}`}
-                      onClick={() => void handleRedeemPoints(p.productId, p.productName)}
-                    >
-                      兑换 {p.price}分 (剩{p.stock})
-                    </Button>
-                  ))}
+                  {math.redeemProducts?.map((p) => {
+                    const isRedeemed = math.redeemedTodayProductIds?.includes(p.productId);
+                    return (
+                      <Button
+                        key={p.productId}
+                        size="small"
+                        disabled={isRedeemed || (math.validPoint ?? 0) < p.price}
+                        loading={actionLoading === `redeem-${p.productId}`}
+                        onClick={() => void handleRedeemPoints(p.productId, p.productName)}
+                      >
+                        {isRedeemed ? `今日已兑换 (${p.price}分)` : `兑换 ${p.price}分 (剩${p.stock})`}
+                      </Button>
+                    );
+                  })}
                   {(!math.redeemProducts || math.redeemProducts.length === 0) && (
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>支持 1,000分与 10,000分兑换说道币/叮咚币</Typography.Text>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>支持 1,000分与 10,000分兑换说道币/叮咚币 (每日各限1次)</Typography.Text>
                   )}
                 </Space>
               </Descriptions.Item>
@@ -668,7 +658,7 @@ export default function AccountGameRewards({ accountId }: Props) {
         <Card
           title={(
             <Space>
-              <span>🌟 会员好运与每日签到</span>
+              <span>🌟 会员好运签到</span>
               {member?.lastReward ? <Tag color="gold">最近: {member.lastReward}</Tag> : null}
             </Space>
           )}

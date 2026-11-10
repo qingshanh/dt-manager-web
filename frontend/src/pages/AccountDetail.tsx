@@ -2358,18 +2358,23 @@ export default function AccountDetail() {
         </Card>
       )}
 
-      {account?.latest_monitor?.route_address ? (
-        <Card size="small" title="监听诊断" style={{ marginBottom: 16 }}>
+      {account?.latest_monitor && (
+        account.latest_monitor.status !== 'running' ||
+        Boolean(account.latest_monitor.error_message) ||
+        account.latest_monitor.route_address?.includes('Error') ||
+        account.latest_monitor.route_address?.includes('fail')
+      ) ? (
+        <Card size="small" title="⚠️ 监听异常诊断" style={{ marginBottom: 16 }}>
           <Space direction="vertical" size={4}>
             <Space wrap>
-              <Tag color={account.latest_monitor.status === 'running' ? 'green' : 'default'}>
-                {account.latest_monitor.status === 'running' ? '监听中' : account.latest_monitor.status}
+              <Tag color={account.latest_monitor.status === 'running' ? 'green' : 'error'}>
+                {account.latest_monitor.status}
               </Tag>
               <span>心跳 {account.latest_monitor.heartbeat_count}</span>
               <span>入库 {account.latest_monitor.msg_received_count}</span>
               <span>启动 {dayjs(account.latest_monitor.started_at).format('HH:mm:ss')}</span>
             </Space>
-            <div style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 12 }}>
+            <div style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 12, color: '#cf1322' }}>
               {account.latest_monitor.route_address}
             </div>
           </Space>
