@@ -40,6 +40,7 @@ import {
   waterAccountFruit,
   addXiequWhitelist,
   runAccountMemberDaily,
+  runAccountMathDaily,
   type AccountGameSummary,
   type GameTaskLog,
   type RankLeaderboardItem,
@@ -167,6 +168,27 @@ export default function AccountGameRewards({ accountId }: Props) {
       await loadData();
     } catch (err) {
       message.error(err instanceof Error ? err.message : '浇水失败');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+
+  const handleRunMathDaily = async () => {
+    setActionLoading('math');
+    try {
+      const res = await runAccountMathDaily(accountId);
+      if (res.logs) {
+        setLogs((prev) => [...res.logs, ...prev]);
+      }
+      if (res.success) {
+        message.success('算术不等式自动做题与冲榜已完成！');
+      } else {
+        message.info('算术日常任务已处理');
+      }
+      await loadData();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '算术日常执行失败');
     } finally {
       setActionLoading(null);
     }
@@ -557,6 +579,14 @@ export default function AccountGameRewards({ accountId }: Props) {
               <Button size="small" icon={<TrophyOutlined />} onClick={handleOpenRank}>
                 世界前50排行榜
               </Button>
+              <Button
+                size="small"
+                icon={<ThunderboltOutlined />}
+                loading={actionLoading === 'math'}
+                onClick={() => void handleRunMathDaily()}
+              >
+                做题/冲榜
+              </Button>
             </Space>
           )}
         >
@@ -644,9 +674,6 @@ export default function AccountGameRewards({ accountId }: Props) {
           )}
           extra={(
             <Space size={6}>
-              <Tooltip title="查看玩法介绍与收益说明">
-                <Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('member')}>说明</Button>
-              </Tooltip>
               <Button
                 size="small"
                 icon={<ClockCircleOutlined />}

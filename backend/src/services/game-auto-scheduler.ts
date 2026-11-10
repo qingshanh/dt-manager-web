@@ -7,7 +7,9 @@ import {
   runAccountAllDaily,
   runAccountFruitDaily,
   runAccountKnifeDaily,
-  runAccountPetDaily
+  runAccountPetDaily,
+  runAccountMathDaily,
+  runAccountMemberDaily
 } from "./dingtone/game-service.js";
 import { getSettingsMap } from "./settings.service.js";
 

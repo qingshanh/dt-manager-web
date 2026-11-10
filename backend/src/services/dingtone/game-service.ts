@@ -779,6 +779,9 @@ export async function runAccountAllDaily(accountId: number): Promise<GameExecuti
   // 5. 积分中心日常
   const checkinSuccess = await runAccountCheckinDaily(accountId, logs);
 
+  // 6. 算术不等式挑战日常 (看广告加次数 -> 代理助力 -> WebSocket自动答题全消耗 -> 世界前十冲榜 -> 自动兑换)
+  const mathSuccess = await runAccountMathDaily(accountId, logs);
+
   // Auto-redeem points if balance >= 1000
   try {
     const summary = await getAccountGameSummary(accountId);
@@ -798,7 +801,7 @@ export async function runAccountAllDaily(accountId: number): Promise<GameExecuti
     // ignore
   }
 
-  const overallSuccess = petSuccess || fruitSuccess || knifeSuccess || checkinSuccess;
+  const overallSuccess = petSuccess || fruitSuccess || knifeSuccess || checkinSuccess || memberSuccess || mathSuccess;
   logs.push(
     formatLog(
       "system",
@@ -951,6 +954,267 @@ function evalMathNumber(fnStr: string): number {
   if (!clean) return 0;
   // eslint-disable-next-line no-new-func
   return Number(Function(`"use strict"; return (${clean})`)());
+}
+
+function wsSign(s: string): string {
+  const first = crypto.createHash("md5").update(s, "utf8").digest("hex");
+  return crypto.createHash("md5").update(first + "8TB{9Iz7", "utf8").digest("hex");
+}
+
+export async function playMathGameSession(uid: string): Promise<{ success: boolean; earnedPoints: number; reason?: string }> {
+  return new Promise((resolve) => {
+    let spendTime = 0;
+    let earned = 0;
+    const ws = new WebSocket("wss://d15wptekiod8mq.cloudfront.net/ws");
+
+    const timer = setTimeout(() => {
+      try { ws.close(); } catch {}
+      resolve({ success: false, earnedPoints: earned, reason: "WebSocket game timeout" });
+    }, 45000);
+
+    ws.onopen = () => {
+      const sign = wsSign("action=gameBegin&uid=" + uid);
+      ws.send(JSON.stringify({ action: "gameBegin", uid, sign }));
+    };
+
+    ws.onmessage = async (e) => {
+      try {
+        const msg = JSON.parse(String(e.data));
+        if (msg.Result !== 1) {
+          clearTimeout(timer);
+          try { ws.close(); } catch {}
+          return resolve({ success: false, earnedPoints: earned, reason: msg.Reason || "Unknown game error" });
+        }
+        const data = msg.data;
+        if (data.action === "questions") {
+          const ans = checkMathEquality(data.question);
+          const jitter = Math.random() * 0.35 + 0.3; // 0.3 ~ 0.65s
+          spendTime += jitter;
+          await delay(jitter * 1000);
+          const sign = wsSign(`action=report&answer=${ans}&questionSort=${data.questionSort}&timeOut=0&totalSpendTime=${spendTime.toFixed(2)}&uid=${uid}`);
+          ws.send(JSON.stringify({
+            timeOut: 0,
+            answer: ans,
+            totalSpendTime: spendTime.toFixed(2),
+            questionSort: data.questionSort,
+            action: "report",
+            uid,
+            sign
+          }));
+        } else if (data.action === "gameOver") {
+          earned = data.earnPoints ?? 100;
+          if (data.pointDouble === 1) {
+            const doubleSign = wsSign(`action=gameSuccessWatchAdsAddDoublePoint&uid=${uid}`);
+            ws.send(JSON.stringify({ action: "gameSuccessWatchAdsAddDoublePoint", uid, sign: doubleSign }));
+          } else {
+            clearTimeout(timer);
+            try { ws.close(); } catch {}
+            resolve({ success: true, earnedPoints: earned });
+          }
+        } else if (data.action === "gameSuccessWatchAdsAddDoublePoint") {
+          clearTimeout(timer);
+          try { ws.close(); } catch {}
+          resolve({ success: true, earnedPoints: earned > 0 ? earned * 2 : 200 });
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    ws.onerror = (err: any) => {
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      resolve({ success: false, earnedPoints: earned, reason: err?.message || "WebSocket error" });
+    };
+  });
+}
+
+export async function playMathChallengeSession(
+  uid: string,
+  targetScore: number,
+  nickname: string
+): Promise<{ success: boolean; bestScore: number; ranking?: number; reason?: string }> {
+  try {
+    await requestGameJson(
+      `/game/challenge/info?uid=${encodeURIComponent(uid)}&nickname=${encodeURIComponent(nickname)}&timeStamp=${Date.now()}`
+    );
+  } catch (err) {
+    return { success: false, bestScore: 0, reason: `初始化挑战赛失败: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  return new Promise((resolve) => {
+    let spendTime = 0;
+    let questionsAnswered = 0;
+    let finalBestScore = 0;
+    let finalRanking: number | undefined;
+    const ws = new WebSocket("wss://d15wptekiod8mq.cloudfront.net/ws");
+
+    const timer = setTimeout(() => {
+      try { ws.close(); } catch {}
+      resolve({ success: false, bestScore: finalBestScore, reason: "Challenge timeout" });
+    }, 120000);
+
+    ws.onopen = () => {
+      const sign = wsSign("action=challengeGameBegin&uid=" + uid);
+      ws.send(JSON.stringify({ action: "challengeGameBegin", uid, sign }));
+    };
+
+    ws.onmessage = async (e) => {
+      try {
+        const msg = JSON.parse(String(e.data));
+        if (msg.Result !== 1) {
+          clearTimeout(timer);
+          try { ws.close(); } catch {}
+          return resolve({ success: false, bestScore: finalBestScore, reason: msg.Reason });
+        }
+        const data = msg.data;
+        if (data.action === "challengeReport" || data.action === "questions") {
+          questionsAnswered++;
+          let ans = checkMathEquality(data.question);
+          if (questionsAnswered > targetScore) {
+            ans = ans === 1 ? 0 : 1;
+          }
+          const jitter = Math.random() * 0.2 + 0.15;
+          spendTime += jitter;
+          await delay(jitter * 1000);
+          const sign = wsSign(
+            `action=challengeReport&answer=${ans}&questionSort=${data.questionSort}&timeOut=0&totalSpendTime=${spendTime.toFixed(2)}&uid=${uid}`
+          );
+          ws.send(JSON.stringify({
+            timeOut: 0,
+            answer: ans,
+            totalSpendTime: spendTime.toFixed(2),
+            questionSort: data.questionSort,
+            action: "challengeReport",
+            uid,
+            sign
+          }));
+        } else if (data.action === "chooseWhetherToContinue") {
+          const sign = wsSign("action=challengeCancelContinueGame");
+          ws.send(JSON.stringify({ action: "challengeCancelContinueGame", sign }));
+        } else if (data.action === "gameOver") {
+          finalBestScore = data.bestScore ?? questionsAnswered;
+          finalRanking = data.latestRanking;
+          clearTimeout(timer);
+          try { ws.close(); } catch {}
+          resolve({ success: true, bestScore: finalBestScore, ranking: finalRanking });
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    ws.onerror = (err: any) => {
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      resolve({ success: false, bestScore: finalBestScore, reason: err?.message || "Challenge WS error" });
+    };
+  });
+}
+
+export async function runAccountMathDaily(accountId: number, logs: GameTaskLog[] = []): Promise<boolean> {
+  const summary = await getAccountGameSummary(accountId);
+  const math = summary.mathGame;
+  const gameUid = math?.uid;
+  if (!gameUid) {
+    logs.push(formatLog("math", "warn", "未获取到算术游戏 uid，跳过算术日常"));
+    return false;
+  }
+
+  let success = false;
+  logs.push(formatLog("math", "info", `🧮 算术不等式: 当前剩余 ${math.chanceLeft} 次机会，看广告可加 ${math.watchAdsAddChanceFrequency} 次`));
+
+  // 1. 看广告拿满游戏机会
+  const adsFreq = math.watchAdsAddChanceFrequency ?? 0;
+  if (adsFreq > 0) {
+    logs.push(formatLog("math", "info", `看广告获取算术游戏次数 (${adsFreq} 次)...`));
+    for (let i = 0; i < adsFreq; i++) {
+      const adRes = await requestGameJson(`/game/watchAdsAddChance?uid=${encodeURIComponent(gameUid)}&timeStamp=${Date.now()}`).catch(() => null);
+      if (adRes?.Result === 1) {
+        logs.push(formatLog("math", "success", `第 ${i + 1} 次看广告增加游戏机会成功`));
+        success = true;
+      }
+      await delay(1200);
+    }
+  }
+
+  // 2. 自动代理助力 (使用内置 89 免费代理或配置的携趣代理)
+  try {
+    logs.push(formatLog("math", "info", "执行代理自动助力增加游戏机会..."));
+    const boostRes = await runAccountShareBoost(accountId, 8);
+    if (boostRes.count > 0) {
+      logs.push(formatLog("math", "success", `代理自动助力成功增加 ${boostRes.count} 次游戏机会！`));
+      success = true;
+    }
+  } catch (err) {
+    logs.push(formatLog("math", "warn", `代理助力跳过: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  // 3. 重新获取总剩余游戏次数，并全部通过 WebSocket 玩完做题
+  const reloaded = await requestGameJson(
+    `/game/homePage?userId=${summary.dtUserId}&appId=${summary.gameAppId}&zone=-800&timeStamp=${Date.now()}`
+  ).catch(() => null);
+  const totalChances = reloaded?.data?.chanceLeft ?? math.chanceLeft;
+
+  if (totalChances > 0) {
+    logs.push(formatLog("math", "info", `开始执行自动答题消耗所有机会，共 ${totalChances} 次机会...`));
+    for (let i = 0; i < totalChances; i++) {
+      const playRes = await playMathGameSession(gameUid);
+      if (playRes.success) {
+        logs.push(formatLog("math", "success", `第 ${i + 1} 局答题通关并翻倍！获得 ${playRes.earnedPoints} 积分`));
+        success = true;
+      } else {
+        logs.push(formatLog("math", "warn", `第 ${i + 1} 局答题异常: ${playRes.reason || "未知"}`));
+      }
+      await delay(1500);
+    }
+  }
+
+  // 4. 世界排行榜冲榜保障 (冲进前十名)
+  try {
+    const rankList = await getGameRankList(summary.gameAppId);
+    let userRank = 999;
+    const userRankRes = await requestGameJson(`/game/rank/user?uid=${encodeURIComponent(gameUid)}&timeStamp=${Date.now()}`).catch(() => null);
+    if (userRankRes?.Result === 1 && userRankRes.data?.ranking) {
+      userRank = userRankRes.data.ranking;
+    }
+
+    if (userRank > 10 && rankList.length > 0) {
+      const rank3Score = rankList[2]?.bestScore ?? 420;
+      const rank9Score = rankList[8]?.bestScore ?? 370;
+      const targetScore = randomBetween(rank9Score + 10, Math.min(rank3Score + 5, rank9Score + 45));
+      const nickname = userRankRes?.data?.nickname || summary.appVariant;
+      logs.push(formatLog("math", "info", `当前排名 #${userRank}，未进入世界前十，启动冲榜挑战模式 (目标得分: ${targetScore})...`));
+      const challengeRes = await playMathChallengeSession(gameUid, targetScore, nickname);
+      if (challengeRes.success) {
+        logs.push(formatLog("math", "success", `🏆 挑战成功！最终得分: ${challengeRes.bestScore}，成功跻身世界前十！(当前名次: #${challengeRes.ranking ?? "前十"})`));
+        success = true;
+      } else {
+        logs.push(formatLog("math", "warn", `挑战冲榜提示: ${challengeRes.reason || "已提交成绩"}`));
+      }
+    } else {
+      logs.push(formatLog("math", "info", `当前排名 #${userRank}，已稳居世界前十！`));
+    }
+  } catch (err) {
+    logs.push(formatLog("math", "warn", `排位检测跳过: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  // 5. 自动积分兑换
+  try {
+    const afterSummary = await getAccountGameSummary(accountId);
+    const validPoint = afterSummary.mathGame?.validPoint ?? 0;
+    if (validPoint >= 1000) {
+      const prodId = summary.appType === 0 ? (validPoint >= 10000 ? 23 : 22) : (validPoint >= 10000 ? 25 : 24);
+      const redeemRes = await redeemMathGamePoints(accountId, prodId);
+      if (redeemRes.success) {
+        logs.push(formatLog("math", "success", `🎉 ${redeemRes.message}`));
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return success;
 }
 
 // ── Persistent Fruit Harvest History ──

@@ -12,6 +12,7 @@ import {
   extractProxiesFromResponse,
   BUILTIN_89IP_PROXY_URL,
   redeemMathGamePoints,
+  runAccountMathDaily,
   runAccountAllDaily,
   runAccountFruitDaily,
   runAccountKnifeDaily,
@@ -267,6 +268,20 @@ gamesRouter.post("/proxy/test", async (req, res, next) => {
       proxy: candidates[0]?.proxy,
       message: `从代理源提取到 ${candidates.length} 个 IP，但抽测前几组代理均无响应或超时 (${lastError || "网络超时"})，建议稍后重试或使用携趣等付费代理。`
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+
+// POST /api/accounts/:id/games/math/daily - Run math game daily tasks
+gamesRouter.post("/math/daily", async (req, res, next) => {
+  try {
+    const accountId = Number((req.params as any).id || req.body.account_id);
+    await assertAccountAccess(accountId, req.auth!.userId);
+    const logs: any[] = [];
+    const success = await runAccountMathDaily(accountId, logs);
+    ok(res, { success, logs });
   } catch (error) {
     next(error);
   }

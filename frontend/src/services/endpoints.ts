@@ -891,3 +891,9 @@ export async function testGameProxy(extractUrl?: string): Promise<{
   }>>('/games/proxy/test', { extract_url: extractUrl });
   return res.data.data;
 }
+
+
+export async function runAccountMathDaily(accountId: number): Promise<{ success: boolean; logs: GameTaskLog[] }> {
+  const res = await api.post<ApiResponse<{ success: boolean; logs: GameTaskLog[] }>>(`/accounts/${accountId}/games/math/daily`);
+  return res.data.data;
+}
