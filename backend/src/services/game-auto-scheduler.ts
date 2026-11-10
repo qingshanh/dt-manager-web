@@ -3,6 +3,7 @@ import { logger } from "../utils/logger.js";
 import { BackgroundLoop } from "./background-loop.js";
 import {
   getAccountGameSummary,
+  randomDelay,
   runAccountAllDaily,
   runAccountFruitDaily,
   runAccountKnifeDaily,
@@ -133,7 +134,11 @@ export class GameAutoSchedulerService {
               error: err instanceof Error ? err.message : String(err)
             });
           }
-          await delay(12_000); // 12 seconds spacing between accounts to ensure strict single-concurrency
+                    const waitMs = await randomDelay(30_000, 90_000); // Random 30~90s human-like spacing between accounts
+          logger.info("Game auto scheduler waiting randomly between accounts", {
+            accountId: account.id,
+            waitSeconds: Math.round(waitMs / 1000)
+          });
           continue;
         }
 
@@ -144,25 +149,25 @@ export class GameAutoSchedulerService {
           if (summary.pet && summary.pet.nextFeedRemainingTime === 0 && (summary.pet.fishNum ?? 0) > 0) {
             logger.info("Game auto scheduler auto-feeding hungry pet", { accountId: account.id });
             await runAccountPetDaily(account.id);
-            await delay(3000);
+            await randomDelay(2000, 5000);
           }
           // 2. Pet Treasure Hunt Claim
           if (summary.pet && summary.pet.treasureHuntStatus === 2) {
             logger.info("Game auto scheduler claiming pet treasure hunt and restarting", { accountId: account.id });
             await runAccountPetDaily(account.id);
-            await delay(3000);
+            await randomDelay(2000, 5000);
           }
           // 3. Knife Box Open
           if (summary.knife && summary.knife.canOpenTreasureBox) {
             logger.info("Game auto scheduler opening knife treasure box", { accountId: account.id });
             await runAccountKnifeDaily(account.id);
-            await delay(3000);
+            await randomDelay(2000, 5000);
           }
           // 4. Fruit Harvest
           if (summary.fruit?.plantFruitList?.some((f) => f.completionRate >= 1.0)) {
             logger.info("Game auto scheduler harvesting mature fruit", { accountId: account.id });
             await runAccountFruitDaily(account.id);
-            await delay(3000);
+            await randomDelay(2000, 5000);
           }
         } catch {
           // ignore single account cooldown poll error

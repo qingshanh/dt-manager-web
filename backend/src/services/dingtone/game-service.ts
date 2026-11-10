@@ -128,8 +128,17 @@ function md5Direct(str: string) {
   return crypto.createHash("md5").update(str, "utf8").digest("hex");
 }
 
-function delay(ms: number) {
+export function randomBetween(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+export function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function randomDelay(minMs: number, maxMs: number): Promise<number> {
+  const ms = randomBetween(minMs, maxMs);
+  return new Promise((resolve) => setTimeout(() => resolve(ms), ms));
 }
 
 function formatLog(module: GameTaskLog["module"], level: GameTaskLog["level"], message: string): GameTaskLog {
@@ -708,15 +717,27 @@ export async function runAccountAllDaily(accountId: number): Promise<GameExecuti
   const logs: GameTaskLog[] = [];
   logs.push(formatLog("system", "info", `🚀 开始执行账户 #${accountId} 游戏与福利全自动每日打卡任务`));
 
+  // 1. 萌宠日常
   const petSuccess = await runAccountPetDaily(accountId, logs);
-  await delay(1500);
+  const waitPet = await randomDelay(4000, 10000);
+  logs.push(formatLog("system", "info", `萌宠模块完成，随机等待 ${(waitPet / 1000).toFixed(1)} 秒进入每日果园...`));
+
+  // 2. 果园日常
   const fruitSuccess = await runAccountFruitDaily(accountId, logs);
-  await delay(1500);
+  const waitFruit = await randomDelay(4000, 10000);
+  logs.push(formatLog("system", "info", `果园模块完成，随机等待 ${(waitFruit / 1000).toFixed(1)} 秒进入飞刀国王...`));
+
+  // 3. 飞刀国王日常
   const knifeSuccess = await runAccountKnifeDaily(accountId, logs);
-  await delay(1500);
-  const checkinSuccess = await runAccountCheckinDaily(accountId, logs);
-  await delay(1500);
+  const waitKnife = await randomDelay(4000, 10000);
+  logs.push(formatLog("system", "info", `飞刀模块完成，随机等待 ${(waitKnife / 1000).toFixed(1)} 秒进入会员签到与好运抽奖...`));
+
+  // 4. 会员签到与好运抽奖
   const memberSuccess = await runAccountMemberDaily(accountId, logs);
+  const waitMember = await randomDelay(3000, 7000);
+
+  // 5. 积分中心日常
+  const checkinSuccess = await runAccountCheckinDaily(accountId, logs);
 
   // Auto-redeem points if balance >= 1000
   try {
