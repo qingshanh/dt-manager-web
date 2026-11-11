@@ -1160,6 +1160,20 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     );
   }
 
+  async runFreeCreditsCheckin(account: DirectSessionAccount, mode: 1 | 2 = 1): Promise<ApiResult> {
+    const runtime = await getDirectRuntimeConfig();
+    return this.withRegisteredSession(runtime, account, async (session) => {
+      const tz = encodeURIComponent("GMT+08:00");
+      const query = `&tz=${tz}&auto=0&mode=${mode}&lotteryEnable=1&IsNewUser=0&countryCode=1`;
+      return await session.callCommonRestJson(
+        mode === 1 ? "freeCredits.dailyCheckin" : "freeCredits.feelingLucky",
+        "/billing/user/checkIn/v3",
+        query,
+        15_000
+      );
+    });
+  }
+
   async pausePhoneNumber(
     account: DirectSessionAccount,
     phoneNumber: string,

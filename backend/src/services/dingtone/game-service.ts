@@ -6,11 +6,13 @@ import { checkAndAutoRedeemAmazonGiftCard } from "../point-store.js";
 import { AppError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
 import { fetchPublicJson } from "../public-account-enrichment.js";
+import { DirectDingtoneGateway } from "./direct-gateway.js";
 
 const POINT_API_BASE = "https://dt-apigatewayv2.dt-pn1.com";
 const MATH_WSS_URL = "wss://d15wptekiod8mq.cloudfront.net/ws";
 const MATH_SALT = "8TB{9Iz7";
 const KNIFE_SALT = "horace-allin";
+const directGateway = new DirectDingtoneGateway();
 
 const DEFAULT_HEADERS = {
   accept: "application/json, text/plain, */*",
@@ -137,6 +139,7 @@ export interface AccountGameSummary {
     lastReward: string | null;
     history: MemberRewardRecord[];
   } | null;
+  mathSecondaryEnabled?: boolean;
 }
 
 export interface GameTaskLog {
@@ -193,6 +196,13 @@ async function requestGameJson(path: string, options: { timeoutMs?: number } = {
     throw new Error(`Game request failed: ${response.status} ${path}`);
   }
   return (await response.json()) as Record<string, any>;
+}
+
+export async function isAccountSecondaryChannelEnabled(accountId: number): Promise<boolean> {
+  const setting = await prisma.setting.findUnique({
+    where: { key: `math_secondary_channel_enabled_${accountId}` }
+  });
+  return setting?.value === "true";
 }
 
 export async function resolveAccountContext(accountId: number) {
@@ -480,6 +490,7 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
   let validTimes = 0;
   let addTimes = 0;
   let maxAddTimes = 1;
+  const mathSecondaryEnabled = await isAccountSecondaryChannelEnabled(accountId);
 
   if (ctx.pointUid) {
     try {
@@ -515,7 +526,8 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
     fruit: fruitData,
     knife: knifeData,
     mathGame: mathGameData,
-    member: memberData
+    member: memberData,
+    mathSecondaryEnabled
   };
 }
 
@@ -870,6 +882,10 @@ export async function runAccountAllDaily(accountId: number): Promise<GameExecuti
 
   // 5. 积分中心日常
   const checkinSuccess = await runAccountCheckinDaily(accountId, logs);
+
+  // 5.2 获取免费币 (每日签到 & 幸运测试 Feeling Lucky，实打实奖励币直充钱包)
+  await runAccountFreeCreditsDaily(accountId, logs);
+  await randomDelay(2000, 4000);
 
   // 6. 算术不等式挑战日常 (看广告加次数 -> 代理助力 -> WebSocket自动答题全消耗 -> 世界前十冲榜 -> 自动兑换)
   const mathSuccess = await runAccountMathDaily(accountId, logs);
@@ -1336,16 +1352,42 @@ export async function runAccountMathDaily(accountId: number, logs: GameTaskLog[]
     }
   }
 
-  // 3.2 副通道游戏机会与积分自动消化兑换（实现双通道真正产币闭环）
+  // 3.2 副通道游戏机会与积分自动消化兑换（受每个账号独立开关严格控制）
+  const secondaryEnabled = await isAccountSecondaryChannelEnabled(accountId);
   const secondaryAppId = summary.gameAppId === 66 ? 67 : 66;
   const secondaryLabel = secondaryAppId === 66 ? "叮咚" : "说道";
+
+  if (!secondaryEnabled) {
+    logs.push(formatLog("math", "info", `副通道自动化处于关闭状态，跳过【${secondaryLabel}副通道】做题与兑换`));
+  } else {
   try {
     const secondaryHome = await requestGameJson(
       `/game/homePage?userId=${summary.dtUserId}&appId=${secondaryAppId}&zone=-800&timeStamp=${Date.now()}`
     ).catch(() => null);
     const secUid = secondaryHome?.data?.uid;
-    const secChances = secondaryHome?.data?.chanceLeft ?? 0;
-    if (secUid && secChances > 0) {
+    if (secUid) {
+      // 看广告拿满副通道机会
+      const secAds = secondaryHome?.data?.watchAdsAddChanceFrequency ?? 0;
+      if (secAds > 0) {
+        logs.push(formatLog("math", "info", `看广告获取【${secondaryLabel}副通道】机会 (${secAds} 次)...`));
+        for (let i = 0; i < secAds; i++) {
+          const adRes = await requestGameJson(
+            `/game/watchAdsAddChance?uid=${encodeURIComponent(secUid)}&timeStamp=${Date.now()}`
+          ).catch(() => null);
+          if (adRes?.Result === 1) {
+            logs.push(formatLog("math", "success", `【${secondaryLabel}】第 ${i + 1} 次看广告增加游戏机会成功`));
+            success = true;
+          }
+          await delay(1200);
+        }
+      }
+
+      // 重新获取副通道总机会并全部做完
+      const reloadedSec = await requestGameJson(
+        `/game/homePage?userId=${summary.dtUserId}&appId=${secondaryAppId}&zone=-800&timeStamp=${Date.now()}`
+      ).catch(() => null);
+      const secChances = reloadedSec?.data?.chanceLeft ?? 0;
+      if (secChances > 0) {
       logs.push(formatLog("math", "info", `检测到【${secondaryLabel}副通道】剩余 ${secChances} 次机会，开始自动答题消耗...`));
       for (let i = 0; i < secChances; i++) {
         const secPlay = await playMathGameSession(secUid);
@@ -1356,6 +1398,7 @@ export async function runAccountMathDaily(accountId: number, logs: GameTaskLog[]
           logs.push(formatLog("math", "warn", `【${secondaryLabel}】第 ${i + 1} 局答题异常: ${secPlay.reason || "未知"}`));
         }
         await delay(1200);
+      }
       }
     }
 
@@ -1394,6 +1437,7 @@ export async function runAccountMathDaily(accountId: number, logs: GameTaskLog[]
   } catch (err) {
     logs.push(formatLog("math", "warn", `副通道自动消化跳过: ${err instanceof Error ? err.message : String(err)}`));
   }
+  }
 
   // 4. 世界排行榜冲榜保障 (冲进前十名)
   try {
@@ -1419,6 +1463,132 @@ export async function runAccountMathDaily(accountId: number, logs: GameTaskLog[]
   }
 
   return success;
+}
+
+export async function runAccountFreeCreditsDaily(
+  accountId: number,
+  logs: GameTaskLog[] = []
+): Promise<{ totalCreditsWon: number }> {
+  const ctx = await resolveAccountContext(accountId);
+  if (!ctx.dtUserId) {
+    logs.push(formatLog("checkin", "warn", "账户缺少 dtUserId，跳过免费币每日签到与幸运测试"));
+    return { totalCreditsWon: 0 };
+  }
+
+  logs.push(formatLog("checkin", "info", `🎁 开始执行账户 #${accountId}【获取免费币】每日签到与幸运测试...`));
+  let totalCreditsWon = 0;
+
+  // 1. 每日免费币签到 (mode = 1)
+  try {
+    const res1 = await executeBillingCheckIn(ctx, 1);
+    if (res1.success) {
+      totalCreditsWon += res1.rewardCredits;
+      logs.push(formatLog("checkin", "success", `🎉 ${res1.message}`));
+    } else {
+      logs.push(formatLog("checkin", "info", `免费币每日签到提示: ${res1.message}`));
+    }
+  } catch (err) {
+    logs.push(formatLog("checkin", "warn", `免费币每日签到请求异常: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  await delay(1500);
+
+  // 2. 幸运测试 (I'm Feeling Lucky, mode = 2)
+  try {
+    const res2 = await executeBillingCheckIn(ctx, 2);
+    if (res2.success) {
+      totalCreditsWon += res2.rewardCredits;
+      logs.push(formatLog("checkin", "success", `🎉 ${res2.message}`));
+    } else {
+      logs.push(formatLog("checkin", "info", `幸运测试提示: ${res2.message}`));
+    }
+  } catch (err) {
+    logs.push(formatLog("checkin", "warn", `幸运测试请求异常: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  return { totalCreditsWon };
+}
+
+async function executeBillingCheckIn(
+  ctx: { account: any; dtUserId: string | null },
+  mode: 1 | 2
+): Promise<{ success: boolean; rewardCredits: number; message: string; data?: any }> {
+  const modeName = mode === 1 ? "免费币每日签到" : "幸运测试 (Feeling Lucky)";
+  const userId = ctx.dtUserId;
+  const token = ctx.account.dtToken || "";
+  const deviceId = ctx.account.dtDeviceId || "";
+  const tz = encodeURIComponent("GMT+08:00");
+  const countryCode = 1;
+
+  // 1. 优先尝试 HTTP Direct API
+  if (userId && token && deviceId) {
+    const url = `https://dt-apigatewayv2.dt-pn1.com/billing/user/checkIn/v3?userId=${userId}&token=${encodeURIComponent(token)}&deviceId=${encodeURIComponent(deviceId)}&tz=${tz}&auto=0&mode=${mode}&lotteryEnable=1&IsNewUser=0&countryCode=${countryCode}`;
+    try {
+      const res = await fetch(url, {
+        headers: DEFAULT_HEADERS,
+        signal: AbortSignal.timeout(10_000)
+      }).then((r) => r.json());
+
+      if (res?.Result === 1) {
+        const credits = Number(res.rewardCredits || res.rewardCreditsDouble || 0);
+        const dup = Boolean(res.duplicated);
+        if (dup) {
+          return { success: true, rewardCredits: 0, message: `今日已完成${modeName}，无需重复领取`, data: res };
+        }
+        return {
+          success: true,
+          rewardCredits: credits,
+          message: `${modeName}成功！奖励 ${credits} 说道币/叮咚币已直接充入钱包！`,
+          data: res
+        };
+      }
+      if (res?.Reason?.includes("duplicated") || res?.Reason?.includes("已签") || res?.Reason?.includes("已领取")) {
+        return { success: true, rewardCredits: 0, message: `今日已完成${modeName}`, data: res };
+      }
+    } catch {
+      // fallback to TCP Direct Gateway
+    }
+  }
+
+  // 2. 降级回退到 Direct TCP Gateway Session 协议请求
+  try {
+    const directAccount = {
+      id: ctx.account.id,
+      adminId: ctx.account.adminId,
+      appVariant: ctx.account.appVariant,
+      email: ctx.account.email,
+      phone: ctx.account.phone,
+      dtUserId: String(ctx.dtUserId),
+      token,
+      deviceId
+    };
+    const payload = await directGateway.runFreeCreditsCheckin(directAccount as any, mode);
+    if (payload && ((payload as any).Result === 1 || (payload as any).rewardCredits !== undefined)) {
+      const credits = Number((payload as any).rewardCredits || (payload as any).rewardCreditsDouble || 0);
+      const dup = Boolean((payload as any).duplicated);
+      if (dup) {
+        return { success: true, rewardCredits: 0, message: `今日已完成${modeName}，无需重复领取`, data: payload };
+      }
+      return {
+        success: true,
+        rewardCredits: credits,
+        message: `${modeName}成功！奖励 ${credits} 说道币/叮咚币已直接充入钱包！`,
+        data: payload
+      };
+    }
+    return {
+      success: false,
+      rewardCredits: 0,
+      message: (payload as any)?.Reason || (payload as any)?.message || "接口未返回奖励数据",
+      data: payload
+    };
+  } catch (err) {
+    return {
+      success: false,
+      rewardCredits: 0,
+      message: err instanceof Error ? err.message : String(err)
+    };
+  }
 }
 
 export async function climbMathGameRank(

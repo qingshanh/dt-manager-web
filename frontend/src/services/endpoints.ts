@@ -816,6 +816,7 @@ export interface AccountGameSummary {
     lastReward: string | null;
     history: MemberRewardRecord[];
   } | null;
+  mathSecondaryEnabled?: boolean;
 }
 
 export interface GameTaskLog {
@@ -883,6 +884,21 @@ export async function addXiequWhitelist(ukey?: string): Promise<{ success: boole
 
 export async function runAccountMemberDaily(accountId: number): Promise<{ success: boolean; logs: GameTaskLog[] }> {
   const res = await api.post<ApiResponse<{ success: boolean; logs: GameTaskLog[] }>>(`/accounts/${accountId}/games/member/daily`);
+  return res.data.data;
+}
+
+export async function runAccountFreeCreditsDaily(accountId: number): Promise<{ totalCreditsWon: number; logs: GameTaskLog[] }> {
+  const res = await api.post<ApiResponse<{ totalCreditsWon: number; logs: GameTaskLog[] }>>(`/accounts/${accountId}/games/free-credits/daily`);
+  return res.data.data;
+}
+
+export async function getMathSecondaryChannel(accountId: number): Promise<{ enabled: boolean }> {
+  const res = await api.get<ApiResponse<{ enabled: boolean }>>(`/accounts/${accountId}/math-secondary-channel`);
+  return res.data.data;
+}
+
+export async function setMathSecondaryChannel(accountId: number, enabled: boolean): Promise<{ enabled: boolean }> {
+  const res = await api.post<ApiResponse<{ enabled: boolean }>>(`/accounts/${accountId}/math-secondary-channel`, { enabled });
   return res.data.data;
 }
 

@@ -14,6 +14,7 @@ import {
   redeemMathGamePoints,
   climbMathGameRank,
   runAccountMathDaily,
+  runAccountFreeCreditsDaily,
   runAccountAllDaily,
   runAccountFruitDaily,
   runAccountKnifeDaily,
@@ -303,6 +304,22 @@ gamesRouter.post("/math/climb-rank", async (req, res, next) => {
 
     const logs: any[] = [];
     const result = await climbMathGameRank(accountId, { targetRank, customScore }, logs);
+    ok(res, { ...result, logs });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/accounts/:id/games/free-credits/daily - Free credits daily check-in and feeling lucky
+gamesRouter.post("/free-credits/daily", async (req, res, next) => {
+  try {
+    const accountId = Number((req.params as any).id || req.body.account_id);
+    if (!Number.isInteger(accountId) || accountId <= 0) {
+      throw new AppError("Valid account ID is required", 400, 400);
+    }
+    await assertAccountAccess(accountId, req.auth!.userId);
+    const logs: any[] = [];
+    const result = await runAccountFreeCreditsDaily(accountId, logs);
     ok(res, { ...result, logs });
   } catch (error) {
     next(error);

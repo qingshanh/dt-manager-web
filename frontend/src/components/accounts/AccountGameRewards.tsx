@@ -44,6 +44,9 @@ import {
   runAllAccountsGameDaily,
   waterAccountFruit,
   runAccountMemberDaily,
+  runAccountFreeCreditsDaily,
+  getMathSecondaryChannel,
+  setMathSecondaryChannel,
   runAccountMathDaily,
   getAutoRedeemAmazon,
   setAutoRedeemAmazon,
@@ -72,6 +75,8 @@ export default function AccountGameRewards({ accountId }: Props) {
   const [savingAutoRedeem, setSavingAutoRedeem] = useState(false);
   const [pointStoreData, setPointStoreData] = useState<any>(null);
   const [schedulerStatus, setSchedulerStatus] = useState<any>(null);
+  const [secondaryChannelEnabled, setSecondaryChannelEnabled] = useState(false);
+  const [savingSecondaryChannel, setSavingSecondaryChannel] = useState(false);
 
   // Modals state
   const [climbModalOpen, setClimbModalOpen] = useState(false);
@@ -97,6 +102,7 @@ export default function AccountGameRewards({ accountId }: Props) {
           setAutoRedeemTarget(String(res.products[0].product_id));
         }
       }).catch(() => {});
+      void getMathSecondaryChannel(accountId).then((res) => setSecondaryChannelEnabled(res.enabled)).catch(() => {});
       void getGameSchedulerStatus().then((res) => setSchedulerStatus(res)).catch(() => {});
     } catch (err) {
       message.error(err instanceof Error ? err.message : '获取游戏与福利数据失败');
@@ -218,6 +224,39 @@ export default function AccountGameRewards({ accountId }: Props) {
   const handleSaveAutoRedeemTarget = async () => {
     await handleToggleAutoRedeemAmazon(autoRedeemAmazon, autoRedeemTarget);
     message.success('已保存自动兑换目标商品配置！');
+  };
+
+  const handleToggleSecondaryChannel = async (checked: boolean) => {
+    setSavingSecondaryChannel(true);
+    try {
+      const res = await setMathSecondaryChannel(accountId, checked);
+      setSecondaryChannelEnabled(res.enabled);
+      message.success(res.enabled ? '已开启算术副通道全自动任务（做题/看广告/自动兑换）' : '已关闭算术副通道任务');
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '保存副通道设置失败');
+    } finally {
+      setSavingSecondaryChannel(false);
+    }
+  };
+
+  const handleRunFreeCredits = async () => {
+    setActionLoading('free-credits');
+    try {
+      const res = await runAccountFreeCreditsDaily(accountId);
+      if (res.logs?.length) {
+        setLogs((prev) => [...res.logs, ...prev]);
+      }
+      if (res.totalCreditsWon > 0) {
+        message.success(`【获取免费币】每日签到与幸运测试成功获得 ${res.totalCreditsWon} 币！`);
+      } else {
+        message.info('【获取免费币】每日签到与幸运测试已执行完成');
+      }
+      await loadData();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '获取免费币执行失败');
+    } finally {
+      setActionLoading(null);
+    }
   };
 
   const handleRunMathDaily = async () => {
@@ -719,6 +758,20 @@ export default function AccountGameRewards({ accountId }: Props) {
               <Descriptions.Item label="历史最高记录">
                 <span>{math.record ? `${math.record} 秒` : '-'}</span>
               </Descriptions.Item>
+              <Descriptions.Item label="副通道全自动开关">
+                <Space wrap align="center" size={8}>
+                  <Switch
+                    checked={secondaryChannelEnabled}
+                    loading={savingSecondaryChannel}
+                    onChange={(checked) => void handleToggleSecondaryChannel(checked)}
+                    checkedChildren="开启"
+                    unCheckedChildren="关闭"
+                  />
+                  <Typography.Text style={{ fontSize: 12, color: secondaryChannelEnabled ? '#1677ff' : '#888' }}>
+                    {secondaryChannelEnabled ? '已开启：自动完成副通道看广告+做题翻倍+自动兑换充入主钱包' : '已关闭：仅保留副端短链供需要时使用，后台不自动执行副通道（默认防风控）'}
+                  </Typography.Text>
+                </Space>
+              </Descriptions.Item>
               <Descriptions.Item label="推广短链码 (双通道独立)">
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
                   <Space wrap size={[8, 8]}>
@@ -849,12 +902,29 @@ export default function AccountGameRewards({ accountId }: Props) {
           title="🌟 会员好运签到"
           extra={(
             <Space size={6}>
+              <Button size="small" type="primary" loading={actionLoading === 'free-credits'} onClick={() => void handleRunFreeCredits()}>免费币签到/测试</Button>
               <Button size="small" icon={<ClockCircleOutlined />} onClick={() => setMemberHistoryModalOpen(true)}>历史</Button>
               <Button size="small" icon={<StarOutlined />} loading={actionLoading === 'member'} onClick={() => void handleRunMemberDaily()}>签到抽奖</Button>
             </Space>
           )}
         >
           <Descriptions size="small" column={1} bordered>
+            <Descriptions.Item label="🎁 免费币签到 & 幸运测试">
+              <Space wrap align="center" size={8}>
+                <Tag color="cyan">每日免费币签到</Tag>
+                <Tag color="gold">幸运测试 (Feeling Lucky)</Tag>
+                <Button
+                  size="small"
+                  loading={actionLoading === 'free-credits'}
+                  onClick={() => void handleRunFreeCredits()}
+                >
+                  立即领币
+                </Button>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  实打实获得说道/叮咚币直充主钱包余额
+                </Typography.Text>
+              </Space>
+            </Descriptions.Item>
             <Descriptions.Item label="每日好运转盘">
               <Space wrap size={[4, 4]}>
                 <Tag color={member && member.adRouletteRemainTimes > 0 ? 'orange' : 'default'}>
