@@ -1336,6 +1336,65 @@ export async function runAccountMathDaily(accountId: number, logs: GameTaskLog[]
     }
   }
 
+  // 3.2 副通道游戏机会与积分自动消化兑换（实现双通道真正产币闭环）
+  const secondaryAppId = summary.gameAppId === 66 ? 67 : 66;
+  const secondaryLabel = secondaryAppId === 66 ? "叮咚" : "说道";
+  try {
+    const secondaryHome = await requestGameJson(
+      `/game/homePage?userId=${summary.dtUserId}&appId=${secondaryAppId}&zone=-800&timeStamp=${Date.now()}`
+    ).catch(() => null);
+    const secUid = secondaryHome?.data?.uid;
+    const secChances = secondaryHome?.data?.chanceLeft ?? 0;
+    if (secUid && secChances > 0) {
+      logs.push(formatLog("math", "info", `检测到【${secondaryLabel}副通道】剩余 ${secChances} 次机会，开始自动答题消耗...`));
+      for (let i = 0; i < secChances; i++) {
+        const secPlay = await playMathGameSession(secUid);
+        if (secPlay.success) {
+          logs.push(formatLog("math", "success", `【${secondaryLabel}】第 ${i + 1} 局答题通关并翻倍！获得 ${secPlay.earnedPoints} 积分`));
+          success = true;
+        } else {
+          logs.push(formatLog("math", "warn", `【${secondaryLabel}】第 ${i + 1} 局答题异常: ${secPlay.reason || "未知"}`));
+        }
+        await delay(1200);
+      }
+    }
+
+    // 副通道积分自动兑换（兑换后的说道币/叮咚币全额汇入同一个主钱包！）
+    const freshSecHome = await requestGameJson(
+      `/game/homePage?userId=${summary.dtUserId}&appId=${secondaryAppId}&zone=-800&timeStamp=${Date.now()}`
+    ).catch(() => null);
+    const secPoints = freshSecHome?.data?.validPoint ?? 0;
+    if (secUid && secPoints >= 1000) {
+      const prod10k = secondaryAppId === 66 ? 23 : 25;
+      const prod1k = secondaryAppId === 66 ? 22 : 24;
+      const dailyState = loadMathDailyState(accountId);
+      let pLeft = secPoints;
+
+      if (pLeft >= 10000 && !dailyState.redeemedProductIds.includes(prod10k)) {
+        logs.push(formatLog("math", "info", `【${secondaryLabel}副通道】积分 ${pLeft}，尝试兑换 10000 档位入账主钱包...`));
+        const r10 = await redeemMathGamePoints(accountId, prod10k, secUid).catch(() => null);
+        if (r10?.success) {
+          logs.push(formatLog("math", "success", `🎉 ${r10.message}`));
+          pLeft -= 10000;
+        } else if (r10?.message) {
+          logs.push(formatLog("math", "info", `【${secondaryLabel}】10000档位提示: ${r10.message}`));
+        }
+        await delay(1200);
+      }
+      if (pLeft >= 1000 && !dailyState.redeemedProductIds.includes(prod1k)) {
+        logs.push(formatLog("math", "info", `【${secondaryLabel}副通道】积分 ${pLeft}，尝试兑换 1000 档位入账主钱包...`));
+        const r1 = await redeemMathGamePoints(accountId, prod1k, secUid).catch(() => null);
+        if (r1?.success) {
+          logs.push(formatLog("math", "success", `🎉 ${r1.message}`));
+        } else if (r1?.message) {
+          logs.push(formatLog("math", "info", `【${secondaryLabel}】1000档位提示: ${r1.message}`));
+        }
+      }
+    }
+  } catch (err) {
+    logs.push(formatLog("math", "warn", `副通道自动消化跳过: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
   // 4. 世界排行榜冲榜保障 (冲进前十名)
   try {
     const currentRank = summary.mathGame?.ranking ?? -1;
@@ -1754,10 +1813,14 @@ export async function getGameRankList(appId = 66): Promise<RankLeaderboardItem[]
   }
 }
 
-export async function redeemMathGamePoints(accountId: number, productId: number): Promise<{ success: boolean; message: string }> {
+export async function redeemMathGamePoints(
+  accountId: number,
+  productId: number,
+  customUid?: string
+): Promise<{ success: boolean; message: string }> {
   const ctx = await resolveAccountContext(accountId);
   const summary = await getAccountGameSummary(accountId);
-  const gameUid = summary.mathGame?.uid;
+  const gameUid = customUid || summary.mathGame?.uid;
   if (!gameUid) {
     throw new AppError("未获取到算术游戏 uid", 400, 400);
   }
