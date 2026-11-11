@@ -7,6 +7,7 @@ import {
   Card,
   Descriptions,
   Empty,
+  InputNumber,
   Modal,
   Progress,
   Select,
@@ -35,6 +36,7 @@ import {
   feedAccountPet,
   getAccountGameSummary,
   getGameRankList,
+  climbAccountMathRank,
   redeemMathGamePoints,
   runAccountGameDaily,
   runAccountKnifeDaily,
@@ -71,6 +73,9 @@ export default function AccountGameRewards({ accountId }: Props) {
   const [schedulerStatus, setSchedulerStatus] = useState<any>(null);
 
   // Modals state
+  const [climbModalOpen, setClimbModalOpen] = useState(false);
+  const [targetRankChoice, setTargetRankChoice] = useState<number>(0);
+  const [customScoreInput, setCustomScoreInput] = useState<number>(430);
   const [guideModalOpen, setGuideModalOpen] = useState(false);
   const [guideTab, setGuideTab] = useState('pet');
   const [rankModalOpen, setRankModalOpen] = useState(false);
@@ -233,6 +238,33 @@ export default function AccountGameRewards({ accountId }: Props) {
     }
   };
 
+  const handleClimbRank = async () => {
+    setActionLoading('climb');
+    setClimbModalOpen(false);
+    try {
+      const params: { target_rank?: number; custom_score?: number } = {};
+      if (targetRankChoice === -1) {
+        params.custom_score = customScoreInput;
+      } else if (targetRankChoice >= 2 && targetRankChoice <= 6) {
+        params.target_rank = targetRankChoice;
+      }
+      const res = await climbAccountMathRank(accountId, params);
+      if (res.logs?.length) {
+        setLogs((prev) => [...res.logs, ...prev]);
+      }
+      if (res.success) {
+        message.success(res.message || '冲榜挑战成功！');
+      } else {
+        message.info(res.message || '冲榜挑战已处理');
+      }
+      await loadData();
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : '冲榜挑战失败');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   const handleRunMemberDaily = async () => {
     setActionLoading('member');
     try {
@@ -321,6 +353,16 @@ export default function AccountGameRewards({ accountId }: Props) {
   const currentFruit = fruit?.plantFruitList?.[0];
   const expiry = data?.creditExpiry;
 
+  const formatRemainingDuration = (seconds?: number | null): string => {
+    if (!seconds || seconds <= 0) return '即将结算';
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (d > 0) return `${d}天 ${h}小时 ${m}分`;
+    if (h > 0) return `${h}小时 ${m}分`;
+    return `${m}分钟`;
+  };
+
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
       {/* 顶部状态与全局控制条 */}
@@ -330,7 +372,11 @@ export default function AccountGameRewards({ accountId }: Props) {
           <Tag color="cyan">客户端: {data?.appType === 0 ? '叮咚 (0)' : '说道 (3)'}</Tag>
         </Space>
         <Space wrap align="center">
-          {schedulerStatus?.nextCycleAt ? (
+          {schedulerStatus?.running ? (
+            <Tag color="processing" icon={<ReloadOutlined spin />}>
+              正在自动调度: {schedulerStatus.currentTask || '任务执行中'}
+            </Tag>
+          ) : schedulerStatus?.nextCycleAt ? (
             <Tag color="blue" icon={<ClockCircleOutlined />}>
               下次自动唤醒: {new Date(schedulerStatus.nextCycleAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
             </Tag>
@@ -611,12 +657,41 @@ export default function AccountGameRewards({ accountId }: Props) {
             <Space size={6}>
               <Tooltip title="查看玩法说明"><Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('math')} /></Tooltip>
               <Button size="small" icon={<TrophyOutlined />} onClick={handleOpenRank}>排行榜</Button>
-              <Button size="small" icon={<ThunderboltOutlined />} loading={actionLoading === 'math'} onClick={() => void handleRunMathDaily()}>冲榜/做题</Button>
+              <Button size="small" icon={<ThunderboltOutlined />} loading={actionLoading === 'math'} onClick={() => void handleRunMathDaily()}>做题/消耗</Button>
+              <Button size="small" type="primary" icon={<TrophyOutlined />} loading={actionLoading === 'climb'} onClick={() => setClimbModalOpen(true)}>冲榜</Button>
             </Space>
           )}
         >
           {math ? (
             <Descriptions size="small" column={1} bordered>
+              <Descriptions.Item label="世界排名 / 最佳得分">
+                <Space wrap>
+                  {typeof math.ranking === 'number' && math.ranking > 0 ? (
+                    <Tag color={math.ranking <= 10 ? 'gold' : 'blue'}>
+                      🏆 世界第 {math.ranking} 名
+                    </Tag>
+                  ) : (
+                    <Tag color="default">未上榜</Tag>
+                  )}
+                  <Typography.Text type="secondary" style={{ fontSize: 13 }}>
+                    (历史最佳得分: {math.bestScore ?? 0} 分)
+                  </Typography.Text>
+                </Space>
+              </Descriptions.Item>
+              <Descriptions.Item label="本轮赛季结算">
+                {math.seasonEndAt ? (
+                  <Space wrap size={6}>
+                    <Tag color="orange" icon={<ClockCircleOutlined />}>
+                      剩 {formatRemainingDuration(math.seasonRemainingSeconds)}
+                    </Tag>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      ({new Date(math.seasonEndAt).toLocaleDateString('zh-CN')} {new Date(math.seasonEndAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 结算)
+                    </Typography.Text>
+                  </Space>
+                ) : (
+                  <Typography.Text type="secondary">本轮进行中</Typography.Text>
+                )}
+              </Descriptions.Item>
               <Descriptions.Item label="当前积分余额">
                 <Space>
                   <Typography.Text strong style={{ fontSize: 16, color: '#d46b08' }}>
@@ -1016,6 +1091,56 @@ export default function AccountGameRewards({ accountId }: Props) {
             },
           ]}
         />
+      </Modal>
+
+      {/* 算术冲榜 Modal */}
+      <Modal
+        title="🏆 算术挑战 - 立即冲榜"
+        open={climbModalOpen}
+        onCancel={() => setClimbModalOpen(false)}
+        onOk={() => void handleClimbRank()}
+        okText="立即冲榜"
+        confirmLoading={actionLoading === 'climb'}
+        width={500}
+      >
+        <Space direction="vertical" size={14} style={{ width: '100%', marginTop: 8 }}>
+          <Alert
+            type="info"
+            showIcon
+            message="智能冲榜机制说明"
+            description="系统将模拟真实答题并向服务端提交成绩。默认随机超越第 2~6 名，稳妥进入全球前十名！"
+          />
+          <div>
+            <div style={{ marginBottom: 6, fontWeight: 500 }}>选择目标名次：</div>
+            <Select
+              style={{ width: '100%' }}
+              value={targetRankChoice}
+              onChange={(val) => setTargetRankChoice(val)}
+              options={[
+                { value: 0, label: '🎲 智能随机超越第 2 ~ 6 名 (推荐)' },
+                { value: 2, label: '🥈 冲向第 2 名 (超越 #2 分数)' },
+                { value: 3, label: '🥉 冲向第 3 名 (超越 #3 分数)' },
+                { value: 4, label: '冲向第 4 名 (超越 #4 分数)' },
+                { value: 5, label: '冲向第 5 名 (超越 #5 分数)' },
+                { value: 6, label: '冲向第 6 名 (超越 #6 分数)' },
+                { value: -1, label: '✍️ 自定义目标答题得分' },
+              ]}
+            />
+          </div>
+          {targetRankChoice === -1 && (
+            <div>
+              <div style={{ marginBottom: 6, fontWeight: 500 }}>自定义目标得分：</div>
+              <InputNumber
+                style={{ width: '100%' }}
+                min={10}
+                max={999}
+                value={customScoreInput}
+                onChange={(val) => setCustomScoreInput(val || 430)}
+                addonAfter="分"
+              />
+            </div>
+          )}
+        </Space>
       </Modal>
       {/* 会员奖励历史 Modal */}
       <Modal

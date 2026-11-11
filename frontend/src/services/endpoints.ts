@@ -777,6 +777,10 @@ export interface AccountGameSummary {
     chanceLeft: number | null;
     watchAdsAddChanceFrequency: number | null;
     record: number | null;
+    ranking?: number | null;
+    bestScore?: number | null;
+    seasonEndAt?: string | null;
+    seasonRemainingSeconds?: number | null;
     shortUuid: string | null;
     redeemProducts: Array<{
       productId: number;
@@ -904,6 +908,19 @@ export async function runAccountMathDaily(accountId: number): Promise<{ success:
   return res.data.data;
 }
 
+export async function climbAccountMathRank(
+  accountId: number,
+  params?: { target_rank?: number; custom_score?: number }
+): Promise<{ success: boolean; bestScore: number; ranking?: number; message: string; logs: GameTaskLog[] }> {
+  const res = await api.post<ApiResponse<{
+    success: boolean;
+    bestScore: number;
+    ranking?: number;
+    message: string;
+    logs: GameTaskLog[];
+  }>>(`/accounts/${accountId}/games/math/climb-rank`, params || {});
+  return res.data.data;
+}
 
 export async function getAutoRedeemAmazon(accountId: number): Promise<{ enabled: boolean; target_product?: string }> {
   const res = await api.get<ApiResponse<{ enabled: boolean }>>(`/accounts/${accountId}/auto-redeem-amazon`);

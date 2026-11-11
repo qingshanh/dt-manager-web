@@ -4,6 +4,8 @@ import { BackgroundLoop } from "./background-loop.js";
 import {
   getAccountGameSummary,
   randomDelay,
+  climbMathGameRank,
+  autoRedeemMathPoints,
   runAccountAllDaily,
   runAccountFruitDaily,
   runAccountKnifeDaily,
@@ -21,8 +23,36 @@ function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => setTimeout(() => resolve(fallback), timeoutMs))
+  ]);
+}
+
+export function getCstTime(date = new Date()): {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+  dateStr: string;
+} {
+  // China Standard Time is UTC+8
+  const cst = new Date(date.getTime() + 8 * 3600_000);
+  const year = cst.getUTCFullYear();
+  const month = cst.getUTCMonth() + 1;
+  const day = cst.getUTCDate();
+  const hour = cst.getUTCHours();
+  const minute = cst.getUTCMinutes();
+  const second = cst.getUTCSeconds();
+  const dateStr = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  return { year, month, day, hour, minute, second, dateStr };
+}
+
 function isNightQuietHours(date = new Date()): boolean {
-  const hour = date.getHours();
+  const { hour } = getCstTime(date);
   return hour >= 0 && hour < 7;
 }
 
@@ -35,7 +65,7 @@ function parseBooleanSetting(value: string | undefined, fallback: boolean) {
 }
 
 function getTodayDateString(date = new Date()): string {
-  return date.toISOString().split("T")[0]!;
+  return getCstTime(date).dateStr;
 }
 
 // Deterministically assign each account a daily run hour (between 8:00 and 20:59) and minute
@@ -55,8 +85,10 @@ function getAccountScheduledDailyTime(accountId: number, dateStr: string): { hou
 export class GameAutoSchedulerService {
   private readonly accountDailyCompletedDates = new Map<number, string>();
   private isRunning = false;
+  private currentRunningAccountId: number | null = null;
+  private currentTaskName: string | null = null;
   private lastCycleAt: Date | null = null;
-  private nextCycleAt: Date | null = null;
+  private nextWakeUpTime: number = Date.now() + 30_000;
 
   private readonly loop = new BackgroundLoop({
     initialDelayMs: 30_000,
@@ -70,6 +102,7 @@ export class GameAutoSchedulerService {
   });
 
   start() {
+    this.nextWakeUpTime = Date.now() + 30_000;
     this.loop.start();
     logger.info("Game auto scheduler service started");
   }
@@ -80,27 +113,31 @@ export class GameAutoSchedulerService {
 
   getStatus() {
     const now = new Date();
-    const lastCycle = this.lastCycleAt;
-    const nextCycleAt = lastCycle
-      ? new Date(lastCycle.getTime() + (isNightQuietHours(now) ? NIGHT_CYCLE_DELAY_MS : GAME_SCHEDULER_CYCLE_DELAY_MS)).toISOString()
-      : new Date(now.getTime() + GAME_SCHEDULER_CYCLE_DELAY_MS).toISOString();
+    const cst = getCstTime(now);
+    const completedTodayCount = Array.from(this.accountDailyCompletedDates.values()).filter((d) => d === cst.dateStr).length;
+    const safeNextTime = Math.max(this.nextWakeUpTime, now.getTime() + 5_000);
     return {
       running: this.isRunning,
+      currentAccountId: this.currentRunningAccountId,
+      currentTask: this.currentTaskName,
       isNightQuiet: isNightQuietHours(now),
+      cstTime: `${cst.dateStr} ${String(cst.hour).padStart(2, "0")}:${String(cst.minute).padStart(2, "0")}:${String(cst.second).padStart(2, "0")}`,
       lastCycleAt: this.lastCycleAt?.toISOString() ?? null,
-      nextCycleAt,
-      completedTodayCount: Array.from(this.accountDailyCompletedDates.values()).filter((d) => d === getTodayDateString(now)).length
+      nextCycleAt: new Date(safeNextTime).toISOString(),
+      completedTodayCount
     };
   }
 
   async runCycle(now = new Date()): Promise<number> {
     const settings = await getSettingsMap().catch(() => ({} as Record<string, string>));
     if (!parseBooleanSetting(settings.game_auto_scheduler_enabled, true)) {
+      this.nextWakeUpTime = Date.now() + GAME_SCHEDULER_CYCLE_DELAY_MS;
       return GAME_SCHEDULER_CYCLE_DELAY_MS;
     }
 
     // Skip during midnight quiet hours (0:00 - 7:00)
     if (isNightQuietHours(now)) {
+      this.nextWakeUpTime = Date.now() + NIGHT_CYCLE_DELAY_MS;
       return NIGHT_CYCLE_DELAY_MS;
     }
 
@@ -110,9 +147,10 @@ export class GameAutoSchedulerService {
 
     this.isRunning = true;
     this.lastCycleAt = now;
-    const dateStr = getTodayDateString(now);
-    const currentHour = now.getHours();
-    const currentMinute = now.getMinutes();
+    const cst = getCstTime(now);
+    const dateStr = cst.dateStr;
+    const currentHour = cst.hour;
+    const currentMinute = cst.minute;
 
     try {
       const accounts = await prisma.dtAccount.findMany({
@@ -121,6 +159,7 @@ export class GameAutoSchedulerService {
       });
 
       for (const account of accounts) {
+        this.currentRunningAccountId = account.id;
         const lastCompleted = this.accountDailyCompletedDates.get(account.id);
         const { hour: targetHour, minute: targetMinute } = getAccountScheduledDailyTime(account.id, dateStr);
 
@@ -130,12 +169,13 @@ export class GameAutoSchedulerService {
           (currentHour >= 12 || currentHour > targetHour || (currentHour === targetHour && currentMinute >= targetMinute));
 
         if (shouldRunMainDaily) {
+          this.currentTaskName = `执行主干日常任务 (账户 #${account.id})`;
           logger.info("Game auto scheduler running daily tasks for account", {
             accountId: account.id,
             targetTime: `${targetHour}:${targetMinute}`
           });
           try {
-            await runAccountAllDaily(account.id);
+            await withTimeout(runAccountAllDaily(account.id), 120_000, null);
             this.accountDailyCompletedDates.set(account.id, dateStr);
           } catch (err) {
             logger.warn("Game auto scheduler daily run failed for account", {
@@ -153,23 +193,38 @@ export class GameAutoSchedulerService {
 
         // Tier 2: 全天 10 分钟机会补漏与冷却消化池
         try {
-          const summary = await getAccountGameSummary(account.id);
+          this.currentTaskName = `10分钟机会消化 (账户 #${account.id})`;
+          const summary = await withTimeout(getAccountGameSummary(account.id), 25_000, null);
+          if (!summary) continue;
 
-          // 1. 算术不等式: 检测到有剩余机会或广告机会，立即答题做完翻倍
-          if (summary.mathGame && ((summary.mathGame.chanceLeft ?? 0) > 0 || (summary.mathGame.watchAdsAddChanceFrequency ?? 0) > 0)) {
-            logger.info("Game auto scheduler consuming math game chances and climbing rank", {
-              accountId: account.id,
-              chanceLeft: summary.mathGame.chanceLeft
-            });
-            await runAccountMathDaily(account.id);
-            await randomDelay(2000, 5000);
+          // 1. 算术不等式: 消耗做题机会、世界前十冲榜与积分兑换
+          if (summary.mathGame) {
+            if ((summary.mathGame.chanceLeft ?? 0) > 0 || (summary.mathGame.watchAdsAddChanceFrequency ?? 0) > 0) {
+              logger.info("Game auto scheduler consuming math game chances", {
+                accountId: account.id,
+                chanceLeft: summary.mathGame.chanceLeft
+              });
+              await withTimeout(runAccountMathDaily(account.id), 60_000, false);
+              await randomDelay(2000, 5000);
+            } else {
+              const rank = summary.mathGame.ranking ?? -1;
+              if (rank <= 0 || rank > 10) {
+                logger.info("Game auto scheduler auto climbing math rank into top 10", {
+                  accountId: account.id,
+                  currentRank: rank
+                });
+                await withTimeout(climbMathGameRank(account.id), 60_000, null);
+                await randomDelay(2000, 5000);
+              }
+            }
+            await autoRedeemMathPoints(account.id, summary).catch(() => null);
           }
 
           // 2. 飞刀国王: 开箱，投掷全部剩余飞刀并抽奖翻倍
           if (summary.knife) {
             if (summary.knife.canOpenTreasureBox) {
               logger.info("Game auto scheduler opening knife treasure box", { accountId: account.id });
-              await runAccountKnifeDaily(account.id);
+              await withTimeout(runAccountKnifeDaily(account.id), 40_000, false);
               await randomDelay(2000, 5000);
             } else if (
               (summary.knife.remainPlayTimes ?? 0) > 0 ||
@@ -179,7 +234,7 @@ export class GameAutoSchedulerService {
                 accountId: account.id,
                 remainPlayTimes: summary.knife.remainPlayTimes
               });
-              await runAccountKnifeDaily(account.id);
+              await withTimeout(runAccountKnifeDaily(account.id), 60_000, false);
               await randomDelay(2000, 5000);
             }
           }
@@ -192,7 +247,7 @@ export class GameAutoSchedulerService {
               summary.member.addTimes < summary.member.maxAddTimes
             ) {
               logger.info("Game auto scheduler running member roulette and checkin", { accountId: account.id });
-              await runAccountMemberDaily(account.id);
+              await withTimeout(runAccountMemberDaily(account.id), 30_000, false);
               await randomDelay(2000, 5000);
             }
           }
@@ -201,15 +256,15 @@ export class GameAutoSchedulerService {
           if (summary.pet) {
             if (summary.pet.nextFeedRemainingTime === 0 && (summary.pet.fishNum ?? 0) > 0) {
               logger.info("Game auto scheduler auto-feeding hungry pet", { accountId: account.id });
-              await runAccountPetDaily(account.id);
+              await withTimeout(runAccountPetDaily(account.id), 30_000, false);
               await randomDelay(2000, 5000);
-            } else if (summary.pet.treasureHuntStatus === 2) {
-              logger.info("Game auto scheduler claiming pet treasure hunt and restarting", { accountId: account.id });
-              await runAccountPetDaily(account.id);
+            } else if (summary.pet.treasureHuntStatus === 2 || summary.pet.treasureHuntStatus === 0) {
+              logger.info("Game auto scheduler handling pet treasure hunt (claim or start)", { accountId: account.id });
+              await withTimeout(runAccountPetDaily(account.id), 30_000, false);
               await randomDelay(2000, 5000);
             } else if (summary.pet.lotteryLeftChance > 0 || summary.pet.playLeftChance > 0) {
               logger.info("Game auto scheduler using pet lottery or play chances", { accountId: account.id });
-              await runAccountPetDaily(account.id);
+              await withTimeout(runAccountPetDaily(account.id), 30_000, false);
               await randomDelay(2000, 5000);
             }
           }
@@ -218,17 +273,17 @@ export class GameAutoSchedulerService {
           if (summary.fruit) {
             if (summary.fruit.plantFruitList?.some((f) => (f.completionRate ?? 0) >= 1.0)) {
               logger.info("Game auto scheduler harvesting mature fruit", { accountId: account.id });
-              await runAccountFruitDaily(account.id);
+              await withTimeout(runAccountFruitDaily(account.id), 30_000, false);
               await randomDelay(2000, 5000);
             } else if (!summary.fruit.isDailyWaterLimitReached && (summary.fruit.nutritiveNumber ?? 0) >= 10) {
               logger.info("Game auto scheduler auto-watering fruit tree", { accountId: account.id });
-              await runAccountFruitDaily(account.id);
+              await withTimeout(runAccountFruitDaily(account.id), 30_000, false);
               await randomDelay(2000, 5000);
             }
           }
 
           // 6. 自动兑换指定积分商品检测
-          await checkAndAutoRedeemAmazonGiftCard(account.id).catch(() => null);
+          await withTimeout(checkAndAutoRedeemAmazonGiftCard(account.id), 20_000, null).catch(() => null);
         } catch (err) {
           logger.warn("Tier 2 opportunistic task error", {
             accountId: account.id,
@@ -239,10 +294,12 @@ export class GameAutoSchedulerService {
       }
     } finally {
       this.isRunning = false;
+      this.currentRunningAccountId = null;
+      this.currentTaskName = null;
     }
 
     const nextDelay = isNightQuietHours(new Date()) ? NIGHT_CYCLE_DELAY_MS : GAME_SCHEDULER_CYCLE_DELAY_MS;
-    this.nextCycleAt = new Date(Date.now() + nextDelay);
+    this.nextWakeUpTime = Date.now() + nextDelay;
     return nextDelay;
   }
 }

@@ -99,6 +99,10 @@ export interface AccountGameSummary {
     watchAdsAddChanceFrequency: number | null;
     record: number | null;
     shortUuid: string | null;
+    ranking?: number | null;
+    bestScore?: number | null;
+    seasonEndAt?: string | null;
+    seasonRemainingSeconds?: number | null;
     redeemProducts: Array<{
       productId: number;
       productName: string;
@@ -363,13 +367,19 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
   if (gameRes?.Result === 1 && gameRes.data) {
     const gameUid = gameRes.data.uid || null;
     let shortUuid: string | null = null;
+    let userRanking: number | null = null;
+    let userBestScore: number | null = null;
+    let seasonEndAt: string | null = null;
+    let seasonRemainingSeconds: number | null = null;
     const redeemProducts: Array<{ productId: number; productName: string; price: number; stock: number }> = [];
 
     if (gameUid) {
       try {
-        const [uuidRes, redeemRes] = await Promise.all([
+        const [uuidRes, redeemRes, rankUserRes, challengeInfoRes] = await Promise.all([
           requestGameJson(`/game/generateShortUuid?uid=${gameUid}&timeStamp=${Date.now()}`).catch(() => null),
-          requestGameJson(`/game/point/redeemInfo?uid=${gameUid}&timeStamp=${Date.now()}`).catch(() => null)
+          requestGameJson(`/game/point/redeemInfo?uid=${gameUid}&timeStamp=${Date.now()}`).catch(() => null),
+          requestGameJson(`/game/rank/user?uid=${encodeURIComponent(gameUid)}&timeStamp=${Date.now()}`).catch(() => null),
+          requestGameJson(`/game/challenge/info?uid=${encodeURIComponent(gameUid)}&nickname=${encodeURIComponent(ctx.account.nickname || ctx.account.email || "user")}&timeStamp=${Date.now()}`).catch(() => null)
         ]);
         if (uuidRes?.Result === 1) {
           shortUuid = uuidRes.data;
@@ -384,6 +394,14 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
             });
           }
         }
+        if (rankUserRes?.Result === 1 && rankUserRes.data) {
+          userRanking = rankUserRes.data.ranking ?? null;
+          userBestScore = rankUserRes.data.bestScore ?? null;
+        }
+        if (challengeInfoRes?.Result === 1 && challengeInfoRes.data?.endTime) {
+          seasonRemainingSeconds = challengeInfoRes.data.endTime;
+          seasonEndAt = new Date(Date.now() + challengeInfoRes.data.endTime * 1000).toISOString();
+        }
       } catch {
         // ignore
       }
@@ -397,6 +415,10 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
       chanceLeft: gameRes.data.chanceLeft ?? 0,
       watchAdsAddChanceFrequency: gameRes.data.watchAdsAddChanceFrequency ?? 0,
       record: gameRes.data.record ?? null,
+      ranking: userRanking,
+      bestScore: userBestScore,
+      seasonEndAt,
+      seasonRemainingSeconds,
       shortUuid,
       redeemProducts,
       shareBoostToday: {
@@ -807,21 +829,10 @@ export async function runAccountAllDaily(accountId: number): Promise<GameExecuti
   // 6. 算术不等式挑战日常 (看广告加次数 -> 代理助力 -> WebSocket自动答题全消耗 -> 世界前十冲榜 -> 自动兑换)
   const mathSuccess = await runAccountMathDaily(accountId, logs);
 
-  // Auto-redeem points if balance >= 1000
+  // Auto-redeem points if balance >= 1000 (优先10000档位，达上限或已兑换才尝试1000档位)
   try {
     const summary = await getAccountGameSummary(accountId);
-    const validPoint = summary.mathGame?.validPoint ?? 0;
-    const gameUid = summary.mathGame?.uid;
-    if (gameUid && validPoint >= 1000) {
-      const targetProdId = summary.appType === 0 ? (validPoint >= 10000 ? 23 : 22) : (validPoint >= 10000 ? 25 : 24);
-      logs.push(formatLog("math", "info", `当前积分 ${validPoint}，尝试自动兑换说道币/叮咚币...`));
-      const rRes = await redeemMathGamePoints(accountId, targetProdId).catch(() => null);
-      if (rRes?.success) {
-        logs.push(formatLog("math", "success", `🎉 ${rRes.message}`));
-      } else if (rRes?.message) {
-        logs.push(formatLog("math", "info", `自动兑换提示: ${rRes.message}`));
-      }
-    }
+    await autoRedeemMathPoints(accountId, summary, logs);
   } catch {
     // ignore
   }
@@ -1088,12 +1099,23 @@ export async function playMathChallengeSession(
     let questionsAnswered = 0;
     let finalBestScore = 0;
     let finalRanking: number | undefined;
+    let isSettled = false;
     const ws = new WebSocket("wss://d15wptekiod8mq.cloudfront.net/ws");
 
     const timer = setTimeout(() => {
+      if (isSettled) return;
+      isSettled = true;
       try { ws.close(); } catch {}
-      resolve({ success: false, bestScore: finalBestScore, reason: "Challenge timeout" });
-    }, 120000);
+      resolve({ success: questionsAnswered > 0, bestScore: finalBestScore || questionsAnswered, ranking: finalRanking, reason: "Challenge timeout" });
+    }, 180000);
+
+    const finish = (result: { success: boolean; bestScore: number; ranking?: number; reason?: string }) => {
+      if (isSettled) return;
+      isSettled = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      resolve(result);
+    };
 
     ws.onopen = () => {
       const sign = wsSign("action=challengeGameBegin&uid=" + uid);
@@ -1104,20 +1126,19 @@ export async function playMathChallengeSession(
       try {
         const msg = JSON.parse(String(e.data));
         if (msg.Result !== 1) {
-          clearTimeout(timer);
-          try { ws.close(); } catch {}
-          return resolve({ success: false, bestScore: finalBestScore, reason: msg.Reason });
+          return finish({ success: questionsAnswered > 0, bestScore: finalBestScore || questionsAnswered, ranking: finalRanking, reason: msg.Reason });
         }
         const data = msg.data;
+        if (!data) return;
         if (data.action === "challengeReport" || data.action === "questions") {
           questionsAnswered++;
           let ans = checkMathEquality(data.question);
           if (questionsAnswered > targetScore) {
-            ans = ans === 1 ? 0 : 1;
+            ans = ans === 1 ? 0 : 1; // 故意答错离场提交
           }
-          const jitter = Math.random() * 0.2 + 0.15;
-          spendTime += jitter;
-          await delay(jitter * 1000);
+          const jitterSimulated = Math.random() * 0.12 + 0.18;
+          spendTime += jitterSimulated;
+          await delay(Math.random() * 20 + 35); // 35~55ms 真实网络交互间隔
           const sign = wsSign(
             `action=challengeReport&answer=${ans}&questionSort=${data.questionSort}&timeOut=0&totalSpendTime=${spendTime.toFixed(2)}&uid=${uid}`
           );
@@ -1136,19 +1157,19 @@ export async function playMathChallengeSession(
         } else if (data.action === "gameOver") {
           finalBestScore = data.bestScore ?? questionsAnswered;
           finalRanking = data.latestRanking;
-          clearTimeout(timer);
-          try { ws.close(); } catch {}
-          resolve({ success: true, bestScore: finalBestScore, ranking: finalRanking });
+          finish({ success: true, bestScore: finalBestScore, ranking: finalRanking });
         }
       } catch {
         // ignore
       }
     };
 
+    ws.onclose = () => {
+      finish({ success: questionsAnswered >= targetScore, bestScore: finalBestScore || questionsAnswered, ranking: finalRanking, reason: "WebSocket closed" });
+    };
+
     ws.onerror = (err: any) => {
-      clearTimeout(timer);
-      try { ws.close(); } catch {}
-      resolve({ success: false, bestScore: finalBestScore, reason: err?.message || "Challenge WS error" });
+      finish({ success: questionsAnswered >= targetScore, bestScore: finalBestScore || questionsAnswered, ranking: finalRanking, reason: err?.message || "Challenge WS error" });
     };
   });
 }
@@ -1213,49 +1234,144 @@ export async function runAccountMathDaily(accountId: number, logs: GameTaskLog[]
 
   // 4. 世界排行榜冲榜保障 (冲进前十名)
   try {
-    const rankList = await getGameRankList(summary.gameAppId);
-    let userRank = 999;
-    const userRankRes = await requestGameJson(`/game/rank/user?uid=${encodeURIComponent(gameUid)}&timeStamp=${Date.now()}`).catch(() => null);
-    if (userRankRes?.Result === 1 && userRankRes.data?.ranking) {
-      userRank = userRankRes.data.ranking;
-    }
-
-    if (userRank > 10 && rankList.length > 0) {
-      const rank3Score = rankList[2]?.bestScore ?? 420;
-      const rank9Score = rankList[8]?.bestScore ?? 370;
-      const targetScore = randomBetween(rank9Score + 10, Math.min(rank3Score + 5, rank9Score + 45));
-      const nickname = userRankRes?.data?.nickname || summary.appVariant;
-      logs.push(formatLog("math", "info", `当前排名 #${userRank}，未进入世界前十，启动冲榜挑战模式 (目标得分: ${targetScore})...`));
-      const challengeRes = await playMathChallengeSession(gameUid, targetScore, nickname);
-      if (challengeRes.success) {
-        logs.push(formatLog("math", "success", `🏆 挑战成功！最终得分: ${challengeRes.bestScore}，成功跻身世界前十！(当前名次: #${challengeRes.ranking ?? "前十"})`));
-        success = true;
-      } else {
-        logs.push(formatLog("math", "warn", `挑战冲榜提示: ${challengeRes.reason || "已提交成绩"}`));
-      }
+    const currentRank = summary.mathGame?.ranking ?? -1;
+    const isOutOfTop10 = currentRank <= 0 || currentRank > 10;
+    if (isOutOfTop10) {
+      logs.push(formatLog("math", "info", `当前世界排名 #${currentRank <= 0 ? "未上榜" : currentRank}，未进入前十名，启动自动冲榜...`));
+      const climbRes = await climbMathGameRank(accountId, undefined, logs);
+      if (climbRes.success) success = true;
     } else {
-      logs.push(formatLog("math", "info", `当前排名 #${userRank}，已稳居世界前十！`));
+      logs.push(formatLog("math", "info", `当前世界排名 #${currentRank}，已稳居世界前十！`));
     }
   } catch (err) {
     logs.push(formatLog("math", "warn", `排位检测跳过: ${err instanceof Error ? err.message : String(err)}`));
   }
 
-  // 5. 自动积分兑换
+  // 5. 自动积分兑换 (优先10000档位，达上限或已兑换才尝试1000档位)
   try {
     const afterSummary = await getAccountGameSummary(accountId);
-    const validPoint = afterSummary.mathGame?.validPoint ?? 0;
-    if (validPoint >= 1000) {
-      const prodId = summary.appType === 0 ? (validPoint >= 10000 ? 23 : 22) : (validPoint >= 10000 ? 25 : 24);
-      const redeemRes = await redeemMathGamePoints(accountId, prodId);
-      if (redeemRes.success) {
-        logs.push(formatLog("math", "success", `🎉 ${redeemRes.message}`));
-      }
-    }
+    await autoRedeemMathPoints(accountId, afterSummary, logs);
   } catch {
     // ignore
   }
 
   return success;
+}
+
+export async function climbMathGameRank(
+  accountId: number,
+  options?: { targetRank?: number; customScore?: number },
+  logs: GameTaskLog[] = []
+): Promise<{ success: boolean; bestScore: number; ranking?: number; message: string }> {
+  const ctx = await resolveAccountContext(accountId);
+  const summary = await getAccountGameSummary(accountId);
+  const gameUid = summary.mathGame?.uid;
+  if (!gameUid) {
+    throw new AppError("未获取到算术游戏 uid", 400, 400);
+  }
+
+  const rankList = await getGameRankList(summary.gameAppId);
+  const nickname = ctx.account.nickname || ctx.account.email?.split("@")[0] || summary.appVariant;
+
+  let targetScore = 430;
+  let targetRankLabel = "随机第 2~6 名";
+
+  if (options?.customScore && options.customScore > 0) {
+    targetScore = options.customScore;
+    targetRankLabel = `自定义 ${targetScore} 分`;
+  } else {
+    const targetRank =
+      options?.targetRank && options.targetRank >= 2 && options.targetRank <= 6
+        ? options.targetRank
+        : randomBetween(2, 6);
+    targetRankLabel = `第 ${targetRank} 名`;
+
+    if (rankList.length >= targetRank) {
+      const bench = rankList[targetRank - 1]?.bestScore ?? 410;
+      targetScore = bench + randomBetween(1, 3);
+      // 不超越第 1 名
+      const rank1 = rankList[0];
+      if (rank1 && targetScore >= rank1.bestScore) {
+        targetScore = Math.max(rank1.bestScore - 10, bench);
+      }
+      const prevRank = targetRank > 2 ? rankList[targetRank - 2] : undefined;
+      if (prevRank && targetScore >= prevRank.bestScore) {
+        targetScore = Math.max(prevRank.bestScore - 1, bench);
+      }
+    } else {
+      targetScore = 415 + randomBetween(5, 20);
+    }
+  }
+
+  logs.push(formatLog("math", "info", `🏆 启动世界排行榜冲榜挑战 (目标名次: ${targetRankLabel}, 目标得分: ${targetScore})...`));
+  const challengeRes = await playMathChallengeSession(gameUid, targetScore, nickname);
+
+  if (challengeRes.success) {
+    const freshUserRank = await requestGameJson(
+      `/game/rank/user?uid=${encodeURIComponent(gameUid)}&timeStamp=${Date.now()}`
+    ).catch(() => null);
+    const latestRanking = freshUserRank?.data?.ranking ?? challengeRes.ranking;
+    const finalScore = freshUserRank?.data?.bestScore ?? challengeRes.bestScore;
+
+    const msg = `🏆 冲榜挑战成功！最终得分: ${finalScore}，成功排在世界第 ${latestRanking ?? "前十"} 名！`;
+    logs.push(formatLog("math", "success", msg));
+    return {
+      success: true,
+      bestScore: finalScore,
+      ranking: latestRanking,
+      message: msg
+    };
+  }
+
+  const failMsg = `冲榜挑战提示: ${challengeRes.reason || "已提交成绩"}`;
+  logs.push(formatLog("math", "warn", failMsg));
+  return {
+    success: false,
+    bestScore: challengeRes.bestScore,
+    ranking: challengeRes.ranking,
+    message: failMsg
+  };
+}
+
+export async function autoRedeemMathPoints(
+  accountId: number,
+  summary: AccountGameSummary,
+  logs: GameTaskLog[] = []
+): Promise<void> {
+  const math = summary.mathGame;
+  if (!math?.uid) return;
+  const validPoint = math.validPoint ?? 0;
+  if (validPoint < 1000) return;
+
+  const prod10k = summary.appType === 0 ? 23 : 25;
+  const prod1k = summary.appType === 0 ? 22 : 24;
+  const dailyState = loadMathDailyState(accountId);
+
+  let curPoint = validPoint;
+
+  // 1. 优先尝试 10000 积分档位 (若未兑换且未达今日上限)
+  if (curPoint >= 10000 && !dailyState.redeemedProductIds.includes(prod10k)) {
+    logs.push(formatLog("math", "info", `当前积分 ${curPoint}，优先尝试兑换 10000 档位...`));
+    const r10 = await redeemMathGamePoints(accountId, prod10k).catch((e) => ({ success: false, message: e.message }));
+    if (r10.success) {
+      logs.push(formatLog("math", "success", `🎉 ${r10.message}`));
+      curPoint -= 10000;
+    } else if (r10.message) {
+      logs.push(formatLog("math", "info", `10000档位提示: ${r10.message}`));
+    }
+    await delay(1500);
+  }
+
+  // 2. 积分达到上限、已兑换或不足 10000 时，尝试 1000 档位
+  if (curPoint >= 1000 && !dailyState.redeemedProductIds.includes(prod1k)) {
+    logs.push(formatLog("math", "info", `当前积分 ${curPoint}，尝试兑换 1000 档位...`));
+    const r1 = await redeemMathGamePoints(accountId, prod1k).catch((e) => ({ success: false, message: e.message }));
+    if (r1.success) {
+      logs.push(formatLog("math", "success", `🎉 ${r1.message}`));
+    } else if (r1.message) {
+      logs.push(formatLog("math", "info", `1000档位提示: ${r1.message}`));
+    }
+  }
 }
 
 // ── Persistent Fruit Harvest History ──

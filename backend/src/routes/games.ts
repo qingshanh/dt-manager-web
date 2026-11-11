@@ -12,6 +12,7 @@ import {
   extractProxiesFromResponse,
   BUILTIN_89IP_PROXY_URL,
   redeemMathGamePoints,
+  climbMathGameRank,
   runAccountMathDaily,
   runAccountAllDaily,
   runAccountFruitDaily,
@@ -282,6 +283,26 @@ gamesRouter.post("/math/daily", async (req, res, next) => {
     const logs: any[] = [];
     const success = await runAccountMathDaily(accountId, logs);
     ok(res, { success, logs });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/accounts/:id/games/math/climb-rank - Manually trigger rank climbing
+gamesRouter.post("/math/climb-rank", async (req, res, next) => {
+  try {
+    const accountId = Number((req.params as any).id || req.body.account_id);
+    if (!Number.isInteger(accountId) || accountId <= 0) {
+      throw new AppError("Valid account ID is required", 400, 400);
+    }
+    await assertAccountAccess(accountId, req.auth!.userId);
+
+    const targetRank = req.body?.target_rank !== undefined ? Number(req.body.target_rank) : undefined;
+    const customScore = req.body?.custom_score !== undefined ? Number(req.body.custom_score) : undefined;
+
+    const logs: any[] = [];
+    const result = await climbMathGameRank(accountId, { targetRank, customScore }, logs);
+    ok(res, { ...result, logs });
   } catch (error) {
     next(error);
   }
