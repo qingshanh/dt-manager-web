@@ -99,6 +99,15 @@ export interface AccountGameSummary {
     watchAdsAddChanceFrequency: number | null;
     record: number | null;
     shortUuid: string | null;
+    shortUuidDingdong?: string | null;
+    shortUuidShuodao?: string | null;
+    shortUuids?: Array<{
+      appId: number;
+      label: string;
+      shortUuid: string;
+      boostCount?: number;
+      isMaxReached?: boolean;
+    }>;
     ranking?: number | null;
     bestScore?: number | null;
     seasonEndAt?: string | null;
@@ -112,6 +121,10 @@ export interface AccountGameSummary {
     shareBoostToday?: {
       count: number;
       isMaxReached: boolean;
+      count66?: number;
+      isMaxReached66?: boolean;
+      count67?: number;
+      isMaxReached67?: boolean;
     };
     redeemedTodayProductIds?: number[];
   } | null;
@@ -234,14 +247,17 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
   }
 
   const timestamp = Date.now();
+  const primaryAppId = ctx.gameAppId;
+  const secondaryAppId = primaryAppId === 66 ? 67 : 66;
 
-  const [petRes, fruitRes, knifeRes, gameRes, petTaskRes, fruitTaskRes] = await Promise.all([
+  const [petRes, fruitRes, knifeRes, primaryGameRes, secondaryGameRes, petTaskRes, fruitTaskRes] = await Promise.all([
     requestGameJson(`/pet/homePage?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${timestamp}`).catch(() => null),
     requestGameJson(
       `/campaign/fruit/homepage?userId=${ctx.dtUserId}&appType=${ctx.appType}&dingtoneId=${ctx.dingtoneId}&campaignId=10094&zone=GMT%2B8&timeStamp=${timestamp}`
     ).catch(() => null),
     requestGameJson(`/knife/homePage?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${timestamp}`).catch(() => null),
-    requestGameJson(`/game/homePage?userId=${ctx.dtUserId}&appId=${ctx.gameAppId}&zone=-800&timeStamp=${timestamp}`).catch(() => null),
+    requestGameJson(`/game/homePage?userId=${ctx.dtUserId}&appId=${primaryAppId}&zone=-800&timeStamp=${timestamp}`).catch(() => null),
+    requestGameJson(`/game/homePage?userId=${ctx.dtUserId}&appId=${secondaryAppId}&zone=-800&timeStamp=${timestamp}`).catch(() => null),
     requestGameJson(`/pet/task/list?userId=${ctx.dtUserId}&appType=${ctx.appType}&timeStamp=${timestamp}`).catch(() => null),
     requestGameJson(`/campaign/fruit/task/list?userId=${ctx.dtUserId}&campaignId=10094&timeStamp=${timestamp}`).catch(() => null)
   ]);
@@ -364,26 +380,32 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
 
   // Math Game
   let mathGameData: AccountGameSummary["mathGame"] = null;
+  const gameRes = primaryGameRes;
   if (gameRes?.Result === 1 && gameRes.data) {
-    const gameUid = gameRes.data.uid || null;
-    let shortUuid: string | null = null;
+    const primaryUid = gameRes.data.uid || null;
+    const secondaryUid = secondaryGameRes?.data?.uid || null;
+    const uid66 = primaryAppId === 66 ? primaryUid : secondaryUid;
+    const uid67 = primaryAppId === 67 ? primaryUid : secondaryUid;
+    let shortUuid66: string | null = null;
+    let shortUuid67: string | null = null;
     let userRanking: number | null = null;
     let userBestScore: number | null = null;
     let seasonEndAt: string | null = null;
     let seasonRemainingSeconds: number | null = null;
     const redeemProducts: Array<{ productId: number; productName: string; price: number; stock: number }> = [];
 
-    if (gameUid) {
+    if (primaryUid || secondaryUid) {
       try {
-        const [uuidRes, redeemRes, rankUserRes, challengeInfoRes] = await Promise.all([
-          requestGameJson(`/game/generateShortUuid?uid=${gameUid}&timeStamp=${Date.now()}`).catch(() => null),
-          requestGameJson(`/game/point/redeemInfo?uid=${gameUid}&timeStamp=${Date.now()}`).catch(() => null),
-          requestGameJson(`/game/rank/user?uid=${encodeURIComponent(gameUid)}&timeStamp=${Date.now()}`).catch(() => null),
-          requestGameJson(`/game/challenge/info?uid=${encodeURIComponent(gameUid)}&nickname=${encodeURIComponent(ctx.account.nickname || ctx.account.email || "user")}&timeStamp=${Date.now()}`).catch(() => null)
+        const [uuid66Res, uuid67Res, redeemRes, rankUserRes, challengeInfoRes] = await Promise.all([
+          uid66 ? requestGameJson(`/game/generateShortUuid?uid=${uid66}&timeStamp=${Date.now()}`).catch(() => null) : null,
+          uid67 ? requestGameJson(`/game/generateShortUuid?uid=${uid67}&timeStamp=${Date.now()}`).catch(() => null) : null,
+          primaryUid ? requestGameJson(`/game/point/redeemInfo?uid=${primaryUid}&timeStamp=${Date.now()}`).catch(() => null) : null,
+          // ⚠️ 排位冲榜严格使用 primaryUid 和自身 appId，绝不跨端互串！
+          primaryUid ? requestGameJson(`/game/rank/user?uid=${encodeURIComponent(primaryUid)}&timeStamp=${Date.now()}`).catch(() => null) : null,
+          primaryUid ? requestGameJson(`/game/challenge/info?uid=${encodeURIComponent(primaryUid)}&nickname=${encodeURIComponent(ctx.account.nickname || ctx.account.email || "user")}&timeStamp=${Date.now()}`).catch(() => null) : null
         ]);
-        if (uuidRes?.Result === 1) {
-          shortUuid = uuidRes.data;
-        }
+        if (uuid66Res?.Result === 1) shortUuid66 = uuid66Res.data;
+        if (uuid67Res?.Result === 1) shortUuid67 = uuid67Res.data;
         if (redeemRes?.Result === 1 && Array.isArray(redeemRes.data?.products)) {
           for (const item of redeemRes.data.products) {
             redeemProducts.push({
@@ -408,8 +430,9 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
     }
 
     const mathDaily = loadMathDailyState(accountId);
+    const primaryShortUuid = primaryAppId === 66 ? (shortUuid66 || shortUuid67) : (shortUuid67 || shortUuid66);
     mathGameData = {
-      uid: gameUid,
+      uid: primaryUid,
       validPoint: gameRes.data.validPoint ?? 0,
       expirePoint: gameRes.data.expirePoint ?? 0,
       chanceLeft: gameRes.data.chanceLeft ?? 0,
@@ -419,11 +442,33 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
       bestScore: userBestScore,
       seasonEndAt,
       seasonRemainingSeconds,
-      shortUuid,
+      shortUuid: primaryShortUuid,
+      shortUuidDingdong: shortUuid66,
+      shortUuidShuodao: shortUuid67,
+      shortUuids: [
+        ...(shortUuid66 ? [{
+          appId: 66,
+          label: "叮咚",
+          shortUuid: shortUuid66,
+          boostCount: mathDaily.shareBoostCount66 ?? 0,
+          isMaxReached: mathDaily.isShareBoostMaxReached66 ?? false
+        }] : []),
+        ...(shortUuid67 ? [{
+          appId: 67,
+          label: "说道",
+          shortUuid: shortUuid67,
+          boostCount: mathDaily.shareBoostCount67 ?? 0,
+          isMaxReached: mathDaily.isShareBoostMaxReached67 ?? false
+        }] : [])
+      ],
       redeemProducts,
       shareBoostToday: {
         count: mathDaily.shareBoostCount,
-        isMaxReached: mathDaily.isShareBoostMaxReached
+        isMaxReached: mathDaily.isShareBoostMaxReached,
+        count66: mathDaily.shareBoostCount66 ?? 0,
+        isMaxReached66: mathDaily.isShareBoostMaxReached66 ?? false,
+        count67: mathDaily.shareBoostCount67 ?? 0,
+        isMaxReached67: mathDaily.isShareBoostMaxReached67 ?? false
       },
       redeemedTodayProductIds: mathDaily.redeemedProductIds
     };
@@ -899,15 +944,43 @@ export function extractProxiesFromResponse(text: string): Array<{ host: string; 
   return list;
 }
 
-export async function runAccountShareBoost(accountId: number, maxBoosts = 10): Promise<{ count: number; logs: string[] }> {
+export async function runAccountShareBoost(
+  accountId: number,
+  maxBoosts = 10,
+  targetShortUuid?: string
+): Promise<{ count: number; logs: string[] }> {
   const logs: string[] = [];
   const summary = await getAccountGameSummary(accountId);
-  const shortUuid = summary.mathGame?.shortUuid;
-  if (!shortUuid) {
-    throw new AppError("未获取到当前账号的 shortUuid 推广短链码", 400, 400);
+  const math = summary.mathGame;
+  if (!math) {
+    throw new AppError("未获取到当前账号的算术游戏数据", 400, 400);
   }
 
-  logs.push(`获取到 shortUuid: ${shortUuid}`);
+  const targets: Array<{ appId: number; label: string; uuid: string }> = [];
+  if (targetShortUuid) {
+    const matched = math.shortUuids?.find((u) => u.shortUuid === targetShortUuid);
+    targets.push({
+      appId: matched?.appId ?? 0,
+      label: matched?.label ?? "指定码",
+      uuid: targetShortUuid
+    });
+  } else {
+    if (math.shortUuidDingdong) {
+      targets.push({ appId: 66, label: "叮咚", uuid: math.shortUuidDingdong });
+    }
+    if (math.shortUuidShuodao) {
+      targets.push({ appId: 67, label: "说道", uuid: math.shortUuidShuodao });
+    }
+    if (targets.length === 0 && math.shortUuid) {
+      targets.push({ appId: summary.gameAppId, label: "当前", uuid: math.shortUuid });
+    }
+  }
+
+  if (targets.length === 0) {
+    throw new AppError("未找到可助力的推广短链码", 400, 400);
+  }
+
+  logs.push(`待助力短链: ${targets.map((t) => `${t.label}(${t.uuid})`).join(", ")}`);
 
   // Fetch proxy settings
   const settings = await prisma.setting.findMany({
@@ -930,59 +1003,90 @@ export async function runAccountShareBoost(accountId: number, maxBoosts = 10): P
     logs.push(`提取代理源异常: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  let successCount = 0;
-  if (candidates.length === 0) {
-    logs.push("未能获取有效候选代理，尝试使用本机出口 IP 访问一次...");
-    try {
-      const res = await requestGameJson(`/game/shareAddChance?shortUuid=${encodeURIComponent(shortUuid)}`);
-      if (res?.Result === 1) {
-        successCount += 1;
-        logs.push("通过当前 IP 助力成功 +1 次！");
-      } else {
-        logs.push(`助力返回: ${res?.Reason || JSON.stringify(res)}`);
-      }
-    } catch (err) {
-      logs.push(`助力请求失败: ${err instanceof Error ? err.message : String(err)}`);
+  let totalSuccess = 0;
+
+  for (const target of targets) {
+    const dailyState = loadMathDailyState(accountId);
+    if (target.appId === 66 && dailyState.isShareBoostMaxReached66) {
+      logs.push(`叮咚短链 [${target.uuid}] 今日已达上限，跳过`);
+      continue;
     }
-  } else {
-    const targetUrl = `http://dt-apigatewayv2.dt-pn1.com/game/shareAddChance?shortUuid=${encodeURIComponent(shortUuid)}`;
-    for (let i = 0; i < candidates.length && successCount < maxBoosts; i++) {
-      const candidate = candidates[i];
-      if (!candidate) continue;
+    if (target.appId === 67 && dailyState.isShareBoostMaxReached67) {
+      logs.push(`说道短链 [${target.uuid}] 今日已达上限，跳过`);
+      continue;
+    }
+
+    logs.push(`开始为【${target.label}】短链 [${target.uuid}] 执行助力...`);
+    let targetSuccess = 0;
+
+    if (candidates.length === 0) {
+      logs.push(`[${target.label}] 未能获取有效候选代理，尝试使用本机出口 IP 访问一次...`);
       try {
-        const probe = await testHttpProxyConnection(targetUrl, candidate.host, candidate.port);
-        if (probe.status === 200 && probe.body) {
-          let json: any = null;
-          try {
-            json = JSON.parse(probe.body);
-          } catch {
-            continue;
-          }
-          if (json?.Result === 1) {
-            successCount += 1;
+        const res = await requestGameJson(`/game/shareAddChance?shortUuid=${encodeURIComponent(target.uuid)}`);
+        if (res?.Result === 1) {
+          targetSuccess += 1;
+          totalSuccess += 1;
+          const boostState = loadMathDailyState(accountId);
+          boostState.shareBoostCount += 1;
+          if (target.appId === 66) boostState.shareBoostCount66 = (boostState.shareBoostCount66 ?? 0) + 1;
+          if (target.appId === 67) boostState.shareBoostCount67 = (boostState.shareBoostCount67 ?? 0) + 1;
+          saveMathDailyState(boostState);
+          logs.push(`[${target.label}] 通过当前 IP 助力成功 +1 次！`);
+        } else {
+          logs.push(`[${target.label}] 助力返回: ${res?.Reason || JSON.stringify(res)}`);
+          if (res?.Reason?.includes("已达上限")) {
             const boostState = loadMathDailyState(accountId);
-            boostState.shareBoostCount += 1;
+            if (target.appId === 66) boostState.isShareBoostMaxReached66 = true;
+            if (target.appId === 67) boostState.isShareBoostMaxReached67 = true;
             saveMathDailyState(boostState);
-            logs.push(`通过代理 [${candidate.proxy}] 助力成功 +1 次！(累计: ${successCount})`);
-          } else if (json?.Result === 0) {
-            logs.push(`代理 [${candidate.proxy}] 助力响应: ${json.Reason}`);
-            if (json.Reason?.includes("已达上限")) {
-              const boostState = loadMathDailyState(accountId);
-              boostState.isShareBoostMaxReached = true;
-              saveMathDailyState(boostState);
-              logs.push("用户当日分享助力已达系统上限，结束助力");
-              break;
-            }
           }
         }
-        await delay(800);
       } catch {
-        // timeout or error, continue to next candidate
+        // ignore
+      }
+    } else {
+      const targetUrl = `http://dt-apigatewayv2.dt-pn1.com/game/shareAddChance?shortUuid=${encodeURIComponent(target.uuid)}`;
+      for (let i = 0; i < candidates.length && targetSuccess < maxBoosts; i++) {
+        const candidate = candidates[i];
+        if (!candidate) continue;
+        try {
+          const probe = await testHttpProxyConnection(targetUrl, candidate.host, candidate.port);
+          if (probe.status === 200 && probe.body) {
+            let json: any = null;
+            try {
+              json = JSON.parse(probe.body);
+            } catch {
+              continue;
+            }
+            if (json?.Result === 1) {
+              targetSuccess += 1;
+              totalSuccess += 1;
+              const boostState = loadMathDailyState(accountId);
+              boostState.shareBoostCount += 1;
+              if (target.appId === 66) boostState.shareBoostCount66 = (boostState.shareBoostCount66 ?? 0) + 1;
+              if (target.appId === 67) boostState.shareBoostCount67 = (boostState.shareBoostCount67 ?? 0) + 1;
+              saveMathDailyState(boostState);
+              logs.push(`[${target.label}] 通过代理 [${candidate.proxy}] 助力成功 +1 次！(本码累计: ${targetSuccess})`);
+            } else if (json?.Result === 0) {
+              if (json.Reason?.includes("已达上限")) {
+                const boostState = loadMathDailyState(accountId);
+                if (target.appId === 66) boostState.isShareBoostMaxReached66 = true;
+                if (target.appId === 67) boostState.isShareBoostMaxReached67 = true;
+                saveMathDailyState(boostState);
+                logs.push(`[${target.label}] 当日分享助力已达系统上限，结束该码助力`);
+                break;
+              }
+            }
+          }
+          await delay(600);
+        } catch {
+          // timeout or error, continue to next candidate
+        }
       }
     }
   }
 
-  return { count: successCount, logs };
+  return { count: totalSuccess, logs };
 }
 
 export function checkMathEquality(expression: string): number {
@@ -1389,6 +1493,10 @@ export interface MathDailyState {
   dateStr: string;
   shareBoostCount: number;
   isShareBoostMaxReached: boolean;
+  shareBoostCount66?: number;
+  isShareBoostMaxReached66?: boolean;
+  shareBoostCount67?: number;
+  isShareBoostMaxReached67?: boolean;
   redeemedProductIds: number[];
   fruitWaterLimitReached: boolean;
 }
@@ -1418,6 +1526,10 @@ export function loadMathDailyState(accountId: number): MathDailyState {
     dateStr: today,
     shareBoostCount: 0,
     isShareBoostMaxReached: false,
+    shareBoostCount66: 0,
+    isShareBoostMaxReached66: false,
+    shareBoostCount67: 0,
+    isShareBoostMaxReached67: false,
     redeemedProductIds: [],
     fruitWaterLimitReached: false
   };

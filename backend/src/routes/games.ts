@@ -148,7 +148,8 @@ gamesRouter.post("/boost", async (req, res, next) => {
   try {
     const accountId = Number((req.params as any).id || req.body.account_id);
     await assertAccountAccess(accountId, req.auth!.userId);
-    const result = await runAccountShareBoost(accountId);
+    const targetUuid = req.body?.short_uuid ? String(req.body.short_uuid).trim() : undefined;
+    const result = await runAccountShareBoost(accountId, 10, targetUuid);
     ok(res, result);
   } catch (error) {
     next(error);

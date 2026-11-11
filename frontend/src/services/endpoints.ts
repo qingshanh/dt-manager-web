@@ -782,6 +782,15 @@ export interface AccountGameSummary {
     seasonEndAt?: string | null;
     seasonRemainingSeconds?: number | null;
     shortUuid: string | null;
+    shortUuidDingdong?: string | null;
+    shortUuidShuodao?: string | null;
+    shortUuids?: Array<{
+      appId: number;
+      label: string;
+      shortUuid: string;
+      boostCount?: number;
+      isMaxReached?: boolean;
+    }>;
     redeemProducts: Array<{
       productId: number;
       productName: string;
@@ -791,6 +800,10 @@ export interface AccountGameSummary {
     shareBoostToday?: {
       count: number;
       isMaxReached: boolean;
+      count66?: number;
+      isMaxReached66?: boolean;
+      count67?: number;
+      isMaxReached67?: boolean;
     };
     redeemedTodayProductIds?: number[];
   } | null;
@@ -853,8 +866,8 @@ export async function getGameRankList(appId = 66): Promise<RankLeaderboardItem[]
   return res.data.data;
 }
 
-export async function boostAccountGameShare(accountId: number): Promise<{ count: number; logs: string[] }> {
-  const res = await api.post<ApiResponse<{ count: number; logs: string[] }>>(`/accounts/${accountId}/games/boost`);
+export async function boostAccountGameShare(accountId: number, shortUuid?: string): Promise<{ count: number; logs: string[] }> {
+  const res = await api.post<ApiResponse<{ count: number; logs: string[] }>>(`/accounts/${accountId}/games/boost`, { short_uuid: shortUuid });
   return res.data.data;
 }
 

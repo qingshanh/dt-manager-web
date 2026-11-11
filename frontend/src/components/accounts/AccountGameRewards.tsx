@@ -10,6 +10,7 @@ import {
   InputNumber,
   Modal,
   Progress,
+  Radio,
   Select,
   Space,
   Switch,
@@ -76,6 +77,7 @@ export default function AccountGameRewards({ accountId }: Props) {
   const [climbModalOpen, setClimbModalOpen] = useState(false);
   const [targetRankChoice, setTargetRankChoice] = useState<number>(0);
   const [customScoreInput, setCustomScoreInput] = useState<number>(430);
+  const [selectedRankAppId, setSelectedRankAppId] = useState<number>(66);
   const [guideModalOpen, setGuideModalOpen] = useState(false);
   const [guideTab, setGuideTab] = useState('pet');
   const [rankModalOpen, setRankModalOpen] = useState(false);
@@ -310,14 +312,14 @@ export default function AccountGameRewards({ accountId }: Props) {
     }
   };
 
-  const handleShareBoost = async () => {
-    setActionLoading('boost');
+  const handleShareBoost = async (targetUuid?: string, actionKey = 'boost') => {
+    setActionLoading(actionKey);
     try {
-      const res = await boostAccountGameShare(accountId);
+      const res = await boostAccountGameShare(accountId, targetUuid);
       if (res.count > 0) {
         message.success(`成功为该账号助力增加 ${res.count} 次游戏机会！`);
       } else {
-        message.info(res.logs[res.logs.length - 1] || '助力请求已发送');
+        message.info(res.logs[res.logs.length - 1] || '助力请求已处理');
       }
       await loadData();
     } catch (err) {
@@ -327,11 +329,13 @@ export default function AccountGameRewards({ accountId }: Props) {
     }
   };
 
-  const handleOpenRank = async () => {
+  const handleOpenRank = async (targetAppId?: number) => {
+    const appIdToQuery = targetAppId || data?.gameAppId || 66;
+    setSelectedRankAppId(appIdToQuery);
     setRankModalOpen(true);
     setRankLoading(true);
     try {
-      const list = await getGameRankList(data?.gameAppId || 66);
+      const list = await getGameRankList(appIdToQuery);
       setRankList(list);
     } catch (err) {
       message.error(err instanceof Error ? err.message : '获取排行榜失败');
@@ -656,7 +660,7 @@ export default function AccountGameRewards({ accountId }: Props) {
           extra={(
             <Space size={6}>
               <Tooltip title="查看玩法说明"><Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('math')} /></Tooltip>
-              <Button size="small" icon={<TrophyOutlined />} onClick={handleOpenRank}>排行榜</Button>
+              <Button size="small" icon={<TrophyOutlined />} onClick={() => void handleOpenRank()}>排行榜</Button>
               <Button size="small" icon={<ThunderboltOutlined />} loading={actionLoading === 'math'} onClick={() => void handleRunMathDaily()}>做题/消耗</Button>
               <Button size="small" type="primary" icon={<TrophyOutlined />} loading={actionLoading === 'climb'} onClick={() => setClimbModalOpen(true)}>冲榜</Button>
             </Space>
@@ -715,34 +719,103 @@ export default function AccountGameRewards({ accountId }: Props) {
               <Descriptions.Item label="历史最高记录">
                 <span>{math.record ? `${math.record} 秒` : '-'}</span>
               </Descriptions.Item>
-              <Descriptions.Item label="推广短链码 (shortUuid)">
-                <Space size={6} wrap>
-                  <Tag color="purple" style={{ fontSize: 13 }}>{math.shortUuid || '未生成'}</Tag>
-                  {math.shortUuid ? (
-                    <Tooltip title="复制完整推广链接">
-                      <Button
-                        size="small"
-                        type="text"
-                        icon={<CopyOutlined />}
-                        onClick={() => {
-                          const url = `http://dt-apigatewayv2.dt-pn1.com/game/shareAddChance?shortUuid=${math.shortUuid}`;
-                          void copyText(url, '推广短链');
-                        }}
-                      />
-                    </Tooltip>
-                  ) : null}
-                  <Tag color={math.shareBoostToday?.isMaxReached ? 'default' : 'green'}>
-                    今日已助力: +{math.shareBoostToday?.count ?? 0} 次 {math.shareBoostToday?.isMaxReached ? '(已达上限)' : ''}
-                  </Tag>
-                  <Button
-                    size="small"
-                    icon={<ShareAltOutlined />}
-                    disabled={math.shareBoostToday?.isMaxReached}
-                    loading={actionLoading === 'boost'}
-                    onClick={() => void handleShareBoost()}
-                  >
-                    换IP助力
-                  </Button>
+              <Descriptions.Item label="推广短链码 (双通道独立)">
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Space wrap size={[8, 8]}>
+                    {/* 叮咚短链码 */}
+                    {math.shortUuidDingdong ? (
+                      <Space size={4} align="center" style={{ background: '#f0f5ff', padding: '3px 8px', borderRadius: 6, border: '1px solid #adc6ff' }}>
+                        <Tag color="blue" style={{ fontSize: 13, margin: 0 }}>
+                          叮咚: <strong>{math.shortUuidDingdong}</strong>
+                        </Tag>
+                        <Tooltip title="复制叮咚推广链接">
+                          <Button
+                            size="small"
+                            type="text"
+                            icon={<CopyOutlined />}
+                            onClick={() => {
+                              const url = `http://dt-apigatewayv2.dt-pn1.com/game/shareAddChance?shortUuid=${math.shortUuidDingdong}`;
+                              void copyText(url, '叮咚推广短链');
+                            }}
+                          />
+                        </Tooltip>
+                        <Tag color={math.shareBoostToday?.isMaxReached66 ? 'default' : 'cyan'} style={{ margin: 0 }}>
+                          +{math.shareBoostToday?.count66 ?? 0}次{math.shareBoostToday?.isMaxReached66 ? '(满)' : ''}
+                        </Tag>
+                        <Button
+                          size="small"
+                          disabled={math.shareBoostToday?.isMaxReached66}
+                          loading={actionLoading === 'boost-66'}
+                          onClick={() => void handleShareBoost(math.shortUuidDingdong || undefined, 'boost-66')}
+                        >
+                          仅助叮咚
+                        </Button>
+                      </Space>
+                    ) : null}
+
+                    {/* 说道短链码 */}
+                    {math.shortUuidShuodao ? (
+                      <Space size={4} align="center" style={{ background: '#f9f0ff', padding: '3px 8px', borderRadius: 6, border: '1px solid #d3adf7' }}>
+                        <Tag color="purple" style={{ fontSize: 13, margin: 0 }}>
+                          说道: <strong>{math.shortUuidShuodao}</strong>
+                        </Tag>
+                        <Tooltip title="复制说道推广链接">
+                          <Button
+                            size="small"
+                            type="text"
+                            icon={<CopyOutlined />}
+                            onClick={() => {
+                              const url = `http://dt-apigatewayv2.dt-pn1.com/game/shareAddChance?shortUuid=${math.shortUuidShuodao}`;
+                              void copyText(url, '说道推广短链');
+                            }}
+                          />
+                        </Tooltip>
+                        <Tag color={math.shareBoostToday?.isMaxReached67 ? 'default' : 'purple'} style={{ margin: 0 }}>
+                          +{math.shareBoostToday?.count67 ?? 0}次{math.shareBoostToday?.isMaxReached67 ? '(满)' : ''}
+                        </Tag>
+                        <Button
+                          size="small"
+                          disabled={math.shareBoostToday?.isMaxReached67}
+                          loading={actionLoading === 'boost-67'}
+                          onClick={() => void handleShareBoost(math.shortUuidShuodao || undefined, 'boost-67')}
+                        >
+                          仅助说道
+                        </Button>
+                      </Space>
+                    ) : null}
+
+                    {/* 降级回退单一短链码 */}
+                    {!math.shortUuidDingdong && !math.shortUuidShuodao && math.shortUuid && (
+                      <Space size={4}>
+                        <Tag color="purple">{math.shortUuid}</Tag>
+                        <Tooltip title="复制推广链接">
+                          <Button
+                            size="small"
+                            type="text"
+                            icon={<CopyOutlined />}
+                            onClick={() => {
+                              const url = `http://dt-apigatewayv2.dt-pn1.com/game/shareAddChance?shortUuid=${math.shortUuid}`;
+                              void copyText(url, '推广短链');
+                            }}
+                          />
+                        </Tooltip>
+                      </Space>
+                    )}
+                  </Space>
+
+                  {/* 双通道一键全量换IP助力 */}
+                  <div>
+                    <Button
+                      size="small"
+                      type="dashed"
+                      icon={<ShareAltOutlined />}
+                      disabled={math.shareBoostToday?.isMaxReached66 && math.shareBoostToday?.isMaxReached67}
+                      loading={actionLoading === 'boost-all'}
+                      onClick={() => void handleShareBoost(undefined, 'boost-all')}
+                    >
+                      ⚡ 一键双通道换IP助力 (今日总助力: +{math.shareBoostToday?.count ?? 0} 次)
+                    </Button>
+                  </div>
                 </Space>
               </Descriptions.Item>
               <Descriptions.Item label="积分额度兑换 (每日限1次)">
@@ -1037,14 +1110,28 @@ export default function AccountGameRewards({ accountId }: Props) {
         open={rankModalOpen}
         onCancel={() => setRankModalOpen(false)}
         footer={null}
-        width={700}
+        width={720}
       >
+        <div style={{ marginBottom: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+          <Radio.Group
+            value={selectedRankAppId}
+            onChange={(e) => void handleOpenRank(e.target.value)}
+            buttonStyle="solid"
+            size="small"
+          >
+            <Radio.Button value={66}>叮咚排行榜 (AppId 66)</Radio.Button>
+            <Radio.Button value={67}>说道排行榜 (AppId 67)</Radio.Button>
+          </Radio.Group>
+          <Tag color="cyan">
+            当前账号归属: {data?.gameAppId === 67 ? '说道榜单 (67)' : '叮咚榜单 (66)'} (独立隔离不互串)
+          </Tag>
+        </div>
         <div style={{ marginBottom: 12 }}>
           <Alert
             type="info"
             showIcon
-            message="智能冲榜策略已生效"
-            description="当账号跌出前 10 时，系统自动选择当前榜单前列最高分进行超越，保证冲进世界前 10 强！"
+            message={selectedRankAppId === (data?.gameAppId || 66) ? '当前展示账号所属主榜单' : '当前展示另一端排行榜（只读查看）'}
+            description={`冲榜与挑战成绩严格隔离在账号自身主端（${data?.gameAppId === 67 ? '说道' : '叮咚'}），互助双码仅用于换IP助力获取做题机会，绝不会发生跨端串榜！`}
           />
         </div>
         <Table<RankLeaderboardItem>
