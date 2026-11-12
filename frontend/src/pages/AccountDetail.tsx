@@ -2374,7 +2374,7 @@ export default function AccountDetail() {
                 <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
                   <Col xs={12} sm={6}>
                     <Card size="small" loading={loading}>
-                      <Statistic title="说道币余额" value={formatNumber(balanceValue, 2)} />
+                      <Statistic title={account?.app_variant === 'dingdong' ? '叮咚币余额' : '说道币余额'} value={formatNumber(balanceValue, 2)} />
                     </Card>
                   </Col>
                   <Col xs={12} sm={6}>
@@ -2392,7 +2392,9 @@ export default function AccountDetail() {
                       <Statistic
                         title="升级进度"
                         value={
-                          progressPointValue !== null
+                          userGradeValue === 5
+                            ? `${formatNumber(progressPointValue, 0)} (已满级)`
+                            : progressPointValue !== null
                             ? `${formatNumber(progressPointValue, 0)} / ${formatNumber(progressPointTotalValue, 0, '-')}`
                             : '未同步'
                         }

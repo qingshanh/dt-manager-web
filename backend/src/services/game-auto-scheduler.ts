@@ -156,11 +156,12 @@ export class GameAutoSchedulerService {
     try {
       const accounts = await prisma.dtAccount.findMany({
         where: { dtUserId: { not: null } },
-        select: { id: true, nickname: true, dtUserId: true }
+        select: { id: true, nickname: true, email: true, phone: true, dtUserId: true }
       });
 
       for (const account of accounts) {
         this.currentRunningAccountId = account.id;
+        const accountLabel = account.nickname?.trim() || account.email?.trim() || account.phone?.trim() || `账户 #${account.id}`;
         const lastCompleted = this.accountDailyCompletedDates.get(account.id);
         const { hour: targetHour, minute: targetMinute } = getAccountScheduledDailyTime(account.id, dateStr);
 
@@ -170,9 +171,10 @@ export class GameAutoSchedulerService {
           (currentHour >= 12 || currentHour > targetHour || (currentHour === targetHour && currentMinute >= targetMinute));
 
         if (shouldRunMainDaily) {
-          this.currentTaskName = `执行主干日常任务 (账户 #${account.id})`;
+          this.currentTaskName = `执行主干日常 (${accountLabel})`;
           logger.info("Game auto scheduler running daily tasks for account", {
             accountId: account.id,
+            accountLabel,
             targetTime: `${targetHour}:${targetMinute}`
           });
           try {
@@ -194,7 +196,7 @@ export class GameAutoSchedulerService {
 
         // Tier 2: 全天 10 分钟机会补漏与冷却消化池
         try {
-          this.currentTaskName = `10分钟机会消化 (账户 #${account.id})`;
+          this.currentTaskName = `10分钟机会消化 (${accountLabel})`;
           const summary = await withTimeout(getAccountGameSummary(account.id), 25_000, null);
           if (!summary) continue;
 

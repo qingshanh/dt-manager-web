@@ -59,6 +59,10 @@ function resolveSnapshotProgressPointTotal(snapshot: Pick<AccountSnapshot, "rawJ
 }
 
 function normalizeSnapshotPrimaryBalance(value: number | null, rawJson: string | null) {
+  if (value !== null && value !== undefined && Number.isFinite(value) && value >= 0) {
+    return roundTo(value, 2);
+  }
+
   const raw = parseJsonRecord(rawJson);
   const publicPoint = isRecord(raw?.publicPoint) ? raw.publicPoint : null;
   const rawBalance = isRecord(raw?.balance) ? raw.balance : null;
@@ -78,19 +82,19 @@ function normalizeSnapshotPrimaryBalance(value: number | null, rawJson: string |
     "creditBalance",
     "credit_balance"
   ]);
-  const ratio = pickNumber(rawBalance, ["creditExchangeRatio"]) ?? DEFAULT_CREDIT_EXCHANGE_RATIO;
-  if (publicDisplay !== null && publicDisplay > 0) {
-    return normalizeCreditBalance(publicDisplay, ratio);
+  if (publicDisplay !== null && publicDisplay >= 0) {
+    return roundTo(publicDisplay, 2);
   }
 
-  if (rawPrimary !== null && rawPrimary > 0) {
-    return normalizeCreditBalance(rawPrimary, ratio);
+  if (rawPrimary !== null && rawPrimary >= 0) {
+    const ratio = pickNumber(rawBalance, ["creditExchangeRatio"]);
+    if (ratio && ratio > 0 && rawPrimary > 1000) {
+      return roundTo(rawPrimary / ratio, 2);
+    }
+    return roundTo(rawPrimary, 2);
   }
 
-  if (value !== null && value > 0 && value < 1000) {
-    return roundTo(value / DEFAULT_CREDIT_EXCHANGE_RATIO, 2);
-  }
-  return value !== null && value > 0 ? value : null;
+  return null;
 }
 
 function normalizeCreditBalance(value: number, ratio: number) {
