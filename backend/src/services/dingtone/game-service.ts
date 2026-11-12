@@ -2086,6 +2086,17 @@ export async function runAccountMemberDaily(accountId: number, logs: GameTaskLog
           if (lotRes?.Result === 1 && lotRes.data?.prizeName) {
             const prize = lotRes.data.prizeName;
             logs.push(formatLog("checkin", "success", `好运抽奖获得: ${prize}`));
+            // 看广告触发 2 倍翻倍奖励
+            const rawToken = ctx.account.dtToken;
+            const token = rawToken ? (decryptText(rawToken) || rawToken) : "";
+            if (token) {
+              const multiRes = await requestGameJson(
+                `/web/ad/roulette/lottery?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}&token=${encodeURIComponent(token)}&multiple=2`
+              ).catch(() => null);
+              if (multiRes?.Result === 1) {
+                logs.push(formatLog("checkin", "success", "🎉 看广告双倍翻倍成功！转盘奖品已翻倍发放！"));
+              }
+            }
             saveMemberRewardRecord({
               accountId,
               source: "roulette",

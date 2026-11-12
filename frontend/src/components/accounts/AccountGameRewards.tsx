@@ -532,11 +532,11 @@ export default function AccountGameRewards({ accountId }: Props) {
           )}
         >
           {pet ? (
-            <Descriptions size="small" column={1} bordered labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }} contentStyle={{ wordBreak: 'break-all' }}>
-              <Descriptions.Item label="宠物名称">
+            <Descriptions size="small" column={1} bordered labelStyle={{ width: '80px', minWidth: '75px', maxWidth: '84px', textAlign: 'right', padding: '6px 8px', fontSize: 13, color: '#666', fontWeight: 500 }} contentStyle={{ padding: '6px 10px', wordBreak: 'break-all' }}>
+              <Descriptions.Item label="宠物昵称">
                 <Typography.Text strong>{pet.petName || '未命名小猫'}</Typography.Text>
               </Descriptions.Item>
-              <Descriptions.Item label="成长进度">
+              <Descriptions.Item label="成长等级">
                 <div style={{ width: '100%', paddingRight: 8 }}>
                   <Progress
                     percent={Math.round((pet.growthRate ?? 0) * 100)}
@@ -544,7 +544,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                   />
                 </div>
               </Descriptions.Item>
-              <Descriptions.Item label="宠物专属 ID (petId)">
+              <Descriptions.Item label="宠物 ID">
                 <Space size={6}>
                   <Typography.Text copyable={false} strong style={{ color: '#1677ff', fontSize: 15 }}>
                     {pet.petId ?? '-'}
@@ -564,7 +564,7 @@ export default function AccountGameRewards({ accountId }: Props) {
               <Descriptions.Item label="鱼粮余额">
                 <Typography.Text strong style={{ color: '#52c41a' }}>{pet.fishNum ?? 0} g</Typography.Text>
               </Descriptions.Item>
-              <Descriptions.Item label="喂食状态">
+              <Descriptions.Item label="饱腹状态">
                 {pet.nextFeedRemainingTime === 0 ? (
                   <Tag color="success">饥饿中，可立即投喂！</Tag>
                 ) : pet.nextFeedRemainingTime ? (
@@ -584,7 +584,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                   <Tag color="default">寻宝冷却中</Tag>
                 )}
               </Descriptions.Item>
-              <Descriptions.Item label="每日任务与玩耍">
+              <Descriptions.Item label="每日玩乐">
                 <Space wrap size={[4, 4]} style={{ marginTop: 2 }}>
                   <Tag color={pet.lotteryLeftChance > 0 ? 'orange' : 'default'}>转盘: {pet.lotteryLeftChance}次可用</Tag>
                   <Tag color={pet.playLeftChance > 0 ? 'purple' : 'default'}>玩耍: {pet.playLeftChance}次可用</Tag>
@@ -620,11 +620,11 @@ export default function AccountGameRewards({ accountId }: Props) {
           )}
         >
           {fruit ? (
-            <Descriptions size="small" column={1} bordered labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }} contentStyle={{ wordBreak: 'break-all' }}>
+            <Descriptions size="small" column={1} bordered labelStyle={{ width: '80px', minWidth: '75px', maxWidth: '84px', textAlign: 'right', padding: '6px 8px', fontSize: 13, color: '#666', fontWeight: 500 }} contentStyle={{ padding: '6px 10px', wordBreak: 'break-all' }}>
               <Descriptions.Item label="种植水果">
                 <Typography.Text strong>{currentFruit?.name === 'apple' ? '🍎 苹果树 (最高收益推荐)' : currentFruit?.name || '未种植(自动种苹果)'}</Typography.Text>
               </Descriptions.Item>
-              <Descriptions.Item label="成熟度进度">
+              <Descriptions.Item label="成熟进度">
                 <div style={{ width: '100%', paddingRight: 8 }}>
                   <Progress
                     percent={Math.round((currentFruit?.completionRate ?? 0) * 100)}
@@ -632,10 +632,10 @@ export default function AccountGameRewards({ accountId }: Props) {
                   />
                 </div>
               </Descriptions.Item>
-              <Descriptions.Item label="水滴营养液">
+              <Descriptions.Item label="水滴余额">
                 <Typography.Text strong style={{ color: '#1677ff' }}>{fruit.nutritiveNumber ?? 0} 滴</Typography.Text>
               </Descriptions.Item>
-              <Descriptions.Item label="果树状态">
+              <Descriptions.Item label="生长状态">
                 {currentFruit && currentFruit.completionRate >= 1 ? (
                   <Tag color="success">已成熟！自动日常可自动收获说道币</Tag>
                 ) : fruit?.isDailyWaterLimitReached ? (
@@ -646,7 +646,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                   <Tag color="default">未种植果树</Tag>
                 )}
               </Descriptions.Item>
-              <Descriptions.Item label="水滴任务进度">
+              <Descriptions.Item label="水滴任务">
                 <Space wrap size={[4, 4]}>
                   {fruit.tasks?.map((t) => (
                     <Tag key={t.taskType} color={t.isFinished ? 'green' : 'blue'}>
@@ -655,7 +655,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                   ))}
                 </Space>
               </Descriptions.Item>
-              <Descriptions.Item label="历史收成记录 (永久保存)">
+              <Descriptions.Item label="历史收成">
                 {fruit.harvestHistory && fruit.harvestHistory.length > 0 ? (
                   <div style={{ maxHeight: 75, overflowY: 'auto' }}>
                     {fruit.harvestHistory.slice(0, 3).map((h, i) => (
@@ -693,14 +693,14 @@ export default function AccountGameRewards({ accountId }: Props) {
           )}
         >
           {knife ? (
-            <Descriptions size="small" column={1} bordered labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }} contentStyle={{ wordBreak: 'break-all' }}>
-              <Descriptions.Item label="果汁金币">
+            <Descriptions size="small" column={1} bordered labelStyle={{ width: '80px', minWidth: '75px', maxWidth: '84px', textAlign: 'right', padding: '6px 8px', fontSize: 13, color: '#666', fontWeight: 500 }} contentStyle={{ padding: '6px 10px', wordBreak: 'break-all' }}>
+              <Descriptions.Item label="金币余额">
                 <Typography.Text strong style={{ color: '#d46b08', fontSize: 15 }}>{knife.fruitJuiceAmount ?? 0}</Typography.Text>
               </Descriptions.Item>
-              <Descriptions.Item label="剩余游戏机会">
+              <Descriptions.Item label="剩余机会">
                 <Typography.Text strong>{knife.remainPlayTimes ?? 0} 次</Typography.Text>
               </Descriptions.Item>
-              <Descriptions.Item label="看广告拿次数">
+              <Descriptions.Item label="广告机会">
                 <Tag color={knife.watchingGetPlayTimes < knife.watchingGetPlayTimesLimit ? 'processing' : 'default'}>
                   已获取 {knife.watchingGetPlayTimes} / 上限 {knife.watchingGetPlayTimesLimit} 次
                 </Tag>
@@ -714,7 +714,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                   <Tag color="default">未拥有宝箱</Tag>
                 )}
               </Descriptions.Item>
-              <Descriptions.Item label="自动飞刀机制">
+              <Descriptions.Item label="自动机制">
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                   日常执行时自动看广告拿满 15 次机会，自动投掷飞刀并触发十级轮盘抽奖翻倍！
                 </Typography.Text>
@@ -813,10 +813,10 @@ export default function AccountGameRewards({ accountId }: Props) {
                 size="small"
                 column={1}
                 bordered
-                labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }}
-                contentStyle={{ wordBreak: 'break-all' }}
+                labelStyle={{ width: '80px', minWidth: '75px', maxWidth: '84px', textAlign: 'right', padding: '6px 8px', fontSize: 13, color: '#666', fontWeight: 500 }}
+                contentStyle={{ padding: '6px 10px', wordBreak: 'break-all' }}
               >
-                <Descriptions.Item label="副通道自动化">
+                <Descriptions.Item label="副通道">
                   <Space wrap align="center" size={8}>
                     <Switch
                       checked={secondaryChannelEnabled}
@@ -831,7 +831,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                   </Space>
                 </Descriptions.Item>
 
-                <Descriptions.Item label="推广短链码">
+                <Descriptions.Item label="推广短链">
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
                   <Space wrap size={[8, 8]}>
                     {/* 叮咚短链码 */}
@@ -930,7 +930,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                   </div>
                 </Space>
               </Descriptions.Item>
-              <Descriptions.Item label="积分额度兑换 (每日限1次)">
+              <Descriptions.Item label="额度兑换">
                 <Space wrap size={6}>
                   {math.redeemProducts?.map((p) => {
                     const isRedeemed = math.redeemedTodayProductIds?.includes(p.productId);
@@ -968,8 +968,8 @@ export default function AccountGameRewards({ accountId }: Props) {
             </Space>
           )}
         >
-          <Descriptions size="small" column={1} bordered labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }} contentStyle={{ wordBreak: 'break-all' }}>
-            <Descriptions.Item label="🎁 免费币签到 & 幸运测试">
+          <Descriptions size="small" column={1} bordered labelStyle={{ width: '80px', minWidth: '75px', maxWidth: '84px', textAlign: 'right', padding: '6px 8px', fontSize: 13, color: '#666', fontWeight: 500 }} contentStyle={{ padding: '6px 10px', wordBreak: 'break-all' }}>
+            <Descriptions.Item label="免费币">
               <Space wrap align="center" size={8}>
                 <Tag color="cyan">每日免费币签到</Tag>
                 <Tag color="gold">幸运测试 (Feeling Lucky)</Tag>
@@ -985,7 +985,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                 </Typography.Text>
               </Space>
             </Descriptions.Item>
-            <Descriptions.Item label="每日好运转盘">
+            <Descriptions.Item label="好运转盘">
               <Space wrap size={[4, 4]}>
                 <Tag color={member && member.adRouletteRemainTimes > 0 ? 'orange' : 'default'}>
                   可用抽奖: {member?.adRouletteRemainTimes ?? 0} 次
@@ -995,7 +995,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                 </Tag>
               </Space>
             </Descriptions.Item>
-            <Descriptions.Item label="会员每日签到">
+            <Descriptions.Item label="每日签到">
               <Space wrap size={[4, 4]}>
                 <Tag color={member && member.validTimes > 0 ? 'green' : 'default'}>
                   签到状态: {member && member.validTimes > 0 ? `可签到 (${member.validTimes}次)` : '今日已签到'}
@@ -1005,7 +1005,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                 </Tag>
               </Space>
             </Descriptions.Item>
-            <Descriptions.Item label="最近中奖奖励">
+            <Descriptions.Item label="最近中奖">
               {member?.lastReward ? (
                 <Space>
                   <Tag color="success" style={{ fontSize: 13, padding: '2px 8px' }}>
@@ -1021,7 +1021,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                 </Typography.Text>
               )}
             </Descriptions.Item>
-            <Descriptions.Item label="历史中奖记录 (永久保存)">
+            <Descriptions.Item label="中奖历史">
               {member?.history && member.history.length > 0 ? (
                 <div style={{ maxHeight: 75, overflowY: 'auto' }}>
                   {member.history.slice(0, 3).map((h, i) => (
@@ -1040,7 +1040,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                 </Typography.Text>
               )}
             </Descriptions.Item>
-            <Descriptions.Item label="全自动执行机制">
+            <Descriptions.Item label="自动机制">
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 日常自动调度时自动看广告拿满 2 次好运抽奖，自动完成签到领奖，所有中奖均留存本地可追溯！
               </Typography.Text>
@@ -1063,7 +1063,7 @@ export default function AccountGameRewards({ accountId }: Props) {
             </Space>
           )}
         >
-          <Descriptions size="small" column={1} bordered labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }} contentStyle={{ wordBreak: 'break-all' }}>
+          <Descriptions size="small" column={1} bordered labelStyle={{ width: '80px', minWidth: '75px', maxWidth: '84px', textAlign: 'right', padding: '6px 8px', fontSize: 13, color: '#666', fontWeight: 500 }} contentStyle={{ padding: '6px 10px', wordBreak: 'break-all' }}>
             <Descriptions.Item label="积分总览">
               <Space wrap size={[8, 4]}>
                 <span>可用: <Typography.Text strong style={{ color: '#d46b08', fontSize: 14 }}>{pointStoreData?.valid_point ?? math?.validPoint ?? 0}</Typography.Text></span>
@@ -1072,7 +1072,7 @@ export default function AccountGameRewards({ accountId }: Props) {
               </Space>
             </Descriptions.Item>
 
-            <Descriptions.Item label="自动兑换配置">
+            <Descriptions.Item label="自动兑换">
               <Space direction="vertical" size={6} style={{ width: '100%' }}>
                 <Space wrap style={{ justifyContent: 'space-between', width: '100%' }}>
                   <Typography.Text strong>
@@ -1090,7 +1090,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                   <span style={{ fontSize: 12, color: '#555' }}>目标:</span>
                   <Select
                     showSearch
-                    style={{ minWidth: 200, flex: 1 }}
+                    style={{ minWidth: 150, flex: 1 }}
                     placeholder="选择或输入商品 ID / 名称"
                     value={autoRedeemTarget || undefined}
                     onChange={(val) => setAutoRedeemTarget(val)}
@@ -1109,7 +1109,7 @@ export default function AccountGameRewards({ accountId }: Props) {
               </Space>
             </Descriptions.Item>
 
-            <Descriptions.Item label="商城商品 (点击选中)">
+            <Descriptions.Item label="商城商品">
               <Space wrap size={6}>
                 {pointStoreData?.products?.map((p: any) => (
                   <Button
