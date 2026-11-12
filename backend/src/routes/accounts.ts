@@ -659,6 +659,7 @@ accountsRouter.post("/", async (req, res, next) => {
       body.login_type
     );
     const trackCode = selectVerificationTrackCode(existing?.dtTrackCode, body.login_type);
+    const targetTelegramNotify = body.telegram_notify !== undefined ? Boolean(body.telegram_notify) : (existing?.telegramNotify ?? true);
 
     if (body.login_type === "manual_session") {
       const nextStatus = existing?.dtUserId ? existing.status : AccountStatus.pending;
@@ -673,7 +674,7 @@ accountsRouter.post("/", async (req, res, next) => {
           password: null,
           dtDeviceId: deviceId,
           dtTrackCode: trackCode,
-          telegramNotify: body.telegram_notify,
+          telegramNotify: targetTelegramNotify,
           proxyEnabled: body.proxy_enabled,
           status: nextStatus,
           ...(existing?.dtUserId ? {} : { monitorEnabled: false }),
@@ -689,7 +690,7 @@ accountsRouter.post("/", async (req, res, next) => {
           password: null,
           dtDeviceId: deviceId,
           dtTrackCode: trackCode,
-          telegramNotify: body.telegram_notify,
+          telegramNotify: targetTelegramNotify,
           proxyEnabled: body.proxy_enabled,
           status: AccountStatus.pending,
           monitorEnabled: false
@@ -718,7 +719,7 @@ accountsRouter.post("/", async (req, res, next) => {
           password: null,
           dtDeviceId: deviceId,
           dtTrackCode: trackCode,
-          telegramNotify: body.telegram_notify,
+          telegramNotify: targetTelegramNotify,
           proxyEnabled: body.proxy_enabled,
           status: nextStatus,
           lastError: null
@@ -733,7 +734,7 @@ accountsRouter.post("/", async (req, res, next) => {
           password: null,
           dtDeviceId: deviceId,
           dtTrackCode: trackCode,
-          telegramNotify: body.telegram_notify,
+          telegramNotify: targetTelegramNotify,
           proxyEnabled: body.proxy_enabled,
           status: AccountStatus.pending
         }
@@ -805,7 +806,7 @@ accountsRouter.post("/", async (req, res, next) => {
             password: body.password ? encryptText(body.password) : null,
             dtDeviceId: deviceId,
             dtTrackCode: trackCode,
-            telegramNotify: body.telegram_notify,
+            telegramNotify: targetTelegramNotify,
             proxyEnabled: body.proxy_enabled
           }
         })
@@ -820,7 +821,7 @@ accountsRouter.post("/", async (req, res, next) => {
             password: body.password ? encryptText(body.password) : null,
             dtDeviceId: deviceId,
             dtTrackCode: trackCode,
-            telegramNotify: body.telegram_notify,
+            telegramNotify: targetTelegramNotify,
             proxyEnabled: body.proxy_enabled
           }
         });
@@ -4057,7 +4058,7 @@ async function importSessionAccount(
           dtUserId: item.dt_user_id,
           dtToken: encryptText(item.token),
           dtDeviceId: item.device_id,
-          telegramNotify: item.telegram_notify,
+          telegramNotify: item.telegram_notify !== undefined ? Boolean(item.telegram_notify) : existing.telegramNotify,
           proxyEnabled: item.proxy_enabled,
           status: AccountStatus.offline,
           lastLoginAt: new Date(),
@@ -4081,7 +4082,7 @@ async function importSessionAccount(
           dtToken: encryptText(item.token),
           dtDeviceId: item.device_id,
           dtTrackCode: createTrackCode(),
-          telegramNotify: item.telegram_notify,
+          telegramNotify: item.telegram_notify !== undefined ? Boolean(item.telegram_notify) : true,
           proxyEnabled: item.proxy_enabled,
           status: AccountStatus.offline,
           lastLoginAt: new Date()

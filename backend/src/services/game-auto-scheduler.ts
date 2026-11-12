@@ -11,7 +11,8 @@ import {
   runAccountKnifeDaily,
   runAccountPetDaily,
   runAccountMathDaily,
-  runAccountMemberDaily
+  runAccountMemberDaily,
+  runAccountFreeCreditsDaily
 } from "./dingtone/game-service.js";
 import { getSettingsMap } from "./settings.service.js";
 import { checkAndAutoRedeemAmazonGiftCard } from "./point-store.js";
@@ -254,36 +255,49 @@ export class GameAutoSchedulerService {
 
           // 4. 萌宠工坊: 饥饿投喂、寻宝双倍领奖、玩耍与转盘
           if (summary.pet) {
-            if (summary.pet.nextFeedRemainingTime === 0 && (summary.pet.fishNum ?? 0) > 0) {
-              logger.info("Game auto scheduler auto-feeding hungry pet", { accountId: account.id });
-              await withTimeout(runAccountPetDaily(account.id), 30_000, false);
-              await randomDelay(2000, 5000);
-            } else if (summary.pet.treasureHuntStatus === 2 || summary.pet.treasureHuntStatus === 0) {
-              logger.info("Game auto scheduler handling pet treasure hunt (claim or start)", { accountId: account.id });
-              await withTimeout(runAccountPetDaily(account.id), 30_000, false);
-              await randomDelay(2000, 5000);
-            } else if (summary.pet.lotteryLeftChance > 0 || summary.pet.playLeftChance > 0) {
-              logger.info("Game auto scheduler using pet lottery or play chances", { accountId: account.id });
-              await withTimeout(runAccountPetDaily(account.id), 30_000, false);
+            const hasPetTasks = summary.pet.tasks?.some((t) => !t.isFinished);
+            const canFeed = summary.pet.nextFeedRemainingTime === 0 && (summary.pet.fishNum ?? 0) > 0;
+            const canHunt = summary.pet.treasureHuntStatus === 2 || summary.pet.treasureHuntStatus === 0;
+            const hasChances = (summary.pet.lotteryLeftChance ?? 0) > 0 || (summary.pet.playLeftChance ?? 0) > 0;
+
+            if (canFeed || canHunt || hasChances || hasPetTasks) {
+              logger.info("Game auto scheduler running pet daily/chances/tasks", {
+                accountId: account.id,
+                canFeed,
+                canHunt,
+                hasChances,
+                hasPetTasks
+              });
+              await withTimeout(runAccountPetDaily(account.id), 40_000, false);
               await randomDelay(2000, 5000);
             }
           }
 
           // 5. 每日果园: 成熟自动收获、未达上限自动浇水
           if (summary.fruit) {
-            if (summary.fruit.plantFruitList?.some((f) => (f.completionRate ?? 0) >= 1.0)) {
-              logger.info("Game auto scheduler harvesting mature fruit", { accountId: account.id });
-              await withTimeout(runAccountFruitDaily(account.id), 30_000, false);
-              await randomDelay(2000, 5000);
-            } else if (!summary.fruit.isDailyWaterLimitReached && (summary.fruit.nutritiveNumber ?? 0) >= 10) {
-              logger.info("Game auto scheduler auto-watering fruit tree", { accountId: account.id });
-              await withTimeout(runAccountFruitDaily(account.id), 30_000, false);
+            const isMature = summary.fruit.plantFruitList?.some((f) => (f.completionRate ?? 0) >= 1.0);
+            const canWater = !summary.fruit.isDailyWaterLimitReached && (summary.fruit.nutritiveNumber ?? 0) >= 10;
+            const hasFruitTasks = summary.fruit.tasks?.some((t) => !t.isFinished);
+
+            if (isMature || canWater || hasFruitTasks) {
+              logger.info("Game auto scheduler running fruit harvest/watering/tasks", {
+                accountId: account.id,
+                isMature,
+                canWater,
+                hasFruitTasks
+              });
+              await withTimeout(runAccountFruitDaily(account.id), 40_000, false);
               await randomDelay(2000, 5000);
             }
           }
 
           // 6. 自动兑换指定积分商品检测
           await withTimeout(checkAndAutoRedeemAmazonGiftCard(account.id), 20_000, null).catch(() => null);
+
+          // 7. 免费币每日签到与幸运测试 (若今天未完成)
+          if (account.dtUserId) {
+            await withTimeout(runAccountFreeCreditsDaily(account.id), 20_000, { totalCreditsWon: 0 }).catch(() => null);
+          }
         } catch (err) {
           logger.warn("Tier 2 opportunistic task error", {
             accountId: account.id,

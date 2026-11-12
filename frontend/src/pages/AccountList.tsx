@@ -21,7 +21,7 @@ import {
   VerticalAlignBottomOutlined,
   VerticalAlignTopOutlined,
 } from '@ant-design/icons';
-import type { ColumnsType } from 'antd/es/table';
+import type { ColumnsType, TableProps } from 'antd/es/table';
 import dayjs from 'dayjs';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -139,6 +139,25 @@ export default function AccountList() {
   const screens = Grid.useBreakpoint();
   const compactAccountRows = screens.sm === false;
   const [mobileSortKey, setMobileSortKey] = useState<string>('default');
+  const [sortedInfo, setSortedInfo] = useState<{ field?: string; order?: 'ascend' | 'descend' }>(() => {
+    try {
+      const saved = localStorage.getItem('dt_account_list_sort');
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const handleTableChange: TableProps<DtAccountListItem>['onChange'] = (_pagination, _filters, sorter) => {
+    const s = Array.isArray(sorter) ? sorter[0] : sorter;
+    const nextSort = s?.field && s.order ? { field: String(s.field), order: s.order } : {};
+    setSortedInfo(nextSort);
+    try {
+      localStorage.setItem('dt_account_list_sort', JSON.stringify(nextSort));
+    } catch {
+      // ignore
+    }
+  };
 
   const fetch = useCallback(
     async (currentPage = page, currentKeyword = keyword, options?: { force?: boolean }) => {
@@ -375,11 +394,25 @@ export default function AccountList() {
 
   const columns: ColumnsType<DtAccountListItem> = [
     {
+      title: '序号',
+      dataIndex: 'id',
+      width: 68,
+      align: 'center',
+      sorter: (a, b) => a.id - b.id,
+      sortOrder: sortedInfo.field === 'id' ? sortedInfo.order : null,
+      render: (id: number) => (
+        <Tag color="cyan" style={{ marginInlineEnd: 0, fontWeight: 'bold' }}>
+          #{id}
+        </Tag>
+      ),
+    },
+    {
       title: '备注',
       dataIndex: 'nickname',
-      width: 116,
+      width: 110,
       ellipsis: true,
       sorter: (a, b) => (a.nickname || '').localeCompare(b.nickname || ''),
+      sortOrder: sortedInfo.field === 'nickname' ? sortedInfo.order : null,
       render: (text, record) => (
         <Typography.Text
           editable={{
@@ -401,16 +434,19 @@ export default function AccountList() {
     {
       title: '类型',
       dataIndex: 'app_variant',
-      width: 80,
+      width: 72,
+      align: 'center',
       sorter: (a, b) => (a.app_variant || '').localeCompare(b.app_variant || ''),
-      render: (value) => <Tag color={value === 'dingdong' ? 'blue' : 'gold'}>{value === 'dingdong' ? '叮咚' : '说道'}</Tag>,
+      sortOrder: sortedInfo.field === 'app_variant' ? sortedInfo.order : null,
+      render: (value) => <Tag color={value === 'dingdong' ? 'blue' : 'gold'} style={{ marginInlineEnd: 0 }}>{value === 'dingdong' ? '叮咚' : '说道'}</Tag>,
     },
     {
       title: '邮箱',
       dataIndex: 'email',
-      width: 196,
+      width: 190,
       ellipsis: true,
       sorter: (a, b) => (a.email || '').localeCompare(b.email || ''),
+      sortOrder: sortedInfo.field === 'email' ? sortedInfo.order : null,
       render: (value, record) => (
         <CopyableCell
           value={value}
@@ -424,7 +460,9 @@ export default function AccountList() {
       title: '用户 ID',
       dataIndex: 'dt_user_id',
       width: 120,
+      align: 'center',
       sorter: (a, b) => (a.dt_user_id || '').localeCompare(b.dt_user_id || ''),
+      sortOrder: sortedInfo.field === 'dt_user_id' ? sortedInfo.order : null,
       render: (value, record) => (
         <CopyableCell
           value={value}
@@ -437,8 +475,10 @@ export default function AccountList() {
     {
       title: '状态',
       dataIndex: 'status',
-      width: 82,
+      width: 78,
+      align: 'center',
       sorter: (a, b) => (a.status || '').localeCompare(b.status || ''),
+      sortOrder: sortedInfo.field === 'status' ? sortedInfo.order : null,
       render: (value: string, record) => {
         const item = statusMap[value] || { color: 'default', label: value };
         const tags = (
@@ -453,8 +493,10 @@ export default function AccountList() {
     {
       title: '电报',
       dataIndex: 'telegram_notify',
-      width: 58,
+      width: 56,
+      align: 'center',
       sorter: (a, b) => Number(a.telegram_notify) - Number(b.telegram_notify),
+      sortOrder: sortedInfo.field === 'telegram_notify' ? sortedInfo.order : null,
       render: (value, record) => (
         <Switch size="small" checked={value} loading={actionLoading === record.id} onChange={(checked) => void handleTelegramToggle(record, checked)} />
       ),
@@ -462,13 +504,16 @@ export default function AccountList() {
     {
       title: '未读',
       dataIndex: 'unread_count',
-      width: 52,
+      width: 48,
+      align: 'center',
       sorter: (a, b) => (a.unread_count || 0) - (b.unread_count || 0),
+      sortOrder: sortedInfo.field === 'unread_count' ? sortedInfo.order : null,
       render: (value) => (value > 0 ? <Tag color="red" style={{ marginInlineEnd: 0 }}>{value}</Tag> : <Typography.Text type="secondary">0</Typography.Text>),
     },
     {
       title: '排序',
-      width: 48,
+      width: 46,
+      align: 'center',
       render: (_, record) => (
         <Dropdown
           trigger={['click']}
@@ -494,13 +539,16 @@ export default function AccountList() {
     {
       title: '最近登录',
       dataIndex: 'last_login_at',
-      width: 88,
+      width: 90,
+      align: 'center',
       sorter: (a, b) => (a.last_login_at ? dayjs(a.last_login_at).valueOf() : 0) - (b.last_login_at ? dayjs(b.last_login_at).valueOf() : 0),
+      sortOrder: sortedInfo.field === 'last_login_at' ? sortedInfo.order : null,
       render: (value) => (value ? dayjs(value).format('MM-DD HH:mm') : '-'),
     },
     {
       title: '操作',
-      width: 124,
+      width: 120,
+      align: 'center',
       render: (_, record) => (
         <Space size={2}>
           {canVerificationRelogin(record) ? (
@@ -707,6 +755,7 @@ export default function AccountList() {
               preserveSelectedRowKeys: true,
               onChange: (keys) => setSelectedAccountIds(keys.map(Number)),
             }}
+            onChange={handleTableChange}
             loading={loading}
             size="small"
             scroll={{ x: 1050 }}

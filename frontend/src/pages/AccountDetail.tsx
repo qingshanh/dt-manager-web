@@ -1082,17 +1082,16 @@ export default function AccountDetail() {
   const snapshot = account?.snapshot;
   const snapshotExtras = useMemo(() => parseSnapshotExtras(snapshot?.raw_json), [snapshot?.raw_json]);
 
-  const balanceValue = snapshotExtras.primaryBalance ?? snapshot?.primary_balance ?? null;
-  const validPointValue = pointStore?.valid_point ?? snapshot?.valid_point ?? snapshotExtras.validPoint ?? null;
-  const userGradeValue = pointStore?.user_grade ?? snapshotExtras.userGrade ?? snapshot?.user_grade ?? null;
-  const progressPointValue = pointStore?.history_point ?? snapshotExtras.progressPoint ?? snapshot?.progress_point ?? null;
+  const balanceValue = (snapshot?.primary_balance !== undefined && snapshot?.primary_balance !== null) ? snapshot.primary_balance : (snapshotExtras.primaryBalance ?? null);
+  const validPointValue = (snapshot?.valid_point !== undefined && snapshot?.valid_point !== null) ? snapshot.valid_point : (pointStore?.valid_point ?? snapshotExtras.validPoint ?? null);
+  const userGradeValue = (snapshot?.user_grade !== undefined && snapshot?.user_grade !== null) ? snapshot.user_grade : (pointStore?.user_grade ?? snapshotExtras.userGrade ?? null);
+  const progressPointValue = (snapshot?.progress_point !== undefined && snapshot?.progress_point !== null) ? snapshot.progress_point : (pointStore?.history_point ?? snapshotExtras.progressPoint ?? null);
   const progressPointTotalValue =
-    snapshot?.progress_point_total ?? snapshotExtras.progressPointTotal ?? (userGradeValue === 1 ? 500 : userGradeValue === 2 ? 1000 : userGradeValue === 3 ? 3000 : userGradeValue === 4 ? 5000 : null);
+    snapshot?.progress_point_total ?? snapshotExtras.progressPointTotal ?? (userGradeValue === 1 ? 500 : userGradeValue === 2 ? 1000 : userGradeValue === 3 ? 3000 : userGradeValue === 4 ? 5000 : userGradeValue === 5 ? 20000 : null);
   const dingtoneIdValue = snapshotExtras.dtDingtoneId ?? snapshot?.dt_dingtone_id ?? null;
   const membershipLevelValue =
+    (userGradeValue !== null ? (userGradeValue === 5 ? 'V5至尊' : userGradeValue === 4 ? 'V4白金' : `V${userGradeValue}`) : null) ||
     snapshotExtras.membershipLevelLabel ||
-    (userGradeValue === 4 ? 'V4白金' : null) ||
-    (userGradeValue !== null ? `V${userGradeValue}` : null) ||
     snapshot?.membership_type ||
     null;
   const boundPhoneValue = snapshot?.phone?.trim() ? snapshot.phone : null;
@@ -2275,8 +2274,8 @@ export default function AccountDetail() {
   const usesVerificationLogin = account?.login_type === 'email_code' || account?.login_type === 'phone_code';
 
   return (
-    <div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 }}>
+    <div style={{ width: '100%', maxWidth: '100vw', overflowX: 'hidden' }}>
+      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 12, marginBottom: 16 }}>
         <Button icon={<ArrowLeftOutlined />} onClick={() => navigate('/accounts')}>
           返回
         </Button>

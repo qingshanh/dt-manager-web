@@ -7,6 +7,7 @@ import { AppError } from "../../utils/errors.js";
 import { logger } from "../../utils/logger.js";
 import { fetchPublicJson } from "../public-account-enrichment.js";
 import { DirectDingtoneGateway } from "./direct-gateway.js";
+import { decryptText } from "../../utils/crypto.js";
 
 const POINT_API_BASE = "https://dt-apigatewayv2.dt-pn1.com";
 const MATH_WSS_URL = "wss://d15wptekiod8mq.cloudfront.net/ws";
@@ -1515,10 +1516,19 @@ async function executeBillingCheckIn(
 ): Promise<{ success: boolean; rewardCredits: number; message: string; data?: any }> {
   const modeName = mode === 1 ? "免费币每日签到" : "幸运测试 (Feeling Lucky)";
   const userId = ctx.dtUserId;
-  const token = ctx.account.dtToken || "";
+  const rawToken = ctx.account.dtToken;
+  const token = (rawToken ? decryptText(rawToken) : null) || rawToken || "";
   const deviceId = ctx.account.dtDeviceId || "";
   const tz = encodeURIComponent("GMT+08:00");
   const countryCode = 1;
+
+  if (!userId || !token) {
+    return {
+      success: false,
+      rewardCredits: 0,
+      message: "账户尚未激活或缺少会话 Token，请先登录或导入会话"
+    };
+  }
 
   // 1. 优先尝试 HTTP Direct API
   if (userId && token && deviceId) {
@@ -1544,6 +1554,14 @@ async function executeBillingCheckIn(
       }
       if (res?.Reason?.includes("duplicated") || res?.Reason?.includes("已签") || res?.Reason?.includes("已领取")) {
         return { success: true, rewardCredits: 0, message: `今日已完成${modeName}`, data: res };
+      }
+      if (res?.Reason?.includes("token is not correct") || res?.ErrCode === 60014 || res?.ErrCode === 60009) {
+        return {
+          success: false,
+          rewardCredits: 0,
+          message: "会话 Token 已失效或不正确 (60014)，请在账户详情点击【验证码重新登录】刷新会话",
+          data: res
+        };
       }
     } catch {
       // fallback to TCP Direct Gateway
@@ -1576,17 +1594,34 @@ async function executeBillingCheckIn(
         data: payload
       };
     }
+    const reasonText = (payload as any)?.Reason || (payload as any)?.message || "";
+    if (reasonText.includes("token is not correct") || (payload as any)?.ErrCode === 60014) {
+      return {
+        success: false,
+        rewardCredits: 0,
+        message: "会话 Token 已失效或不正确 (60014)，请在账户详情点击【验证码重新登录】刷新会话",
+        data: payload
+      };
+    }
     return {
       success: false,
       rewardCredits: 0,
-      message: (payload as any)?.Reason || (payload as any)?.message || "接口未返回奖励数据",
+      message: reasonText || "接口未返回奖励数据",
       data: payload
     };
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("60014") || msg.includes("token is not correct")) {
+      return {
+        success: false,
+        rewardCredits: 0,
+        message: "会话 Token 已失效 (60014)，请在账户详情点击【验证码重新登录】刷新会话"
+      };
+    }
     return {
       success: false,
       rewardCredits: 0,
-      message: err instanceof Error ? err.message : String(err)
+      message: msg
     };
   }
 }

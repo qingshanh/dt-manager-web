@@ -463,6 +463,8 @@ export default function AccountGameRewards({ accountId }: Props) {
           display: grid;
           grid-template-columns: repeat(3, minmax(0, 1fr));
           gap: 16px;
+          width: 100%;
+          max-width: 100%;
         }
         @media (max-width: 1280px) {
           .game-cards-grid {
@@ -471,8 +473,38 @@ export default function AccountGameRewards({ accountId }: Props) {
         }
         @media (max-width: 768px) {
           .game-cards-grid {
-            grid-template-columns: 1fr;
+            grid-template-columns: minmax(0, 1fr) !important;
             gap: 12px;
+            width: 100% !important;
+            max-width: 100% !important;
+          }
+          .ant-card {
+            width: 100% !important;
+            max-width: 100% !important;
+            overflow: hidden !important;
+          }
+          .ant-card-body {
+            padding: 12px 10px !important;
+          }
+          .ant-descriptions {
+            width: 100% !important;
+          }
+          .ant-descriptions-view {
+            width: 100% !important;
+            table-layout: fixed !important;
+          }
+          .ant-descriptions-item-label {
+            width: 96px !important;
+            min-width: 96px !important;
+            max-width: 96px !important;
+            padding: 6px 8px !important;
+            font-size: 12px !important;
+          }
+          .ant-descriptions-item-content {
+            padding: 6px 8px !important;
+            font-size: 12px !important;
+            word-break: break-all !important;
+            overflow-wrap: anywhere !important;
           }
         }
       `}</style>
@@ -500,7 +532,7 @@ export default function AccountGameRewards({ accountId }: Props) {
           )}
         >
           {pet ? (
-            <Descriptions size="small" column={1} bordered>
+            <Descriptions size="small" column={1} bordered labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }} contentStyle={{ wordBreak: 'break-all' }}>
               <Descriptions.Item label="宠物名称">
                 <Typography.Text strong>{pet.petName || '未命名小猫'}</Typography.Text>
               </Descriptions.Item>
@@ -588,7 +620,7 @@ export default function AccountGameRewards({ accountId }: Props) {
           )}
         >
           {fruit ? (
-            <Descriptions size="small" column={1} bordered>
+            <Descriptions size="small" column={1} bordered labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }} contentStyle={{ wordBreak: 'break-all' }}>
               <Descriptions.Item label="种植水果">
                 <Typography.Text strong>{currentFruit?.name === 'apple' ? '🍎 苹果树 (最高收益推荐)' : currentFruit?.name || '未种植(自动种苹果)'}</Typography.Text>
               </Descriptions.Item>
@@ -661,7 +693,7 @@ export default function AccountGameRewards({ accountId }: Props) {
           )}
         >
           {knife ? (
-            <Descriptions size="small" column={1} bordered>
+            <Descriptions size="small" column={1} bordered labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }} contentStyle={{ wordBreak: 'break-all' }}>
               <Descriptions.Item label="果汁金币">
                 <Typography.Text strong style={{ color: '#d46b08', fontSize: 15 }}>{knife.fruitJuiceAmount ?? 0}</Typography.Text>
               </Descriptions.Item>
@@ -697,82 +729,109 @@ export default function AccountGameRewards({ accountId }: Props) {
         <Card
           title="🧮 算术挑战"
           extra={(
-            <Space size={6}>
+            <Space size={4} wrap>
               <Tooltip title="查看玩法说明"><Button size="small" type="text" icon={<InfoCircleOutlined />} onClick={() => openGuide('math')} /></Tooltip>
               <Button size="small" icon={<TrophyOutlined />} onClick={() => void handleOpenRank()}>排行榜</Button>
-              <Button size="small" icon={<ThunderboltOutlined />} loading={actionLoading === 'math'} onClick={() => void handleRunMathDaily()}>做题/消耗</Button>
+              <Button size="small" icon={<ThunderboltOutlined />} loading={actionLoading === 'math'} onClick={() => void handleRunMathDaily()}>做题</Button>
               <Button size="small" type="primary" icon={<TrophyOutlined />} loading={actionLoading === 'climb'} onClick={() => setClimbModalOpen(true)}>冲榜</Button>
             </Space>
           )}
         >
           {math ? (
-            <Descriptions size="small" column={1} bordered>
-              <Descriptions.Item label="世界排名 / 最佳得分">
-                <Space wrap>
-                  {typeof math.ranking === 'number' && math.ranking > 0 ? (
-                    <Tag color={math.ranking <= 10 ? 'gold' : 'blue'}>
-                      🏆 世界第 {math.ranking} 名
-                    </Tag>
-                  ) : (
-                    <Tag color="default">未上榜</Tag>
-                  )}
-                  <Typography.Text type="secondary" style={{ fontSize: 13 }}>
-                    (历史最佳得分: {math.bestScore ?? 0} 分)
-                  </Typography.Text>
-                </Space>
-              </Descriptions.Item>
-              <Descriptions.Item label="本轮赛季结算">
-                {math.seasonEndAt ? (
-                  <Space wrap size={6}>
-                    <Tag color="orange" icon={<ClockCircleOutlined />}>
-                      剩 {formatRemainingDuration(math.seasonRemainingSeconds)}
-                    </Tag>
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      ({new Date(math.seasonEndAt).toLocaleDateString('zh-CN')} {new Date(math.seasonEndAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 结算)
+            <Space direction="vertical" size={10} style={{ width: '100%' }}>
+              {/* 核心指标统计仪表盘 */}
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                  gap: 8,
+                  background: '#fafafa',
+                  padding: '8px 10px',
+                  borderRadius: 6,
+                  border: '1px solid #f0f0f0'
+                }}
+              >
+                <div>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>积分余额</Typography.Text>
+                  <div>
+                    <Typography.Text strong style={{ fontSize: 18, color: '#d46b08' }}>
+                      {math.validPoint ?? 0}
+                    </Typography.Text>
+                    {math.expirePoint ? (
+                      <Typography.Text type="danger" style={{ fontSize: 11, marginLeft: 4 }}>
+                        (将过期: {math.expirePoint})
+                      </Typography.Text>
+                    ) : null}
+                  </div>
+                </div>
+
+                <div>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>剩余答题机会</Typography.Text>
+                  <div>
+                    <Typography.Text strong style={{ fontSize: 16 }}>
+                      {math.chanceLeft ?? 0} 次
+                    </Typography.Text>
+                    {math.watchAdsAddChanceFrequency ? (
+                      <Tag color="green" style={{ marginLeft: 4, fontSize: 11, padding: '0 4px' }}>
+                        广告+{math.watchAdsAddChanceFrequency}
+                      </Tag>
+                    ) : null}
+                  </div>
+                </div>
+
+                <div>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>世界排名 / 战绩</Typography.Text>
+                  <div>
+                    {typeof math.ranking === 'number' && math.ranking > 0 ? (
+                      <Tag color={math.ranking <= 10 ? 'gold' : 'blue'} style={{ margin: 0, fontWeight: 'bold' }}>
+                        🏆 #{math.ranking} ({math.bestScore ?? 0}分)
+                      </Tag>
+                    ) : (
+                      <Tag color="default" style={{ margin: 0 }}>未上榜</Tag>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>本轮赛季结算</Typography.Text>
+                  <div>
+                    {math.seasonEndAt ? (
+                      <Tooltip title={`${new Date(math.seasonEndAt).toLocaleDateString('zh-CN')} ${new Date(math.seasonEndAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 结算`}>
+                        <Tag color="orange" style={{ margin: 0, cursor: 'pointer' }}>
+                          剩 {formatRemainingDuration(math.seasonRemainingSeconds)}
+                        </Tag>
+                      </Tooltip>
+                    ) : (
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>进行中</Typography.Text>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* 详细配置与操作列表 */}
+              <Descriptions
+                size="small"
+                column={1}
+                bordered
+                labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }}
+                contentStyle={{ wordBreak: 'break-all' }}
+              >
+                <Descriptions.Item label="副通道自动化">
+                  <Space wrap align="center" size={8}>
+                    <Switch
+                      checked={secondaryChannelEnabled}
+                      loading={savingSecondaryChannel}
+                      onChange={(checked) => void handleToggleSecondaryChannel(checked)}
+                      checkedChildren="开"
+                      unCheckedChildren="关"
+                    />
+                    <Typography.Text style={{ fontSize: 12, color: secondaryChannelEnabled ? '#1677ff' : '#888' }}>
+                      {secondaryChannelEnabled ? '已开启：自动做题翻倍+自动兑换充入主钱包' : '默认关闭（防风控，仅保留副短链供手动使用）'}
                     </Typography.Text>
                   </Space>
-                ) : (
-                  <Typography.Text type="secondary">本轮进行中</Typography.Text>
-                )}
-              </Descriptions.Item>
-              <Descriptions.Item label="当前积分余额">
-                <Space>
-                  <Typography.Text strong style={{ fontSize: 16, color: '#d46b08' }}>
-                    {math.validPoint ?? 0}
-                  </Typography.Text>
-                  {math.expirePoint ? (
-                    <Typography.Text type="danger" style={{ fontSize: 12 }}>
-                      (即将过期: {math.expirePoint})
-                    </Typography.Text>
-                  ) : null}
-                </Space>
-              </Descriptions.Item>
-              <Descriptions.Item label="剩余游戏机会">
-                <Typography.Text strong>{math.chanceLeft ?? 0} 次</Typography.Text>
-              </Descriptions.Item>
-              <Descriptions.Item label="看广告可加次数">
-                <Tag color={math.watchAdsAddChanceFrequency ? 'green' : 'default'}>
-                  {math.watchAdsAddChanceFrequency ?? 0} 次
-                </Tag>
-              </Descriptions.Item>
-              <Descriptions.Item label="历史最高记录">
-                <span>{math.record ? `${math.record} 秒` : '-'}</span>
-              </Descriptions.Item>
-              <Descriptions.Item label="副通道全自动开关">
-                <Space wrap align="center" size={8}>
-                  <Switch
-                    checked={secondaryChannelEnabled}
-                    loading={savingSecondaryChannel}
-                    onChange={(checked) => void handleToggleSecondaryChannel(checked)}
-                    checkedChildren="开启"
-                    unCheckedChildren="关闭"
-                  />
-                  <Typography.Text style={{ fontSize: 12, color: secondaryChannelEnabled ? '#1677ff' : '#888' }}>
-                    {secondaryChannelEnabled ? '已开启：自动完成副通道看广告+做题翻倍+自动兑换充入主钱包' : '已关闭：仅保留副端短链供需要时使用，后台不自动执行副通道（默认防风控）'}
-                  </Typography.Text>
-                </Space>
-              </Descriptions.Item>
-              <Descriptions.Item label="推广短链码 (双通道独立)">
+                </Descriptions.Item>
+
+                <Descriptions.Item label="推广短链码">
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
                   <Space wrap size={[8, 8]}>
                     {/* 叮咚短链码 */}
@@ -893,6 +952,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                 </Space>
               </Descriptions.Item>
             </Descriptions>
+            </Space>
           ) : (
             <Empty description="暂无算术游戏数据" />
           )}
@@ -908,7 +968,7 @@ export default function AccountGameRewards({ accountId }: Props) {
             </Space>
           )}
         >
-          <Descriptions size="small" column={1} bordered>
+          <Descriptions size="small" column={1} bordered labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }} contentStyle={{ wordBreak: 'break-all' }}>
             <Descriptions.Item label="🎁 免费币签到 & 幸运测试">
               <Space wrap align="center" size={8}>
                 <Tag color="cyan">每日免费币签到</Tag>
@@ -1003,7 +1063,7 @@ export default function AccountGameRewards({ accountId }: Props) {
             </Space>
           )}
         >
-          <Descriptions size="small" column={1} bordered>
+          <Descriptions size="small" column={1} bordered labelStyle={{ width: '115px', minWidth: '95px', whiteSpace: 'nowrap', textAlign: 'right', fontWeight: 500 }} contentStyle={{ wordBreak: 'break-all' }}>
             <Descriptions.Item label="积分总览">
               <Space wrap size={[8, 4]}>
                 <span>可用: <Typography.Text strong style={{ color: '#d46b08', fontSize: 14 }}>{pointStoreData?.valid_point ?? math?.validPoint ?? 0}</Typography.Text></span>
