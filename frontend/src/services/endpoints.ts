@@ -309,6 +309,7 @@ export async function getAccountMessages(
     keyword?: string;
     msg_type?: Message['msg_type'];
     credit_only?: boolean;
+    phone_only?: boolean;
     exclude_system?: boolean;
     is_read?: boolean;
   },
@@ -318,8 +319,9 @@ export async function getAccountMessages(
     const isReadParam = params?.is_read === undefined ? undefined : String(params.is_read);
     const excludeSystemParam = params?.exclude_system === undefined ? undefined : String(params.exclude_system);
     const creditOnlyParam = params?.credit_only === undefined ? undefined : String(params.credit_only);
+    const phoneOnlyParam = params?.phone_only === undefined ? undefined : String(params.phone_only);
     const res = await api.get<ApiResponse<PagedData<Message>>>(`/accounts/${accountId}/messages`, {
-      params: { ...params, is_read: isReadParam, exclude_system: excludeSystemParam, credit_only: creditOnlyParam },
+      params: { ...params, is_read: isReadParam, exclude_system: excludeSystemParam, credit_only: creditOnlyParam, phone_only: phoneOnlyParam },
       timeout: PAGE_NAVIGATION_TIMEOUT_MS,
     });
     return res.data.data;

@@ -991,7 +991,7 @@ export default function AccountGameRewards({ accountId }: Props) {
                   可用抽奖: {member?.adRouletteRemainTimes ?? 0} 次
                 </Tag>
                 <Tag color="blue">
-                  广告加抽奖: 每日看广告 +2 次
+                  广告加抽奖: 自动看广告拿满 15~18 次
                 </Tag>
               </Space>
             </Descriptions.Item>
@@ -1042,7 +1042,7 @@ export default function AccountGameRewards({ accountId }: Props) {
             </Descriptions.Item>
             <Descriptions.Item label="自动机制">
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                日常自动调度时自动看广告拿满 2 次好运抽奖，自动完成签到领奖，所有中奖均留存本地可追溯！
+                日常自动调度时自动看广告增加 15~18 次好运抽奖，自动完成签到领奖，抽中代币自动触发双倍翻倍并留存团队消息！
               </Typography.Text>
             </Descriptions.Item>
           </Descriptions>

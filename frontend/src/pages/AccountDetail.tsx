@@ -984,7 +984,7 @@ export default function AccountDetail() {
   const [teamMessages, setTeamMessages] = useState<Message[]>([]);
   const [teamMsgTotal, setTeamMsgTotal] = useState(0);
   const [teamMsgPage, setTeamMsgPage] = useState(1);
-  const [teamMessageFilter, setTeamMessageFilter] = useState<'credit' | 'all'>('all');
+  const [teamMessageFilter, setTeamMessageFilter] = useState<'all' | 'credit' | 'phone'>('all');
   const [teamMessageModalOpen, setTeamMessageModalOpen] = useState(false);
   const [msgTotal, setMsgTotal] = useState(0);
   const [msgPage, setMsgPage] = useState(1);
@@ -1222,7 +1222,8 @@ export default function AccountDetail() {
         page,
         pageSize: 20,
         msg_type: 'system' as const,
-        credit_only: teamMessageFilter === 'credit',
+        credit_only: teamMessageFilter === 'credit' ? true : undefined,
+        phone_only: teamMessageFilter === 'phone' ? true : undefined,
       };
       const cacheKey = cacheKeys.accountMessages(accountId, params);
       const cached = !options?.force ? readCachedData<PagedData<Message>>(cacheKey) : null;
@@ -1985,6 +1986,22 @@ export default function AccountDetail() {
 
   const teamMsgColumns: ColumnsType<Message> = [
     {
+      title: '类型',
+      dataIndex: 'k5_flag',
+      width: 120,
+      render: (flag: number) => {
+        if (flag === 531) return <Tag color="green">充值/兑换到账</Tag>;
+        if (flag === 532) return <Tag color="cyan">日常/签到奖励</Tag>;
+        if (flag === 2121 || flag === 2126) return <Tag color="gold">积分/任务奖励</Tag>;
+        if (flag === 10021 || flag === 1048578 || flag === 1048579) return <Tag color="blue">购买号码</Tag>;
+        if (flag === 10022 || flag === 1048609 || flag === 1048610) return <Tag color="purple">续费号码</Tag>;
+        if (flag === 535) return <Tag color="orange">号码激活</Tag>;
+        if (flag === 3300) return <Tag color="default">业务通知</Tag>;
+        if (flag === 2120) return <Tag color="default">活动推广</Tag>;
+        return <Tag>系统消息</Tag>;
+      },
+    },
+    {
       title: '发送方',
       dataIndex: 'from_number',
       width: 140,
@@ -2590,11 +2607,12 @@ export default function AccountDetail() {
         <Segmented
           value={teamMessageFilter}
           options={[
-            { label: '到账奖励', value: 'credit' },
             { label: '全部团队消息', value: 'all' },
+            { label: '到账奖励', value: 'credit' },
+            { label: '号码变动', value: 'phone' },
           ]}
           onChange={(value) => {
-            setTeamMessageFilter(value as 'credit' | 'all');
+            setTeamMessageFilter(value as 'all' | 'credit' | 'phone');
             setTeamMsgPage(1);
           }}
           style={{ marginBottom: 12 }}

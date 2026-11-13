@@ -197,8 +197,14 @@ export function renderTeamMessageContent(
   if (meta.actionType === 34) {
     return `兑换成功，${amount} ${coin}已到账`;
   }
-  if (meta.actionType === 1 || meta.actionType === 2) {
+  if (meta.actionType === 1) {
     return `每日签到，获得 ${amount} ${coin}`;
+  }
+  if (meta.actionType === 2) {
+    return `幸运测试，获得 ${amount} ${coin}`;
+  }
+  if (meta.actionType === 22) {
+    return `活动奖励，${amount} ${coin}已到账`;
   }
   if (meta.actionType === 10) {
     return `观看视频，获得 ${amount} ${coin}`;

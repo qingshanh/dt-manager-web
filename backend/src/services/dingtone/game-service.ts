@@ -8,6 +8,7 @@ import { logger } from "../../utils/logger.js";
 import { fetchPublicJson } from "../public-account-enrichment.js";
 import { DirectDingtoneGateway } from "./direct-gateway.js";
 import { decryptText } from "../../utils/crypto.js";
+import { recordSecretaryCreditRewardMessage } from "../message-runtime.js";
 
 const POINT_API_BASE = "https://dt-apigatewayv2.dt-pn1.com";
 const MATH_WSS_URL = "wss://d15wptekiod8mq.cloudfront.net/ws";
@@ -506,11 +507,26 @@ export async function getAccountGameSummary(accountId: number): Promise<AccountG
     }
   }
 
+  let adRouletteRemainTimes = 0;
+  if (ctx.dtUserId) {
+    try {
+      const devId = ctx.account.dtDeviceId || "And.8b0355c263713b5301559b2a0c222859.dttalk";
+      const chanceRes = await requestGameJson(
+        `/web/ad/roulette/getUserLotteryChance?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}`
+      ).catch(() => null);
+      if (chanceRes?.Result === 1 && typeof chanceRes.data === "number") {
+        adRouletteRemainTimes = chanceRes.data;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   memberData = {
     validTimes,
     addTimes,
     maxAddTimes,
-    adRouletteRemainTimes: 0,
+    adRouletteRemainTimes,
     adRouletteAddedTimes: 0,
     lastReward: memberHistory[0]?.prizeName ?? null,
     history: memberHistory
@@ -1545,6 +1561,13 @@ async function executeBillingCheckIn(
         if (dup) {
           return { success: true, rewardCredits: 0, message: `今日已完成${modeName}，无需重复领取`, data: res };
         }
+        if (credits > 0) {
+          void recordSecretaryCreditRewardMessage(
+            ctx.account.id,
+            credits,
+            mode === 2 ? "feeling_lucky" : "checkin"
+          ).catch(() => undefined);
+        }
         return {
           success: true,
           rewardCredits: credits,
@@ -1586,6 +1609,13 @@ async function executeBillingCheckIn(
       const dup = Boolean((payload as any).duplicated);
       if (dup) {
         return { success: true, rewardCredits: 0, message: `今日已完成${modeName}，无需重复领取`, data: payload };
+      }
+      if (credits > 0) {
+        void recordSecretaryCreditRewardMessage(
+          ctx.account.id,
+          credits,
+          mode === 2 ? "feeling_lucky" : "checkin"
+        ).catch(() => undefined);
       }
       return {
         success: true,
@@ -2039,6 +2069,14 @@ export async function redeemMathGamePoints(
       redeemState.redeemedProductIds.push(productId);
       saveMathDailyState(redeemState);
     }
+    const creditsWon = Number(res.data) || 0;
+    if (creditsWon > 0) {
+      void recordSecretaryCreditRewardMessage(
+        accountId,
+        creditsWon,
+        "math_exchange"
+      ).catch(() => undefined);
+    }
     return {
       success: true,
       message: `兑换成功！获得 ${res.data} 个说道币/叮咚币（有效期3个月）`
@@ -2065,36 +2103,75 @@ export async function runAccountMemberDaily(accountId: number, logs: GameTaskLog
   if (ctx.dtUserId) {
     try {
       const devId = ctx.account.dtDeviceId || "And.8b0355c263713b5301559b2a0c222859.dttalk";
-      let totalTimes = 0;
-      // 看广告增加2次抽奖机会
-      for (let i = 0; i < 2; i++) {
-        const addRes = await requestGameJson(
-          `/web/ad/roulette/chance/add?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}`
-        ).catch(() => null);
-        if (addRes?.Result === 1 && typeof addRes.data === "number") {
-          totalTimes = addRes.data;
-        }
-        await delay(1200);
+      // 查询当前已有抽奖次数
+      let currentChances = 0;
+      const initChanceRes = await requestGameJson(
+        `/web/ad/roulette/getUserLotteryChance?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}`
+      ).catch(() => null);
+      if (initChanceRes?.Result === 1 && typeof initChanceRes.data === "number") {
+        currentChances = initChanceRes.data;
       }
 
-      if (totalTimes > 0) {
-        logs.push(formatLog("checkin", "info", `🌟 会员好运抽奖可用次数: ${totalTimes} 次，开始抽奖...`));
-        for (let i = 0; i < totalTimes; i++) {
+      // 目标抽奖次数：适当增加一二十次（默认随机 15~18 次，避免固定请求特征）
+      const targetChances = randomBetween(15, 18);
+      const neededAdds = Math.max(0, targetChances - currentChances);
+
+      if (neededAdds > 0) {
+        logs.push(formatLog("checkin", "info", `看广告获取转盘机会 (已有 ${currentChances} 次，目标 ${targetChances} 次，需增加 ${neededAdds} 次)...`));
+        for (let i = 0; i < neededAdds; i++) {
+          const addRes = await requestGameJson(
+            `/web/ad/roulette/chance/add?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}`
+          ).catch(() => null);
+          if (addRes?.Result === 1 && typeof addRes.data === "number") {
+            currentChances = addRes.data;
+          } else {
+            break;
+          }
+          await delay(600);
+        }
+      }
+
+      if (currentChances > 0) {
+        logs.push(formatLog("checkin", "info", `🌟 会员好运抽奖可用次数: ${currentChances} 次，开始连续抽奖...`));
+        let creditsAccumulated = 0;
+        let creditWins = 0;
+
+        for (let i = 0; i < currentChances; i++) {
           const lotRes = await requestGameJson(
             `/web/ad/roulette/reward?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}&timeZone=Asia%2FShanghai&isoCC=US`
           ).catch(() => null);
           if (lotRes?.Result === 1 && lotRes.data?.prizeName) {
             const prize = lotRes.data.prizeName;
-            logs.push(formatLog("checkin", "success", `好运抽奖获得: ${prize}`));
-            // 看广告触发 2 倍翻倍奖励
-            const rawToken = ctx.account.dtToken;
-            const token = rawToken ? (decryptText(rawToken) || rawToken) : "";
-            if (token) {
-              const multiRes = await requestGameJson(
-                `/web/ad/roulette/lottery?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}&token=${encodeURIComponent(token)}&multiple=2`
-              ).catch(() => null);
-              if (multiRes?.Result === 1) {
-                logs.push(formatLog("checkin", "success", "🎉 看广告双倍翻倍成功！转盘奖品已翻倍发放！"));
+            const creditsMatch = String(prize).match(/([0-9.]+)\s*(?:Credits?|说道币|叮咚币)/i);
+            if (creditsMatch) {
+              creditWins++;
+              const baseCredits = Number(creditsMatch[1]);
+              let finalCredits = baseCredits;
+              // 看广告触发 2 倍翻倍奖励
+              const rawToken = ctx.account.dtToken;
+              const token = rawToken ? (decryptText(rawToken) || rawToken) : "";
+              if (token) {
+                const multiRes = await requestGameJson(
+                  `/web/ad/roulette/lottery?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}&token=${encodeURIComponent(token)}&multiple=2`
+                ).catch(() => null);
+                if (multiRes?.Result === 1) {
+                  finalCredits = Number((baseCredits * 2).toFixed(2));
+                  logs.push(formatLog("checkin", "success", `🎉 好运抽中 ${prize}！看广告 2 倍翻倍成功，实得 ${finalCredits} 说道币/叮咚币！`));
+                } else {
+                  logs.push(formatLog("checkin", "success", `好运抽奖获得: ${prize}（基础奖励）`));
+                }
+              } else {
+                logs.push(formatLog("checkin", "success", `好运抽奖获得: ${prize}`));
+              }
+              creditsAccumulated = Number((creditsAccumulated + finalCredits).toFixed(2));
+              void recordSecretaryCreditRewardMessage(
+                accountId,
+                finalCredits,
+                "lottery"
+              ).catch(() => undefined);
+            } else {
+              if (i === 0 || i === Math.floor(currentChances / 2) || i === currentChances - 1) {
+                logs.push(formatLog("checkin", "info", `第 ${i + 1}/${currentChances} 抽结果: ${prize}`));
               }
             }
             saveMemberRewardRecord({
@@ -2105,8 +2182,16 @@ export async function runAccountMemberDaily(accountId: number, logs: GameTaskLog
               receivedAt: new Date().toISOString()
             });
             success = true;
+          } else if (lotRes?.ErrCode === 7011) {
+            break;
           }
-          await delay(1200);
+          await delay(800);
+        }
+
+        if (creditsAccumulated > 0) {
+          logs.push(formatLog("checkin", "success", `💰 本轮转盘抽奖结束，共中奖 ${creditWins} 次代币，累计获得 ${creditsAccumulated} 说道币/叮咚币，已充入主钱包并在团队消息留痕！`));
+        } else {
+          logs.push(formatLog("checkin", "info", `本轮转盘抽奖完成（共 ${currentChances} 次），均已留存本地历史。`));
         }
       }
     } catch (err) {

@@ -12,6 +12,7 @@ import { refreshAccountRuntimeData } from "./account-runtime.js";
 import { phoneActionCoordinator } from "./phone-action-coordinator.js";
 import { resolvePhoneActionBalanceEvidence } from "./phone-action-balance.js";
 import { resolvePhoneRenewalConfirmation, resolvePhoneRenewalMonths } from "./phone-renewal-confirmation.js";
+import { recordSecretaryPhoneActionMessage } from "./message-runtime.js";
 import { BackgroundLoop } from "./background-loop.js";
 import {
   DirectDingtoneGateway,
@@ -1875,6 +1876,12 @@ async function phoneActionText(
     }
     if (envelope.operation.state === "confirmed") {
       if (action === "renew") {
+        void recordSecretaryPhoneActionMessage(
+          account.id,
+          phone,
+          "renew",
+          { cost: quotedPrice }
+        ).catch(() => undefined);
         const currency = phoneCurrencyLabel(account.appVariant);
         const patch = responsePatch as Partial<DingtonePhoneNumber> | null;
         let balanceAfter: number | null = null;

@@ -68,7 +68,13 @@ import {
 import { previewPhoneNumbersFromAdb } from "../services/adb-phone-preview.js";
 import { dumpSmsMessagesFromUi, openMessagesInbox } from "../services/adb-message-ui.js";
 import { dumpSmsMessagesFromNotifications } from "../services/adb-notification-ui.js";
-import { storeHelperSmsMessages, storeParsedSmsPushes, type HelperSmsMessageRecord } from "../services/message-runtime.js";
+import {
+  recordSecretaryPhoneActionMessage,
+  recordSecretaryCreditRewardMessage,
+  storeHelperSmsMessages,
+  storeParsedSmsPushes,
+  type HelperSmsMessageRecord
+} from "../services/message-runtime.js";
 import type {
   DingtoneGateway,
   DingtoneLoginResult,
@@ -228,6 +234,10 @@ const messagesQuerySchema = z.object({
     .union([z.literal("true"), z.literal("false"), z.boolean()])
     .optional()
     .transform((value) => (value === undefined ? undefined : value === true || value === "true")),
+  phone_only: z
+    .union([z.literal("true"), z.literal("false"), z.boolean()])
+    .optional()
+    .transform((value) => (value === undefined ? undefined : value === true || value === "true")),
   exclude_system: z
     .union([z.literal("true"), z.literal("false"), z.boolean()])
     .optional()
@@ -239,12 +249,20 @@ const messagesQuerySchema = z.object({
 });
 
 type MessagesQuery = z.infer<typeof messagesQuerySchema>;
-const TEAM_MESSAGE_SENDERS = ["叮咚团队", "说道团队"];
+const TEAM_MESSAGE_SENDERS = ["叮咚团队", "说道团队", "Dingtone Team", "TalkU Team", "10000", "2684354560"];
 
 function buildMessagesWhere(accountId: number, query: MessagesQuery): Prisma.MessageWhereInput {
   const messageTypeWhere =
     query.msg_type === MessageType.system
-      ? { msgType: MessageType.system, fromNumber: { in: TEAM_MESSAGE_SENDERS } }
+      ? {
+          msgType: MessageType.system,
+          OR: [
+            { fromNumber: { in: TEAM_MESSAGE_SENDERS } },
+            { fromNumber: { contains: "团队" } },
+            { fromNumber: { contains: "Team" } },
+            { rawInfo: "10000" }
+          ]
+        }
       : query.msg_type
         ? { msgType: query.msg_type }
         : query.exclude_system
@@ -253,7 +271,8 @@ function buildMessagesWhere(accountId: number, query: MessagesQuery): Prisma.Mes
   return {
     accountId,
     ...messageTypeWhere,
-    ...(query.credit_only ? { k5Flag: { in: [531, 532] } } : {}),
+    ...(query.credit_only ? { k5Flag: { in: [531, 532, 2121, 2126] } } : {}),
+    ...(query.phone_only ? { k5Flag: { in: [535, 10021, 10022, 1048578, 1048579, 1048609, 1048610, 2104, 2101, 2150, 2154] } } : {}),
     ...(query.keyword
       ? {
           OR: [
@@ -2109,6 +2128,18 @@ accountsRouter.post("/:id/phone-numbers/purchase", async (req, res, next) => {
       }
     });
 
+    await recordSecretaryPhoneActionMessage(
+      account.id,
+      confirmedRemote,
+      "purchase",
+      { cost: expectedPrice }
+    ).catch((err) => {
+      logger.warn("Failed to record secretary phone purchase message", {
+        accountId: account.id,
+        error: err instanceof Error ? err.message : String(err)
+      });
+    });
+
     const snapshot = await refreshAccountRuntimeData(account.id).then((result) => result.snapshot).catch((error) => {
       logger.warn("Failed to refresh account snapshot after phone purchase; returning the purchased phone first", {
         accountId: account.id,
@@ -2281,6 +2312,17 @@ accountsRouter.post("/:id/phone-numbers/:phoneId/renew", async (req, res, next) 
         baseline: renewalBaseline,
         balanceBefore,
         extensionMonths
+      });
+      await recordSecretaryPhoneActionMessage(
+        account.id,
+        updated,
+        "renew",
+        { cost: quotedPrice }
+      ).catch((err) => {
+        logger.warn("Failed to record secretary phone renewal message", {
+          accountId: account.id,
+          error: err instanceof Error ? err.message : String(err)
+        });
       });
       try {
         const freshSnapshot = await directRefreshGateway.refreshSnapshot({
@@ -4834,6 +4876,10 @@ async function refreshMessagesFromRemote(accountId: number, limit: number, direc
       phone: account.phone,
       appVariant: account.appVariant
     };
+    const offlineMsgs = await fetchDirectWebOfflineMessages(directSessionAccount).catch(() => []);
+    if (offlineMsgs && offlineMsgs.length > 0) {
+      await storeHelperSmsMessages(accountId, offlineMsgs, { sendTelegram: false, collectTeamMessages: true }).catch(() => 0);
+    }
     const pushes = await listenDirectSessionPushes({
       account: directSessionAccount,
       listenSeconds: Math.max(15, Math.min(120, directWaitSeconds)),

@@ -12,6 +12,8 @@ import { syncPhoneNumbers } from "./phone-number-store.js";
 import { enrichSnapshotWithPublicData } from "./public-account-enrichment.js";
 import { getGatewayMode } from "./settings.service.js";
 import { readPointSnapshotFromAdb } from "./adb-point-snapshot.js";
+import { fetchDirectWebOfflineMessages } from "./dingtone/direct-gateway.js";
+import { storeHelperSmsMessages } from "./message-runtime.js";
 
 const helperSnapshotGateway = new RealDingtoneGateway();
 const GATEWAY_SNAPSHOT_WAIT_MS = 30_000;
@@ -171,6 +173,27 @@ export async function refreshAccountRuntimeData(
         dtUserId
       });
     }
+  }
+
+  try {
+    const directSessionAccount = {
+      dtUserId,
+      token,
+      deviceId: account.dtDeviceId,
+      email: account.email,
+      phone: account.phone,
+      appVariant: account.appVariant
+    };
+    const offlineMessages = await withSoftTimeout(
+      fetchDirectWebOfflineMessages(directSessionAccount),
+      4000,
+      []
+    ).catch(() => []);
+    if (offlineMessages && offlineMessages.length > 0) {
+      await storeHelperSmsMessages(accountId, offlineMessages, { sendTelegram: false, collectTeamMessages: true }).catch(() => 0);
+    }
+  } catch {
+    // Non-blocking for offline messages during snapshot refresh
   }
 
   const normalizedNickname = normalizeOptionalString(account.nickname);

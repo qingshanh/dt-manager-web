@@ -871,3 +871,144 @@ function deriveFallbackName(input: {
 }) {
   return input.nickname?.trim() || input.email?.trim() || input.phone?.trim() || input.dtUserId?.trim() || "Untitled Account";
 }
+
+export async function recordSecretaryPhoneActionMessage(
+  accountId: number,
+  phone: { phoneNumber: string; countryCode?: number | null },
+  action: "purchase" | "renew",
+  options?: { cost?: number | null; source?: string; db?: MessageRuntimeDb }
+) {
+  const db = options?.db ?? prisma;
+  const account = await db.dtAccount.findUnique({
+    where: { id: accountId }
+  });
+  if (!account) return;
+
+  const appVariant = account.appVariant === "dingdong" ? "dingdong" : "dingtone";
+  const coin = appVariant === "dingdong" ? "叮咚币" : "说道币";
+  const teamName = appVariant === "dingdong" ? "叮咚团队" : "说道团队";
+  const rawNum = phone.phoneNumber.trim();
+  const formattedPhone = rawNum.startsWith("+") ? rawNum : `+${rawNum}`;
+  const cost = options?.cost ?? (action === "purchase" ? 1200 : 900);
+  const countryCode = phone.countryCode;
+
+  if (action === "purchase") {
+    const deductType = countryCode === 44 ? 1048578 : countryCode === 1 ? 1048579 : 10021;
+    const deductContent = `您已使用 ${cost} ${coin}成功购买号码 ${formattedPhone}。`;
+    const activeContent = `您申请到的电话号码：${formattedPhone}。为了保持激活状态，需要保持这些条件。`;
+    const now = Date.now();
+
+    await storeHelperSmsMessages(account.id, [
+      {
+        conversationType: 4,
+        conversationId: "10000",
+        type: deductType,
+        senderId: teamName,
+        msgId: `local-sec-purchase-${rawNum}-${now}`,
+        content: deductContent,
+        timestamp: now,
+        data1: teamName,
+        data2: JSON.stringify({ action: "purchase_deduct", phoneNumber: rawNum, cost, type: deductType }),
+        data3: "local-secretary"
+      },
+      {
+        conversationType: 4,
+        conversationId: "10000",
+        type: 535,
+        senderId: teamName,
+        msgId: `local-sec-active-${rawNum}-${now + 1}`,
+        content: activeContent,
+        timestamp: now + 1,
+        data1: teamName,
+        data2: JSON.stringify({ action: "purchase_active", phoneNumber: rawNum, type: 535 }),
+        data3: "local-secretary"
+      }
+    ], { db, sendTelegram: false, collectTeamMessages: true });
+  } else if (action === "renew") {
+    const renewType = countryCode === 44 ? 1048609 : countryCode === 1 ? 1048610 : 10022;
+    const renewContent = `您已使用 ${cost} ${coin}成功续费号码 ${formattedPhone}。`;
+    const now = Date.now();
+
+    await storeHelperSmsMessages(account.id, [
+      {
+        conversationType: 4,
+        conversationId: "10000",
+        type: renewType,
+        senderId: teamName,
+        msgId: `local-sec-renew-${rawNum}-${now}`,
+        content: renewContent,
+        timestamp: now,
+        data1: teamName,
+        data2: JSON.stringify({ action: "renew_deduct", phoneNumber: rawNum, cost, type: renewType }),
+        data3: "local-secretary"
+      }
+    ], { db, sendTelegram: false, collectTeamMessages: true });
+  }
+}
+
+export async function recordSecretaryCreditRewardMessage(
+  accountId: number,
+  credits: number,
+  reason: "checkin" | "feeling_lucky" | "math_exchange" | "lottery" | "fruit_harvest" | "pet_hunt",
+  options?: { points?: number; appVariant?: string; db?: MessageRuntimeDb }
+) {
+  if (credits <= 0) return;
+  const db = options?.db ?? prisma;
+  const account = await db.dtAccount.findUnique({
+    where: { id: accountId }
+  });
+  if (!account) return;
+
+  const appVariant = account.appVariant === "dingdong" ? "dingdong" : "dingtone";
+  const coin = appVariant === "dingdong" ? "叮咚币" : "说道币";
+  const teamName = appVariant === "dingdong" ? "叮咚团队" : "说道团队";
+  const amount = Number(credits).toFixed(2);
+  const now = Date.now();
+
+  let type = 532;
+  let actionType = 5;
+  let text = `任务完成，获得 ${amount} ${coin}`;
+  let ex = -1;
+
+  if (reason === "checkin") {
+    type = 532;
+    actionType = 1;
+    text = `每日签到，获得 ${amount} ${coin}`;
+  } else if (reason === "feeling_lucky") {
+    type = 532;
+    actionType = 2;
+    text = `幸运测试，获得 ${amount} ${coin}`;
+  } else if (reason === "math_exchange") {
+    type = 531;
+    actionType = 34;
+    ex = 90;
+    text = `兑换成功，${amount} ${coin}已到账`;
+  } else if (reason === "lottery") {
+    type = 532;
+    actionType = 5;
+    text = `每日好运转盘，获得 ${amount} ${coin}`;
+  } else if (reason === "fruit_harvest") {
+    type = 531;
+    actionType = 22;
+    text = `每日果园丰收，获得 ${amount} ${coin}`;
+  } else if (reason === "pet_hunt") {
+    type = 531;
+    actionType = 22;
+    text = `萌宠寻宝归来，获得 ${amount} ${coin}`;
+  }
+
+  await storeHelperSmsMessages(account.id, [
+    {
+      conversationType: 4,
+      conversationId: "10000",
+      type,
+      senderId: teamName,
+      msgId: `local-sec-credit-${reason}-${now}`,
+      content: text,
+      timestamp: now,
+      data1: teamName,
+      data2: JSON.stringify({ k1: type, credits, type: actionType, ex, reason }),
+      data3: "local-secretary"
+    }
+  ], { db, sendTelegram: false, collectTeamMessages: true });
+}
