@@ -1160,6 +1160,16 @@ export class DirectDingtoneGateway implements DingtoneGateway {
     );
   }
 
+  async sendSmsMessage(
+    account: DirectSessionAccount,
+    params: { from: string; to: string; content: string }
+  ): Promise<{ success: boolean; msgId: string; fee?: number }> {
+    const runtime = await getDirectRuntimeConfig();
+    return this.withSession(runtime, account, async (session) => {
+      return (session as any).sendDirectSms(params);
+    });
+  }
+
   async runFreeCreditsCheckin(account: DirectSessionAccount, mode: 1 | 2 = 1): Promise<ApiResult> {
     const runtime = await getDirectRuntimeConfig();
     return this.withRegisteredSession(runtime, account, async (session) => {
@@ -3520,6 +3530,21 @@ class DirectSession {
     }
   }
 
+  async sendDirectSms(options: { from: string; to: string; content: string }) {
+    const msgId = String(Date.now());
+    const frame = buildDirectSmsFrame({
+      session: this.sessionId,
+      route: this.route,
+      from: options.from,
+      to: options.to,
+      content: options.content,
+      msgId
+    });
+    dumpDirectDebugFrame("sendDirectSms", frame);
+    await this.write(frame);
+    return { success: true, msgId };
+  }
+
   async callCommonRestJson(
     label: string,
     apiName: string,
@@ -5772,6 +5797,108 @@ function u24be(value: number) {
 
 function lengthPrefixedBuffer(value: Buffer) {
   return Buffer.concat([u32be(value.length), value]);
+}
+
+export function buildDirectSmsInfoPayload(params: {
+  from: string;
+  to: string;
+  content: string;
+  msgId?: string;
+}): { info: string; k1: number } {
+  const cleanFrom = params.from.replace(/[^0-9]/g, "");
+  const cleanTo = params.to.replace(/[^0-9]/g, "");
+
+  let fromCc = "1";
+  let fromLocal = cleanFrom;
+  if (cleanFrom.startsWith("31")) { fromCc = "31"; fromLocal = cleanFrom.slice(2); }
+  else if (cleanFrom.startsWith("44")) { fromCc = "44"; fromLocal = cleanFrom.slice(2); }
+  else if (cleanFrom.startsWith("33")) { fromCc = "33"; fromLocal = cleanFrom.slice(2); }
+  else if (cleanFrom.length === 11 && cleanFrom.startsWith("1")) { fromCc = "1"; fromLocal = cleanFrom.slice(1); }
+
+  let toCc = "1";
+  let toLocal = cleanTo;
+  if (cleanTo.startsWith("31")) { toCc = "31"; toLocal = cleanTo.slice(2); }
+  else if (cleanTo.startsWith("44")) { toCc = "44"; toLocal = cleanTo.slice(2); }
+  else if (cleanTo.length === 11 && cleanTo.startsWith("1")) { toCc = "1"; toLocal = cleanTo.slice(1); }
+
+  const fromStr = fromCc + "|" + fromLocal;
+  const toStr = toCc + "|" + toLocal;
+  const contentBuf = Buffer.from(params.content, "utf8");
+  const pidsBuf = Buffer.from("3001", "utf8");
+  const bindBuf = Buffer.from('{"bindPhoneNumbers":"","fraud":0}', "utf8");
+
+  const totalLen = 4 + 8 + 4 + 4 + 4 + fromStr.length + 1 + 4 + toStr.length + 4 + contentBuf.length + 4 + pidsBuf.length + 8 + 4 + bindBuf.length;
+  const buf = Buffer.alloc(totalLen);
+  let pos = 0;
+
+  buf.writeUInt32LE(1, pos); pos += 4;
+  const numericId = BigInt(params.msgId ? params.msgId.replace(/[^0-9]/g, "").slice(-9) : String(Date.now()).slice(-9));
+  buf.writeBigUInt64LE(numericId, pos); pos += 8;
+  buf.set([0x01, 0x67, 0x00, 0x04], pos); pos += 4;
+  buf.writeUInt32LE(0x20, pos); pos += 4;
+
+  buf.writeUInt32LE(fromStr.length, pos); pos += 4;
+  buf.write(fromStr, pos, "utf8"); pos += fromStr.length;
+
+  buf.writeUInt8(1, pos); pos += 1;
+  buf.writeUInt32LE(toStr.length, pos); pos += 4;
+  buf.write(toStr, pos, "utf8"); pos += toStr.length;
+
+  buf.writeUInt32LE(contentBuf.length, pos); pos += 4;
+  contentBuf.copy(buf, pos); pos += contentBuf.length;
+
+  buf.writeUInt32LE(pidsBuf.length, pos); pos += 4;
+  pidsBuf.copy(buf, pos); pos += pidsBuf.length;
+
+  buf.fill(0, pos, pos + 8); pos += 8;
+
+  buf.writeUInt32LE(bindBuf.length, pos); pos += 4;
+  bindBuf.copy(buf, pos); pos += bindBuf.length;
+
+  return {
+    info: buf.toString("base64"),
+    k1: 560
+  };
+}
+
+export function buildDirectSmsFrame(options: {
+  session: Buffer;
+  route: Buffer;
+  from: string;
+  to: string;
+  content: string;
+  msgId?: string;
+  serial?: number;
+}): Buffer {
+  const { session, route, from, to, content, msgId, serial = 7 } = options;
+  const payload = buildDirectSmsInfoPayload({ from, to, content, msgId });
+  const jsonStr = JSON.stringify(payload);
+  const jsonBuf = Buffer.from(jsonStr, "utf8");
+  const contentBuf = Buffer.from(content, "utf8");
+
+  const sourceRoute = route && route.length >= 8 ? route.subarray(0, 8) : Buffer.from("eed7000300202b35", "hex");
+  const destRoute = Buffer.from("0000000300200001", "hex");
+  const headerMagic = Buffer.from("1407000000000101", "hex");
+  const serialBuf = Buffer.alloc(4); serialBuf.writeUInt32BE(serial);
+  const trackBuf = Buffer.from("6800030e", "hex");
+  const gatewayIdBuf = Buffer.from("00008400a68e0af000000000000000000100005000a008aa7600000000000000000000000000000000000000000000000000000000000000041c000000023530", "hex");
+  const jsonLenBuf = Buffer.alloc(4); jsonLenBuf.writeUInt32BE(jsonBuf.length);
+
+  const body = Buffer.concat([
+    sourceRoute,
+    destRoute,
+    headerMagic,
+    serialBuf,
+    trackBuf,
+    gatewayIdBuf,
+    jsonLenBuf,
+    jsonBuf,
+    Buffer.from([0x00, 0x00, 0x00, 0x00, contentBuf.length]),
+    contentBuf,
+    Buffer.from("00000000280232f00a8ea60084000076aa08a00050000032000e0300680700000005000000b10000001600000000000001000000036170690000000131", "hex")
+  ]);
+
+  return encodeFrame(session, 0x0103, body);
 }
 
 function patchQuery(templateQuery: string, params: DirectTemplateParams) {

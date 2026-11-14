@@ -1793,9 +1793,21 @@ export interface MathDailyState {
   isShareBoostMaxReached67?: boolean;
   redeemedProductIds: number[];
   fruitWaterLimitReached: boolean;
+  rouletteAddsCompleted?: boolean;
+  rouletteAddsCount?: number;
 }
 
-const MATH_STATE_FILE_PATH = path.resolve(process.cwd(), "_tmp/runtime/math_daily_state.json");
+function resolveMathStateFilePath(): string {
+  const candidates = [
+    path.resolve(process.cwd(), "backend/_tmp/runtime/math_daily_state.json"),
+    path.resolve(process.cwd(), "_tmp/runtime/math_daily_state.json"),
+    path.resolve(process.cwd(), "../_tmp/runtime/math_daily_state.json")
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return path.resolve(process.cwd(), "_tmp/runtime/math_daily_state.json");
+}
 
 function getTodayDateStr(): string {
   return new Date().toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" }).replace(/\//g, "-");
@@ -1803,10 +1815,11 @@ function getTodayDateStr(): string {
 
 export function loadMathDailyState(accountId: number): MathDailyState {
   const today = getTodayDateStr();
+  const filePath = resolveMathStateFilePath();
   try {
     ensureHarvestDir();
-    if (fs.existsSync(MATH_STATE_FILE_PATH)) {
-      const all = JSON.parse(fs.readFileSync(MATH_STATE_FILE_PATH, "utf8")) as Record<string, MathDailyState>;
+    if (fs.existsSync(filePath)) {
+      const all = JSON.parse(fs.readFileSync(filePath, "utf8")) as Record<string, MathDailyState>;
       const key = `${accountId}:${today}`;
       if (all[key]) {
         return all[key];
@@ -1825,20 +1838,31 @@ export function loadMathDailyState(accountId: number): MathDailyState {
     shareBoostCount67: 0,
     isShareBoostMaxReached67: false,
     redeemedProductIds: [],
-    fruitWaterLimitReached: false
+    fruitWaterLimitReached: false,
+    rouletteAddsCompleted: false,
+    rouletteAddsCount: 0
   };
 }
 
 export function saveMathDailyState(state: MathDailyState) {
   try {
     ensureHarvestDir();
+    const filePath = resolveMathStateFilePath();
     let all: Record<string, MathDailyState> = {};
-    if (fs.existsSync(MATH_STATE_FILE_PATH)) {
-      all = JSON.parse(fs.readFileSync(MATH_STATE_FILE_PATH, "utf8"));
+    if (fs.existsSync(filePath)) {
+      all = JSON.parse(fs.readFileSync(filePath, "utf8"));
     }
     const key = `${state.accountId}:${state.dateStr}`;
     all[key] = state;
-    fs.writeFileSync(MATH_STATE_FILE_PATH, JSON.stringify(all, null, 2), "utf8");
+    fs.writeFileSync(filePath, JSON.stringify(all, null, 2), "utf8");
+    try {
+      const altPath = filePath.includes("backend")
+        ? filePath.replace(/backend[\\/]/, "")
+        : path.resolve(process.cwd(), "backend/_tmp/runtime/math_daily_state.json");
+      const altDir = path.dirname(altPath);
+      if (!fs.existsSync(altDir)) fs.mkdirSync(altDir, { recursive: true });
+      fs.writeFileSync(altPath, JSON.stringify(all, null, 2), "utf8");
+    } catch {}
   } catch (err) {
     logger.warn("Failed to save math daily state", { error: String(err) });
   }
@@ -2112,23 +2136,30 @@ export async function runAccountMemberDaily(accountId: number, logs: GameTaskLog
         currentChances = initChanceRes.data;
       }
 
-      // 目标抽奖次数：适当增加一二十次（默认随机 15~18 次，避免固定请求特征）
-      const targetChances = randomBetween(15, 18);
-      const neededAdds = Math.max(0, targetChances - currentChances);
-
-      if (neededAdds > 0) {
-        logs.push(formatLog("checkin", "info", `看广告获取转盘机会 (已有 ${currentChances} 次，目标 ${targetChances} 次，需增加 ${neededAdds} 次)...`));
-        for (let i = 0; i < neededAdds; i++) {
-          const addRes = await requestGameJson(
-            `/web/ad/roulette/chance/add?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}`
-          ).catch(() => null);
-          if (addRes?.Result === 1 && typeof addRes.data === "number") {
-            currentChances = addRes.data;
-          } else {
-            break;
+      const dailyState = loadMathDailyState(accountId);
+      // 目标抽奖次数：适当增加一二十次（默认随机 15~18 次，每天严格只完成一轮，防止重启重复刷）
+      if (!dailyState.rouletteAddsCompleted) {
+        const targetChances = randomBetween(15, 18);
+        const neededAdds = Math.max(0, targetChances - currentChances);
+        if (neededAdds > 0) {
+          logs.push(formatLog("checkin", "info", `看广告获取转盘机会 (已有 ${currentChances} 次，目标 ${targetChances} 次，需增加 ${neededAdds} 次)...`));
+          for (let i = 0; i < neededAdds; i++) {
+            const addRes = await requestGameJson(
+              `/web/ad/roulette/chance/add?userId=${ctx.dtUserId}&deviceId=${encodeURIComponent(devId)}`
+            ).catch(() => null);
+            if (addRes?.Result === 1 && typeof addRes.data === "number") {
+              currentChances = addRes.data;
+            } else {
+              break;
+            }
+            await delay(600);
           }
-          await delay(600);
         }
+        dailyState.rouletteAddsCompleted = true;
+        dailyState.rouletteAddsCount = currentChances;
+        saveMathDailyState(dailyState);
+      } else {
+        logs.push(formatLog("checkin", "info", `今日好运转盘看广告已完成（今日不再重复看广告），当前剩余可用抽奖机会: ${currentChances} 次`));
       }
 
       if (currentChances > 0) {

@@ -191,4 +191,8 @@ export type DingtoneGateway = {
     phoneNumber: string,
     phone?: Partial<DingtonePhoneNumber>
   ): Promise<void>;
+  sendSmsMessage?(
+    account: { dtUserId: string; token: string; deviceId?: string | null; appVariant?: "dingtone" | "dingdong" },
+    params: { from: string; to: string; content: string }
+  ): Promise<{ success: boolean; msgId: string; fee?: number }>;
 };

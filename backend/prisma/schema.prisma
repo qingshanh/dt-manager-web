@@ -114,6 +114,9 @@ model DtAccount {
   monitorSessions MonitorSession[]
   pointStoreOrders PointStoreOrder[]
   phoneActionOperations PhoneActionOperation[]
+  contacts        Contact[]
+  conversationSettings ConversationSetting[]
+  callRecords     CallRecord[]
 
   @@index([adminId])
   @@index([status])
@@ -288,4 +291,56 @@ model Setting {
   updatedAt   DateTime @updatedAt @map("updated_at")
 
   @@map("settings")
+}
+
+model Contact {
+  id          Int       @id @default(autoincrement())
+  accountId   Int       @map("account_id")
+  name        String
+  phoneNumber String    @map("phone_number")
+  avatarUrl   String?   @map("avatar_url")
+  email       String?
+  note        String?
+  starred     Boolean   @default(false)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  account     DtAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, phoneNumber])
+  @@index([accountId])
+  @@map("contacts")
+}
+
+model ConversationSetting {
+  id          Int       @id @default(autoincrement())
+  accountId   Int       @map("account_id")
+  peerNumber  String    @map("peer_number")
+  isPinned    Boolean   @default(false) @map("is_pinned")
+  isMuted     Boolean   @default(false) @map("is_muted")
+  isBlocked   Boolean   @default(false) @map("is_blocked")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  account     DtAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, peerNumber])
+  @@index([accountId])
+  @@map("conversation_settings")
+}
+
+model CallRecord {
+  id           Int       @id @default(autoincrement())
+  accountId    Int       @map("account_id")
+  direction    String    @default("inbound")
+  peerNumber   String    @map("peer_number")
+  myNumber     String?   @map("my_number")
+  duration     Int       @default(0)
+  costCredits  Float?    @map("cost_credits")
+  callTime     DateTime  @default(now()) @map("call_time")
+  recordingUrl String?   @map("recording_url")
+  voicemailUrl String?   @map("voicemail_url")
+  note         String?
+  createdAt    DateTime  @default(now()) @map("created_at")
+  account      DtAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([accountId, callTime(sort: Desc)])
+  @@map("call_records")
 }

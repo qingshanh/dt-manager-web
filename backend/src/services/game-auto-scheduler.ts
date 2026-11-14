@@ -12,6 +12,7 @@ import {
   runAccountPetDaily,
   runAccountMathDaily,
   runAccountMemberDaily,
+  loadMathDailyState,
   runAccountFreeCreditsDaily
 } from "./dingtone/game-service.js";
 import { getSettingsMap } from "./settings.service.js";
@@ -244,11 +245,11 @@ export class GameAutoSchedulerService {
 
           // 3. 会员好运与签到: 抽奖机会立即抽完，签到领奖
           if (summary.member) {
-            if (
-              summary.member.adRouletteRemainTimes > 0 ||
-              summary.member.validTimes > 0 ||
-              summary.member.addTimes < summary.member.maxAddTimes
-            ) {
+            const dailyState = loadMathDailyState(account.id);
+            // 严格防重：每天只调度执行一次好运转盘看广告与抽奖
+            const canDoRoulette = !dailyState.rouletteAddsCompleted;
+            const canDoCheckin = summary.member.validTimes > 0 || summary.member.addTimes < summary.member.maxAddTimes;
+            if (canDoRoulette || canDoCheckin) {
               logger.info("Game auto scheduler running member roulette and checkin", { accountId: account.id });
               await withTimeout(runAccountMemberDaily(account.id), 30_000, false);
               await randomDelay(2000, 5000);

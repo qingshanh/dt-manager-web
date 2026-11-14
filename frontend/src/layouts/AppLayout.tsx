@@ -24,6 +24,7 @@ import {
 } from '../services/endpoints';
 import type { RecentMessage, SSENewMessageEvent } from '../types';
 import { MESSAGE_READ_STATE_EVENT } from '../services/ui-events';
+import { isRecentSentMessage } from '../services/sent-cache';
 
 const { Header, Sider, Content } = Layout;
 const RECENT_MESSAGE_FALLBACK_POLL_MS = 30_000;
@@ -142,7 +143,7 @@ export default function AppLayout() {
 
   const notifyIncomingMessage = useCallback(
     (data: SSENewMessageEvent) => {
-      if (data.msgType === 'system') {
+      if (data.msgType === 'system' || (data as any).direction === 'outgoing' || isRecentSentMessage(data.content, data.accountId)) {
         return;
       }
       setNotificationCount((count) => count + 1);

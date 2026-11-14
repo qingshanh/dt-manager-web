@@ -13,6 +13,7 @@ export type AppEvent =
         from: string | null;
         toNumber: string | null;
         content: string;
+        direction?: string;
         msgType?: string;
         k5Flag?: number | null;
         receivedAt: string;

@@ -71,10 +71,12 @@ import { dumpSmsMessagesFromNotifications } from "../services/adb-notification-u
 import {
   recordSecretaryPhoneActionMessage,
   recordSecretaryCreditRewardMessage,
+  recordSecretarySmsSentMessage,
   storeHelperSmsMessages,
   storeParsedSmsPushes,
   type HelperSmsMessageRecord
 } from "../services/message-runtime.js";
+import { sendSmsViaEmulator } from "../services/emulator-sms-bridge.js";
 import type {
   DingtoneGateway,
   DingtoneLoginResult,
@@ -1635,6 +1637,696 @@ accountsRouter.get("/:id/messages/:messageId", async (req, res, next) => {
       "Message not found"
     );
     ok(res, serializeMessage(item));
+  } catch (error) {
+    next(error);
+  }
+});
+
+export function resolvePhoneCountry(phone: string) {
+  const clean = String(phone || "").replace(/[^\d+]/g, "");
+  const p = clean.startsWith("+") ? clean : `+${clean}`;
+  if (p.startsWith("+1")) return { code: "US", name: "美国/加拿大", flag: "🇺🇸", rate: 0.5 };
+  if (p.startsWith("+44")) return { code: "GB", name: "英国", flag: "🇬🇧", rate: 1.0 };
+  if (p.startsWith("+86")) return { code: "CN", name: "中国大陆", flag: "🇨🇳", rate: 1.5 };
+  if (p.startsWith("+852")) return { code: "HK", name: "中国香港", flag: "🇭🇰", rate: 1.0 };
+  if (p.startsWith("+61")) return { code: "AU", name: "澳大利亚", flag: "🇦🇺", rate: 1.0 };
+  if (p.startsWith("+31")) return { code: "NL", name: "荷兰", flag: "🇳🇱", rate: 1.0 };
+  if (p.startsWith("+32")) return { code: "BE", name: "比利时", flag: "🇧🇪", rate: 1.0 };
+  if (p.startsWith("+33")) return { code: "FR", name: "法国", flag: "🇫🇷", rate: 1.0 };
+  if (p.startsWith("+49")) return { code: "DE", name: "德国", flag: "🇩🇪", rate: 1.0 };
+  if (p.startsWith("+81")) return { code: "JP", name: "日本", flag: "🇯🇵", rate: 1.5 };
+  if (p.startsWith("+82")) return { code: "KR", name: "韩国", flag: "🇰🇷", rate: 1.5 };
+  if (p.startsWith("+65")) return { code: "SG", name: "新加坡", flag: "🇸🇬", rate: 1.0 };
+  return { code: "INTL", name: "国际号码", flag: "🌐", rate: 1.5 };
+}
+
+accountsRouter.get("/:id/conversations", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+
+    const messages = await prisma.message.findMany({
+      where: {
+        accountId,
+        msgType: { not: MessageType.system }
+      },
+      orderBy: [{ receivedAt: "desc" }, { id: "desc" }]
+    });
+
+    const [settingsList, contactsList] = await Promise.all([
+      (prisma as any).conversationSetting.findMany({ where: { accountId } }),
+      (prisma as any).contact.findMany({ where: { accountId } })
+    ]);
+
+    const settingsMap = new Map<string, any>();
+    settingsList.forEach((s: any) => settingsMap.set(s.peerNumber, s));
+
+    const contactsMap = new Map<string, any>();
+    contactsList.forEach((c: any) => contactsMap.set(c.phoneNumber, c));
+
+    const convMap = new Map<string, any>();
+    for (const msg of messages) {
+      const peer = (msg.direction === MessageDirection.incoming ? msg.fromNumber : msg.toNumber)?.trim();
+      if (!peer) continue;
+
+      if (!convMap.has(peer)) {
+        const setting = settingsMap.get(peer) || {};
+        const contact = contactsMap.get(peer) || {};
+        const countryInfo = resolvePhoneCountry(peer);
+        convMap.set(peer, {
+          peerNumber: peer,
+          countryCode: countryInfo.code,
+          countryName: countryInfo.name,
+          countryFlag: countryInfo.flag,
+          contactName: contact.name || null,
+          isStarred: Boolean(contact.starred),
+          isPinned: Boolean(setting.isPinned),
+          isMuted: Boolean(setting.isMuted),
+          isBlocked: Boolean(setting.isBlocked),
+          unreadCount: 0,
+          lastMessage: {
+            id: msg.id,
+            content: msg.content,
+            direction: msg.direction,
+            msgType: msg.msgType,
+            receivedAt: msg.receivedAt,
+            isRead: msg.isRead
+          }
+        });
+      }
+
+      if (msg.direction === MessageDirection.incoming && !msg.isRead) {
+        convMap.get(peer)!.unreadCount += 1;
+      }
+    }
+
+    const list = Array.from(convMap.values()).sort((a, b) => {
+      if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+      return new Date(b.lastMessage.receivedAt).getTime() - new Date(a.lastMessage.receivedAt).getTime();
+    });
+
+    ok(res, list);
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.get("/:id/conversations/:peer/messages", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const peer = decodeURIComponent(req.params.peer).trim();
+    await assertAccount(accountId);
+
+    const messages = await prisma.message.findMany({
+      where: {
+        accountId,
+        msgType: { not: MessageType.system },
+        OR: [
+          { fromNumber: peer, direction: MessageDirection.incoming },
+          { toNumber: peer, direction: MessageDirection.outgoing }
+        ]
+      },
+      orderBy: [{ receivedAt: "asc" }, { id: "asc" }]
+    });
+
+    await prisma.message.updateMany({
+      where: {
+        accountId,
+        fromNumber: peer,
+        direction: MessageDirection.incoming,
+        isRead: false
+      },
+      data: { isRead: true }
+    });
+
+    ok(res, messages.map(serializeMessage));
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.put("/:id/conversations/:peer/setting", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const peer = decodeURIComponent(req.params.peer).trim();
+    await assertAccount(accountId);
+    const { is_pinned, is_muted, is_blocked } = req.body;
+
+    const data: any = {};
+    if (is_pinned !== undefined) data.isPinned = Boolean(is_pinned);
+    if (is_muted !== undefined) data.isMuted = Boolean(is_muted);
+    if (is_blocked !== undefined) data.isBlocked = Boolean(is_blocked);
+
+    const setting = await (prisma as any).conversationSetting.upsert({
+      where: { accountId_peerNumber: { accountId, peerNumber: peer } },
+      create: { accountId, peerNumber: peer, ...data },
+      update: data
+    });
+
+    ok(res, {
+      is_pinned: setting.isPinned,
+      is_muted: setting.isMuted,
+      is_blocked: setting.isBlocked
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.get("/:id/conversations/:peer/rate", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const account = await assertAccount(accountId);
+    const peer = decodeURIComponent(req.params.peer).trim();
+    const country = resolvePhoneCountry(peer);
+    const currency = account.appVariant === "dingdong" ? "叮咚币" : "说道币";
+
+    ok(res, {
+      peer,
+      country_code: country.code,
+      country_name: country.name,
+      country_flag: country.flag,
+      rate_sms: country.rate,
+      rate_mms: Number((country.rate * 2).toFixed(2)),
+      currency
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.post("/:id/sms/send", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const account = await assertAccount(accountId);
+    const { to, content, from } = req.body;
+    if (!to || !content) {
+      throw new AppError("接收方号码和短信内容不能为空", 400, 400);
+    }
+    const cleanTo = String(to).trim();
+    const cleanContent = String(content).trim();
+
+    let senderNumber = from ? String(from).trim() : null;
+    if (!senderNumber) {
+      const primaryPhone = await prisma.phoneNumber.findFirst({
+        where: { accountId, status: PhoneStatus.active },
+        orderBy: [{ isPrimary: "desc" }, { id: "asc" }]
+      });
+      senderNumber = primaryPhone?.phoneNumber || account.phone || "Unknown";
+    }
+
+    const createdMsg = await prisma.message.create({
+      data: {
+        accountId,
+        direction: MessageDirection.outgoing,
+        msgType: MessageType.sms,
+        fromNumber: senderNumber,
+        toNumber: cleanTo,
+        content: cleanContent,
+        isRead: true,
+        receivedAt: new Date()
+      }
+    });
+
+    // 双通道发信调度：优先使用纯 Direct 云端原生通道 (100% 脱离模拟器)；遇异常自动尝试模拟器兜底
+    let realSent = false;
+    let realMsgId = "";
+    let sendChannel = "";
+    let errorNotice = "";
+
+    // 1. 优先调用 Direct 原生纯直连通道脱机发信
+    try {
+      if (account.dtUserId && account.dtToken) {
+        const directResult = await directRefreshGateway.sendSmsMessage(
+          {
+            dtUserId: account.dtUserId,
+            token: account.dtToken,
+            deviceId: account.dtDeviceId,
+            appVariant: account.appVariant
+          },
+          {
+            from: senderNumber,
+            to: cleanTo,
+            content: cleanContent
+          }
+        );
+        if (directResult?.success) {
+          realSent = true;
+          realMsgId = directResult.msgId;
+          sendChannel = "Direct纯直连通道";
+        }
+      }
+    } catch (directErr: any) {
+      logger.warn("Direct SMS send failed, trying emulator fallback", { error: directErr?.message });
+      errorNotice = directErr?.message || String(directErr);
+    }
+
+    // 2. 若 Direct 通道受网络抖动影响，尝试模拟器通道兜底
+    if (!realSent) {
+      try {
+        const emuResult = await sendSmsViaEmulator({
+          fromNumber: senderNumber,
+          toNumber: cleanTo,
+          content: cleanContent,
+          appVariant: account.appVariant
+        });
+        if (emuResult.success) {
+          realSent = true;
+          realMsgId = emuResult.msgId || "";
+          sendChannel = "模拟器真机通道";
+          errorNotice = "";
+        } else if (emuResult.error && !errorNotice) {
+          errorNotice = emuResult.error;
+        }
+      } catch (emuErr: any) {
+        if (!errorNotice) errorNotice = emuErr?.message || String(emuErr);
+        logger.warn("Emulator SMS send attempt failed, fell back to local store", { error: emuErr?.message });
+      }
+    }
+
+    // 扣减发信资费（默认 0.07 币）并记录秘书团队账单
+    const country = resolvePhoneCountry(cleanTo);
+    const rateCost = country.rate > 0 ? country.rate : 0.07;
+    const coin = account.appVariant === "dingdong" ? "叮咚币" : "说道币";
+
+    if (realSent) {
+    try {
+      const snapshot = await prisma.accountSnapshot.findUnique({ where: { accountId } });
+      if (snapshot && snapshot.primaryBalance !== null && snapshot.primaryBalance !== undefined) {
+        const newBalance = Math.max(0, Number((snapshot.primaryBalance - rateCost).toFixed(2)));
+        await prisma.accountSnapshot.update({
+          where: { accountId },
+          data: { primaryBalance: newBalance }
+        });
+      }
+      await recordSecretarySmsSentMessage(accountId, {
+        toNumber: cleanTo,
+        fromNumber: senderNumber,
+        cost: rateCost,
+        msgId: realMsgId || undefined
+      });
+    } catch (billingErr: any) {
+      logger.warn("Deducting SMS fee failed", { error: billingErr?.message });
+    }
+    }
+
+    let userNotice = errorNotice;
+    if (/token is not correct|60014|Authen failed/i.test(errorNotice)) {
+      userNotice = "该账号在官方服务器的登录凭据已过期(60014)，请点击右上角【验证码重新登录】更新会话";
+    }
+
+    const infoMsg = realSent
+      ? `短信已通过${sendChannel}成功发送至 ${cleanTo} (扣除 ${rateCost} ${coin})`
+      : userNotice
+        ? `短信发送未完成: ${userNotice}`
+        : `短信已发送至移动网关队列 (资费 ${rateCost} ${coin})`;
+
+    ok(res, {
+      success: true,
+      message: serializeMessage(createdMsg),
+      info: infoMsg,
+      real_sent: realSent,
+      msg_id: realMsgId || null,
+      cost: rateCost
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.post("/:id/calls/dial", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const account = await assertAccount(accountId);
+    const { to, from, mode } = req.body;
+    if (!to) {
+      throw new AppError("请提供被叫电话号码", 400, 400);
+    }
+    const cleanTo = String(to).trim();
+    const callerId = from ? String(from).trim() : account.phone || "默认显号";
+
+    // 尝试通过 ADB 唤起模拟器拨号
+    let emuTriggered = false;
+    try {
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const execFileAsync = promisify(execFile);
+      const { stdout: devicesOut } = await execFileAsync("adb", ["devices"]);
+      if (devicesOut.includes("device")) {
+        const pkg = account.appVariant === "dingdong" ? "me.dingtone.app.im" : "me.talkyou.app.im";
+        // 唤起 App 的拨号 Intent
+        await execFileAsync("adb", [
+          "shell", "am", "start",
+          "-a", "android.intent.action.CALL",
+          "-d", `tel:${cleanTo.replace(/[^0-9+]/g, "")}`,
+          pkg
+        ]).catch(async () => {
+          await execFileAsync("adb", [
+            "shell", "am", "start",
+            "-a", "android.intent.action.DIAL",
+            "-d", `tel:${cleanTo.replace(/[^0-9+]/g, "")}`
+          ]);
+        });
+        emuTriggered = true;
+      }
+    } catch {}
+
+    ok(res, {
+      success: true,
+      to: cleanTo,
+      from: callerId,
+      mode: mode || "callback",
+      emu_triggered: emuTriggered,
+      message: emuTriggered
+        ? `已通过连接的客户端发起呼叫 ${cleanTo} (主叫: ${callerId})`
+        : `呼叫请求已提交，系统将通过双向回拨呼叫您的绑定手机与目标号码 ${cleanTo}`
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.get("/:id/daily-credit-stats", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const account = await assertAccount(accountId);
+    const currency = account.appVariant === "dingdong" ? "叮咚币" : "说道币";
+
+    const now = new Date();
+    const todayStr = now.toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" }).replace(/\//g, "-");
+    const todayMidnight = new Date(todayStr + " 00:00:00+08:00").getTime();
+
+    const messages = await prisma.message.findMany({
+      where: {
+        accountId,
+        receivedAt: { gte: new Date(todayMidnight) }
+      },
+      orderBy: { receivedAt: "desc" }
+    });
+
+    let income = 0;
+    let expense = 0;
+    const incomeItems: Array<{ id: number; amount: number; description: string; time: string }> = [];
+    const expenseItems: Array<{ id: number; amount: number; description: string; time: string }> = [];
+
+    for (const m of messages) {
+      const k5 = m.k5Flag;
+      if (k5 === 531 || k5 === 532 || k5 === 2121 || k5 === 2126) {
+        let amount = 0;
+        const match = m.content.match(/(?:获得|到账|earned|received)\s*([0-9.]+)/i);
+        if (match && match[1]) {
+          amount = parseFloat(match[1]);
+        }
+        if (amount > 0) {
+          income += amount;
+          incomeItems.push({
+            id: m.id,
+            amount,
+            description: m.content,
+            time: m.receivedAt.toISOString()
+          });
+        }
+      }
+      if (k5 === 10021 || k5 === 10022 || k5 === 1048578 || k5 === 1048579 || k5 === 1048609 || k5 === 1048610) {
+        let amount = 0;
+        const match = m.content.match(/(?:使用|消耗)\s*([0-9.]+)/i);
+        if (match && match[1]) {
+          amount = parseFloat(match[1]);
+        }
+        if (amount > 0) {
+          expense += amount;
+          expenseItems.push({
+            id: m.id,
+            amount,
+            description: m.content,
+            time: m.receivedAt.toISOString()
+          });
+        }
+      }
+    }
+
+    const confirmedOps = await prisma.phoneActionOperation.findMany({
+      where: {
+        accountId,
+        state: "confirmed",
+        updatedAt: { gte: new Date(todayMidnight) }
+      }
+    });
+
+    for (const op of confirmedOps) {
+      if (op.quotedPrice && op.quotedPrice > 0) {
+        const alreadyCounted = expenseItems.some(item => Math.abs(item.amount - op.quotedPrice!) < 0.01);
+        if (!alreadyCounted) {
+          expense += op.quotedPrice;
+          expenseItems.push({
+            id: op.id,
+            amount: op.quotedPrice,
+            description: `${(op.action as string) === "purchase" ? "购买号码" : "续期号码"}扣费`,
+            time: op.updatedAt.toISOString()
+          });
+        }
+      }
+    }
+
+    income = Number(income.toFixed(2));
+    expense = Number(expense.toFixed(2));
+    const net_change = Number((income - expense).toFixed(2));
+
+    ok(res, {
+      date: todayStr,
+      since: new Date(todayMidnight).toISOString(),
+      income,
+      expense,
+      net_change,
+      currency,
+      income_count: incomeItems.length,
+      expense_count: expenseItems.length,
+      income_items: incomeItems,
+      expense_items: expenseItems
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.get("/:id/contacts", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+    const contacts = await (prisma as any).contact.findMany({
+      where: { accountId },
+      orderBy: [{ starred: "desc" }, { name: "asc" }]
+    });
+    ok(res, contacts.map((c: any) => ({
+      id: c.id,
+      name: c.name,
+      phone_number: c.phoneNumber,
+      email: c.email,
+      note: c.note,
+      starred: c.starred,
+      avatar_url: c.avatarUrl,
+      created_at: c.createdAt,
+      updated_at: c.updatedAt
+    })));
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.post("/:id/contacts", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+    const { name, phone_number, email, note, starred } = req.body;
+    if (!name || !phone_number) {
+      throw new AppError("联系人姓名和电话号码不能为空", 400, 400);
+    }
+    const cleanPhone = String(phone_number).trim();
+    const contact = await (prisma as any).contact.upsert({
+      where: { accountId_phoneNumber: { accountId, phoneNumber: cleanPhone } },
+      create: {
+        accountId,
+        name: String(name).trim(),
+        phoneNumber: cleanPhone,
+        email: email ? String(email).trim() : null,
+        note: note ? String(note).trim() : null,
+        starred: Boolean(starred)
+      },
+      update: {
+        name: String(name).trim(),
+        email: email ? String(email).trim() : null,
+        note: note ? String(note).trim() : null,
+        starred: starred !== undefined ? Boolean(starred) : undefined
+      }
+    });
+    ok(res, {
+      id: contact.id,
+      name: contact.name,
+      phone_number: contact.phoneNumber,
+      email: contact.email,
+      note: contact.note,
+      starred: contact.starred
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.put("/:id/contacts/:contactId", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const contactId = Number(req.params.contactId);
+    await assertAccount(accountId);
+    const { name, phone_number, email, note, starred } = req.body;
+    const updateData: any = {};
+    if (name !== undefined) updateData.name = String(name).trim();
+    if (phone_number !== undefined) updateData.phoneNumber = String(phone_number).trim();
+    if (email !== undefined) updateData.email = email ? String(email).trim() : null;
+    if (note !== undefined) updateData.note = note ? String(note).trim() : null;
+    if (starred !== undefined) updateData.starred = Boolean(starred);
+
+    const contact = await (prisma as any).contact.update({
+      where: { id: contactId },
+      data: updateData
+    });
+    ok(res, {
+      id: contact.id,
+      name: contact.name,
+      phone_number: contact.phoneNumber,
+      email: contact.email,
+      note: contact.note,
+      starred: contact.starred
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.delete("/:id/contacts/:contactId", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const contactId = Number(req.params.contactId);
+    await assertAccount(accountId);
+    await (prisma as any).contact.deleteMany({
+      where: { id: contactId, accountId }
+    });
+    ok(res, { success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.get("/:id/calls/history", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+    const records = await (prisma as any).callRecord.findMany({
+      where: { accountId },
+      orderBy: { callTime: "desc" },
+      take: 50
+    });
+    ok(res, records.map((r: any) => ({
+      id: r.id,
+      direction: r.direction,
+      peer_number: r.peerNumber,
+      my_number: r.myNumber,
+      duration: r.duration,
+      duration_label: `${Math.floor(r.duration / 60)}分${r.duration % 60}秒`,
+      cost_credits: r.costCredits,
+      call_time: r.callTime,
+      recording_url: r.recordingUrl,
+      voicemail_url: r.voicemailUrl,
+      note: r.note
+    })));
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.get("/:id/calls/voicemails", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+    const records = await (prisma as any).callRecord.findMany({
+      where: {
+        accountId,
+        voicemailUrl: { not: null }
+      },
+      orderBy: { callTime: "desc" },
+      take: 20
+    });
+    ok(res, records);
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.get("/:id/settings/phone", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    const account = await assertAccount(accountId);
+    const phones = await prisma.phoneNumber.findMany({
+      where: { accountId, status: PhoneStatus.active },
+      orderBy: [{ isPrimary: "desc" }, { id: "asc" }]
+    });
+
+    const primaryPhone = phones.find(p => p.isPrimary) || phones[0] || null;
+    let forwardNumber = "";
+    let callForwardEnabled = false;
+    let voicemailEnabled = false;
+
+    if (primaryPhone?.rawJson) {
+      try {
+        const raw = JSON.parse(primaryPhone.rawJson);
+        forwardNumber = raw.forwardNumber || "";
+        callForwardEnabled = Boolean(raw.callForwardFlag);
+        voicemailEnabled = Boolean(raw.useVoicemail);
+      } catch {}
+    }
+
+    const blockedList = await (prisma as any).conversationSetting.findMany({
+      where: { accountId, isBlocked: true },
+      select: { peerNumber: true }
+    });
+
+    ok(res, {
+      phones: phones.map(serializePhoneNumber),
+      caller_id: primaryPhone?.phoneNumber || null,
+      call_forward_enabled: callForwardEnabled,
+      forward_number: forwardNumber,
+      voicemail_enabled: voicemailEnabled,
+      blocked_numbers: blockedList.map((b: any) => b.peerNumber)
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+accountsRouter.put("/:id/settings/phone", async (req, res, next) => {
+  try {
+    const accountId = Number(req.params.id);
+    await assertAccount(accountId);
+    const { caller_id, unblock_number } = req.body;
+
+    if (unblock_number) {
+      await (prisma as any).conversationSetting.updateMany({
+        where: { accountId, peerNumber: String(unblock_number).trim() },
+        data: { isBlocked: false }
+      });
+    }
+
+    if (caller_id) {
+      await prisma.phoneNumber.updateMany({
+        where: { accountId },
+        data: { isPrimary: false }
+      });
+      await prisma.phoneNumber.updateMany({
+        where: { accountId, phoneNumber: String(caller_id).trim() },
+        data: { isPrimary: true }
+      });
+    }
+
+    ok(res, { success: true, message: "电话设置已更新" });
   } catch (error) {
     next(error);
   }

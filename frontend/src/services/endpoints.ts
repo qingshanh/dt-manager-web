@@ -962,3 +962,188 @@ export async function setAutoRedeemAmazon(accountId: number, enabled: boolean, t
   const res = await api.post<ApiResponse<{ enabled: boolean }>>(`/accounts/${accountId}/auto-redeem-amazon`, { enabled, target_product: targetProduct });
   return res.data.data;
 }
+
+// ── 会话聊天 (Conversations & Chat) ──
+
+export interface ConversationItem {
+  peerNumber: string;
+  countryCode: string;
+  countryName: string;
+  countryFlag: string;
+  contactName: string | null;
+  isStarred: boolean;
+  isPinned: boolean;
+  isMuted: boolean;
+  isBlocked: boolean;
+  unreadCount: number;
+  lastMessage: {
+    id: number;
+    content: string;
+    direction: 'incoming' | 'outgoing';
+    msgType: string;
+    receivedAt: string;
+    isRead: boolean;
+  };
+}
+
+export interface ConversationRateInfo {
+  peer: string;
+  country_code: string;
+  country_name: string;
+  country_flag: string;
+  rate_sms: number;
+  rate_mms: number;
+  currency: string;
+}
+
+export async function getAccountConversations(accountId: number): Promise<ConversationItem[]> {
+  const res = await api.get<ApiResponse<ConversationItem[]>>(`/accounts/${accountId}/conversations`);
+  return res.data.data;
+}
+
+export async function getConversationMessages(accountId: number, peer: string): Promise<Message[]> {
+  const res = await api.get<ApiResponse<Message[]>>(`/accounts/${accountId}/conversations/${encodeURIComponent(peer)}/messages`);
+  return res.data.data;
+}
+
+export async function updateConversationSetting(
+  accountId: number,
+  peer: string,
+  setting: { is_pinned?: boolean; is_muted?: boolean; is_blocked?: boolean }
+): Promise<{ is_pinned: boolean; is_muted: boolean; is_blocked: boolean }> {
+  const res = await api.put<ApiResponse<{ is_pinned: boolean; is_muted: boolean; is_blocked: boolean }>>(
+    `/accounts/${accountId}/conversations/${encodeURIComponent(peer)}/setting`,
+    setting
+  );
+  return res.data.data;
+}
+
+export async function getConversationRate(accountId: number, peer: string): Promise<ConversationRateInfo> {
+  const res = await api.get<ApiResponse<ConversationRateInfo>>(`/accounts/${accountId}/conversations/${encodeURIComponent(peer)}/rate`);
+  return res.data.data;
+}
+
+export async function sendAccountSms(
+  accountId: number,
+  payload: { to: string; content: string; from?: string }
+): Promise<{ success: boolean; message: Message; info: string }> {
+  const res = await api.post<ApiResponse<{ success: boolean; message: Message; info: string }>>(`/accounts/${accountId}/sms/send`, payload);
+  return res.data.data;
+}
+
+// ── 通讯录 (Contacts) ──
+
+export interface ContactItem {
+  id: number;
+  name: string;
+  phone_number: string;
+  email?: string | null;
+  note?: string | null;
+  starred: boolean;
+  avatar_url?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export async function getAccountContacts(accountId: number): Promise<ContactItem[]> {
+  const res = await api.get<ApiResponse<ContactItem[]>>(`/accounts/${accountId}/contacts`);
+  return res.data.data;
+}
+
+export async function saveAccountContact(
+  accountId: number,
+  contact: { id?: number; name: string; phone_number: string; email?: string; note?: string; starred?: boolean }
+): Promise<ContactItem> {
+  if (contact.id) {
+    const res = await api.put<ApiResponse<ContactItem>>(`/accounts/${accountId}/contacts/${contact.id}`, contact);
+    return res.data.data;
+  }
+  const res = await api.post<ApiResponse<ContactItem>>(`/accounts/${accountId}/contacts`, contact);
+  return res.data.data;
+}
+
+export async function deleteAccountContact(accountId: number, contactId: number): Promise<{ success: boolean }> {
+  const res = await api.delete<ApiResponse<{ success: boolean }>>(`/accounts/${accountId}/contacts/${contactId}`);
+  return res.data.data;
+}
+
+// ── 通话记录与语音信箱 (Calls & Voicemail) ──
+
+export interface CallRecordItem {
+  id: number;
+  direction: 'inbound' | 'outbound' | 'missed';
+  peer_number: string;
+  my_number?: string | null;
+  duration: number;
+  duration_label: string;
+  cost_credits?: number | null;
+  call_time: string;
+  recording_url?: string | null;
+  voicemail_url?: string | null;
+  note?: string | null;
+}
+
+export async function getAccountCallHistory(accountId: number): Promise<CallRecordItem[]> {
+  const res = await api.get<ApiResponse<CallRecordItem[]>>(`/accounts/${accountId}/calls/history`);
+  return res.data.data;
+}
+
+export async function getAccountVoicemails(accountId: number): Promise<CallRecordItem[]> {
+  const res = await api.get<ApiResponse<CallRecordItem[]>>(`/accounts/${accountId}/calls/voicemails`);
+  return res.data.data;
+}
+
+export async function dialAccountCall(
+  accountId: number,
+  params: { to: string; from?: string; mode?: 'emulator' | 'callback' }
+): Promise<{ success: boolean; message: string; emu_triggered?: boolean }> {
+  const res = await api.post<ApiResponse<{ success: boolean; message: string; emu_triggered?: boolean }>>(
+    `/accounts/${accountId}/calls/dial`,
+    params
+  );
+  return res.data.data;
+}
+
+// ── 电话与系统设置 (Phone & Settings) ──
+
+export interface AccountPhoneSettings {
+  phones: Array<{ id: number; phone_number: string; is_primary: boolean; status: string; display_name?: string | null }>;
+  caller_id: string | null;
+  call_forward_enabled: boolean;
+  forward_number: string;
+  voicemail_enabled: boolean;
+  blocked_numbers: string[];
+}
+
+export async function getAccountPhoneSettings(accountId: number): Promise<AccountPhoneSettings> {
+  const res = await api.get<ApiResponse<AccountPhoneSettings>>(`/accounts/${accountId}/settings/phone`);
+  return res.data.data;
+}
+
+export async function updateAccountPhoneSettings(
+  accountId: number,
+  settings: { caller_id?: string; unblock_number?: string }
+): Promise<{ success: boolean; message: string }> {
+  const res = await api.put<ApiResponse<{ success: boolean; message: string }>>(`/accounts/${accountId}/settings/phone`, settings);
+  return res.data.data;
+}
+
+// ── 每日收支代币统计 (Daily Credit Stats) ──
+
+export interface DailyCreditStats {
+  date: string;
+  since: string;
+  income: number;
+  expense: number;
+  net_change: number;
+  currency: string;
+  income_count: number;
+  expense_count: number;
+  income_items: Array<{ id: number; amount: number; description: string; time: string }>;
+  expense_items: Array<{ id: number; amount: number; description: string; time: string }>;
+}
+
+export async function getDailyCreditStats(accountId: number): Promise<DailyCreditStats> {
+  const res = await api.get<ApiResponse<DailyCreditStats>>(`/accounts/${accountId}/daily-credit-stats`);
+  return res.data.data;
+}

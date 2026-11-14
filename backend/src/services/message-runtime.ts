@@ -98,6 +98,10 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
     return false;
   }
 
+  // 检查是否为本账号名下号码发出的同步短信
+  const isOutgoingSync = !teamName && (await isHelperOutgoingMessage(targetAccount, normalizedPush.fromNumber, db));
+  const direction = isOutgoingSync ? MessageDirection.outgoing : MessageDirection.incoming;
+
   const duplicate = await findDuplicateMessage(targetAccount.id, normalizedPush, db);
   if (duplicate) {
     return false;
@@ -106,7 +110,7 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
   const message = await db.message.create({
     data: {
       accountId: targetAccount.id,
-      direction: MessageDirection.incoming,
+      direction,
       msgType,
       fromNumber: teamName ?? normalizedPush.fromNumber,
       toNumber: normalizedPush.toNumber ?? null,
@@ -114,12 +118,13 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
       rawInfo: normalizedPush.rawInfo ?? null,
       rawK3: normalizedPush.rawK3 ?? null,
       k5Flag: normalizedPush.k5Flag ?? null,
-      isRead: systemMessage,
+      isRead: isOutgoingSync || systemMessage,
       receivedAt: new Date()
     }
   });
 
-  if ((options.emitEvents ?? true) && (!systemMessage || isTeamCreditFlag(normalizedPush.k5Flag))) {
+  // 如果是出站同步短信，严禁广播为新短信通知
+  if (!isOutgoingSync && (options.emitEvents ?? true) && (!systemMessage || isTeamCreditFlag(normalizedPush.k5Flag))) {
     eventBus.emitEvent({
       adminId: targetAccount.adminId,
       type: "new_message",
@@ -130,13 +135,14 @@ async function storeParsedSmsPush(accountId: number, push: ParsedSmsPush, option
         from: teamName ?? normalizedPush.fromNumber,
         toNumber: normalizedPush.toNumber,
         content,
+        direction,
         msgType,
         k5Flag: normalizedPush.k5Flag ?? null,
         receivedAt: message.receivedAt.toISOString()
       }
     });
   }
-  if (!systemMessage) {
+  if (!systemMessage && !isOutgoingSync) {
     void maybeSendTelegram(targetAccount, normalizedPush, message.id, message.receivedAt, db, options.sendTelegram ?? true);
   }
   logger.info("Stored incoming direct SMS push", {
@@ -944,6 +950,35 @@ export async function recordSecretaryPhoneActionMessage(
       }
     ], { db, sendTelegram: false, collectTeamMessages: true });
   }
+}
+
+export async function recordSecretarySmsSentMessage(
+  accountId: number,
+  params: { toNumber: string; fromNumber: string; cost?: number; msgId?: string; db?: MessageRuntimeDb }
+) {
+  const db = params.db ?? prisma;
+  const account = await db.dtAccount.findUnique({ where: { id: accountId } });
+  if (!account) return;
+  const appVariant = account.appVariant === "dingdong" ? "dingdong" : "dingtone";
+  const coin = appVariant === "dingdong" ? "叮咚币" : "说道币";
+  const teamName = appVariant === "dingdong" ? "叮咚团队" : "说道团队";
+  const cost = params.cost ?? 0.07;
+  const now = Date.now();
+  const deductContent = `您已使用 ${cost.toFixed(2)} ${coin}成功向 ${params.toNumber} 发送 1 条短信。`;
+  await storeHelperSmsMessages(account.id, [
+    {
+      conversationType: 4,
+      conversationId: "10000",
+      type: 10022,
+      senderId: teamName,
+      msgId: params.msgId || `local-sec-sms-${now}`,
+      content: deductContent,
+      timestamp: now,
+      data1: teamName,
+      data2: JSON.stringify({ action: "sms_deduct", toNumber: params.toNumber, cost, type: 10022 }),
+      data3: "local-secretary"
+    }
+  ], { db, sendTelegram: false, collectTeamMessages: true });
 }
 
 export async function recordSecretaryCreditRewardMessage(

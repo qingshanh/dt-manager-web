@@ -20,6 +20,7 @@ import {
   Tabs,
   Tag,
   Tooltip,
+  Typography,
 } from 'antd';
 import {
   ArrowLeftOutlined,
@@ -31,10 +32,16 @@ import {
   PlusOutlined,
   ReloadOutlined,
   SafetyCertificateOutlined,
+  ArrowUpOutlined,
+  ArrowDownOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
 import { PhoneExpiryBadge } from '../components/PhoneExpiryBadge';
+import { AccountChatView } from '../components/accounts/AccountChatView';
+import { AccountContacts } from '../components/accounts/AccountContacts';
+import { AccountCalls } from '../components/accounts/AccountCalls';
+import { AccountPhoneSettings } from '../components/accounts/AccountPhoneSettings';
 import { generateUUID } from '../utils/uuid';
 import {
   CACHE_TTL_MS,
@@ -50,6 +57,7 @@ import {
   getAccountMessage,
   getAccountMessages,
   getAccountPointStore,
+  getDailyCreditStats,
   getPhoneNumberCountries,
   getPhoneActionOperation,
   getPhoneNumbers,
@@ -72,6 +80,7 @@ import {
   updatePhoneNumberLabel,
   validateSession,
 } from '../services/endpoints';
+import type { DailyCreditStats } from '../services/endpoints';
 import type {
   DtAccountDetail,
   Message,
@@ -990,6 +999,10 @@ export default function AccountDetail() {
   const [msgPage, setMsgPage] = useState(1);
   const [msgLoading, setMsgLoading] = useState(false);
   const [teamMsgLoading, setTeamMsgLoading] = useState(false);
+  const [selectedChatPeer, setSelectedChatPeer] = useState<string | undefined>(undefined);
+  const [messageViewMode, setMessageViewMode] = useState<'chat' | 'table'>('chat');
+  const [dailyStats, setDailyStats] = useState<DailyCreditStats | null>(null);
+  const [loadingDailyStats, setLoadingDailyStats] = useState(false);
   const messageRequestIdRef = useRef(0);
   const teamMessageRequestIdRef = useRef(0);
   const accountRequestIdRef = useRef(0);
@@ -1012,6 +1025,23 @@ export default function AccountDetail() {
     phoneRequestIdRef.current += 1;
   }
   const [activeTab, setActiveTab] = useState(() => searchParams.get('tab') === 'messages' ? 'messages' : 'info');
+
+  const fetchDailyStats = useCallback(async () => {
+    setLoadingDailyStats(true);
+    try {
+      const stats = await getDailyCreditStats(accountId);
+      setDailyStats(stats);
+    } catch {
+      // ignore
+    } finally {
+      setLoadingDailyStats(false);
+    }
+  }, [accountId]);
+
+  useEffect(() => {
+    void fetchDailyStats();
+  }, [fetchDailyStats]);
+
   const focusedMessageId = useMemo(() => {
     const value = Number(searchParams.get('messageId'));
     return Number.isInteger(value) && value > 0 ? value : null;
@@ -1633,6 +1663,7 @@ export default function AccountDetail() {
       setAccount((current) => (current ? { ...current, snapshot: result.snapshot } : current));
       void fetchAccount({ force: true });
       void fetchPhones();
+      void fetchDailyStats();
       if (result.refresh_error || result.cached) {
         message.warning(result.refresh_error || '本次未确认远端更新，当前显示缓存资料');
       } else {
@@ -2420,6 +2451,64 @@ export default function AccountDetail() {
                   </Col>
                 </Row>
 
+                <Card
+                  size="small"
+                  title="📊 今日代币收支统计 (自今日 00:00 至今)"
+                  extra={
+                    <Button
+                      size="small"
+                      icon={<ReloadOutlined />}
+                      loading={loadingDailyStats}
+                      onClick={fetchDailyStats}
+                    >
+                      刷新收支统计
+                    </Button>
+                  }
+                  style={{ marginBottom: 24, background: '#fafafa' }}
+                >
+                  <Row gutter={[16, 16]}>
+                    <Col xs={8} sm={8}>
+                      <Statistic
+                        title={`今日获取 (${dailyStats?.currency || '币'})`}
+                        value={dailyStats ? `+${dailyStats.income.toFixed(2)}` : '+0.00'}
+                        valueStyle={{ color: '#52c41a', fontWeight: 'bold' }}
+                        prefix={<ArrowUpOutlined />}
+                      />
+                      <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                        共 {dailyStats?.income_count ?? 0} 笔奖励/到账
+                      </Typography.Text>
+                    </Col>
+                    <Col xs={8} sm={8}>
+                      <Statistic
+                        title={`今日消耗 (${dailyStats?.currency || '币'})`}
+                        value={dailyStats ? `-${dailyStats.expense.toFixed(2)}` : '-0.00'}
+                        valueStyle={{ color: '#ff4d4f', fontWeight: 'bold' }}
+                        prefix={<ArrowDownOutlined />}
+                      />
+                      <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                        共 {dailyStats?.expense_count ?? 0} 笔购号/续费
+                      </Typography.Text>
+                    </Col>
+                    <Col xs={8} sm={8}>
+                      <Statistic
+                        title="今日净变动"
+                        value={
+                          dailyStats
+                            ? `${dailyStats.net_change >= 0 ? '+' : ''}${dailyStats.net_change.toFixed(2)} ${dailyStats.currency}`
+                            : '0.00'
+                        }
+                        valueStyle={{
+                          color: (dailyStats?.net_change ?? 0) >= 0 ? '#1677ff' : '#d46b08',
+                          fontWeight: 'bold',
+                        }}
+                      />
+                      <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                        统计日期: {dailyStats?.date || '-'}
+                      </Typography.Text>
+                    </Col>
+                  </Row>
+                </Card>
+
                 <Descriptions bordered column={2} size="small">
                 <Descriptions.Item label={account?.app_variant === 'dingdong' ? '叮咚号' : '说道号'}>{dingtoneIdValue || '未获取到'}</Descriptions.Item>
                   <Descriptions.Item label="用户 ID">{account?.dt_user_id || '-'}</Descriptions.Item>
@@ -2463,73 +2552,106 @@ export default function AccountDetail() {
             label: `消息（总计 ${account?.total_messages ?? 0} / 未读 ${account?.unread_messages ?? 0}）`,
             children: (
               <div>
-                <div style={{ marginBottom: 12 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                  <Segmented
+                    value={messageViewMode}
+                    options={[
+                      { label: '💬 对话聊天流', value: 'chat' },
+                      { label: '📋 原始消息列表', value: 'table' },
+                    ]}
+                    onChange={(v) => setMessageViewMode(v as 'chat' | 'table')}
+                  />
                   <Space>
-                    <Button onClick={handleMarkAllRead}>全部已读</Button>
-                    <Tooltip title="先尝试 direct 收取；如果没有新短信，会继续扫描已连接的 app/helper/ADB 作为兜底。">
-                      <Button type="primary" loading={syncingLatestMessages} onClick={syncLatestMessages}>
-                        收取新短信
-                      </Button>
-                    </Tooltip>
-                    <Tooltip title="从已连接的 app/helper 数据库导入历史短信，需要模拟器和 app。">
-                      <Button loading={syncingAppMessages} onClick={syncAppMessages}>
-                        从 app 导入历史
-                      </Button>
-                    </Tooltip>
-                    <Tooltip title="只刷新本地数据库列表，不主动联网收短信。">
-                      <Button icon={<ReloadOutlined />} loading={refreshingLocalMessages} onClick={refreshLocalMessages}>
-                        刷新本地列表
-                      </Button>
-                    </Tooltip>
+                    <Button onClick={openTeamMessageHistory}>
+                      {account?.app_variant === 'dingdong' ? '叮咚团队' : '说道团队'}消息 ({teamMsgTotal})
+                    </Button>
+                    {messageViewMode === 'table' && (
+                      <>
+                        <Button onClick={handleMarkAllRead}>全部已读</Button>
+                        <Tooltip title="先尝试 direct 收取；如果没有新短信，会继续扫描已连接的 app/helper/ADB 作为兜底。">
+                          <Button type="primary" loading={syncingLatestMessages} onClick={syncLatestMessages}>
+                            收取新短信
+                          </Button>
+                        </Tooltip>
+                        <Tooltip title="从已连接的 app/helper 数据库导入历史短信，需要模拟器和 app。">
+                          <Button loading={syncingAppMessages} onClick={syncAppMessages}>
+                            从 app 导入历史
+                          </Button>
+                        </Tooltip>
+                        <Tooltip title="只刷新本地数据库列表，不主动联网收短信。">
+                          <Button icon={<ReloadOutlined />} loading={refreshingLocalMessages} onClick={refreshLocalMessages}>
+                            刷新本地列表
+                          </Button>
+                        </Tooltip>
+                      </>
+                    )}
                   </Space>
                 </div>
-                {lastRefreshDiagnostics && lastRefreshDiagnostics.length > 0 ? (
-                  <Card size="small" title="最近一次刷新诊断" style={{ marginBottom: 12 }}>
-                    <div style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 12 }}>
-                      {buildRefreshDiagnosticsSummary(lastRefreshDiagnostics)}
-                    </div>
-                  </Card>
-                ) : null}
-                <Card
-                  size="small"
-                  hoverable
-                  role="button"
-                  tabIndex={0}
-                  style={{ marginBottom: 12, cursor: 'pointer' }}
-                  loading={teamMsgLoading}
-                  onClick={openTeamMessageHistory}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ') {
-                      event.preventDefault();
-                      openTeamMessageHistory();
-                    }
-                  }}
-                >
-                  <Space>
-                    <Tag color="blue">团队消息</Tag>
-                    <strong>{account?.app_variant === 'dingdong' ? '叮咚团队' : '说道团队'}</strong>
-                    <span style={{ color: '#666' }}>共 {teamMsgTotal} 条，点击查看历史</span>
-                  </Space>
-                  <div style={{ marginTop: 8, color: '#666' }}>{teamMessages[0]?.content || '暂无团队消息'}</div>
-                </Card>
-                <Table
-                  columns={msgColumns}
-                  dataSource={messages}
-                  rowKey="id"
-                  loading={msgLoading}
-                  size="small"
-                  pagination={{
-                    current: msgPage,
-                    total: msgTotal,
-                    pageSize: 10,
-                    onChange: (page) => {
-                      setMsgPage(page);
-                    },
-                  }}
-                  rowClassName={(record) => record.id === focusedMessageId ? 'message-row-focused' : ''}
-                  scroll={{ x: 860 }}
-                />
+
+                {messageViewMode === 'chat' ? (
+                  <AccountChatView
+                    accountId={accountId}
+                    initialPeer={selectedChatPeer}
+                    onOpenContacts={() => setActiveTab('contacts')}
+                    accountPhones={phones}
+                  />
+                ) : (
+                  <div>
+                    {lastRefreshDiagnostics && lastRefreshDiagnostics.length > 0 ? (
+                      <Card size="small" title="最近一次刷新诊断" style={{ marginBottom: 12 }}>
+                        <div style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 12 }}>
+                          {buildRefreshDiagnosticsSummary(lastRefreshDiagnostics)}
+                        </div>
+                      </Card>
+                    ) : null}
+                    <Table
+                      columns={msgColumns}
+                      dataSource={messages}
+                      rowKey="id"
+                      loading={msgLoading}
+                      size="small"
+                      pagination={{
+                        current: msgPage,
+                        total: msgTotal,
+                        pageSize: 10,
+                        onChange: (page) => {
+                          setMsgPage(page);
+                        },
+                      }}
+                      rowClassName={(record) => record.id === focusedMessageId ? 'message-row-focused' : ''}
+                      scroll={{ x: 860 }}
+                    />
+                  </div>
+                )}
               </div>
+            ),
+          },
+          {
+            key: 'contacts',
+            label: '通讯录',
+            children: (
+              <AccountContacts
+                accountId={accountId}
+                onSelectChat={(phoneNumber) => {
+                  setSelectedChatPeer(phoneNumber);
+                  setActiveTab('messages');
+                  setMessageViewMode('chat');
+                }}
+              />
+            ),
+          },
+          {
+            key: 'calls',
+            label: '通话与信箱',
+            children: (
+              <AccountCalls
+                accountId={accountId}
+                onSelectChat={(phoneNumber) => {
+                  setSelectedChatPeer(phoneNumber);
+                  setActiveTab('messages');
+                  setMessageViewMode('chat');
+                }}
+              />
             ),
           },
           {
@@ -2572,6 +2694,11 @@ export default function AccountDetail() {
                 />
               </div>
             ),
+          },
+          {
+            key: 'settings',
+            label: '通信设置',
+            children: <AccountPhoneSettings accountId={accountId} accountPhones={phones} />,
           },
             {
               key: 'games',
